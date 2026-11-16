@@ -1,0 +1,1919 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Horn Speakers Designer</title>
+<style>
+:root { --paper:#FFFFFF; --panel:#FAFAFA; --ink:#1C1C1C; --faint:#A6A6A6; --base:#7A7A7A; --grid:#F0F0F0; --gridmaj:#E2E2E2;
+        --line:#E8E8E8; --red:#C8331D; --mono:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--paper); color:var(--ink); font:12px/1.5 var(--mono); }
+#app { padding:16px; }
+/* the page scrolls as a whole (the wheel works anywhere); the settings column stays in view beside it */
+.frame { border:1px solid var(--gridmaj); max-width:1240px; margin:0 auto; background:var(--paper);
+         min-height:calc(100vh - 32px); display:flex; flex-direction:column; }
+.frame > header, .frame > footer { flex:0 0 auto; }
+/* the header: the title and the design on one row, the tabs on their own row under them */
+header { display:grid; grid-template-columns:1fr auto; align-items:center; border-bottom:1px solid var(--gridmaj); }
+.ttl { padding:14px 20px; min-width:0; }
+.ttl .src { font-size:10px; letter-spacing:.04em; color:var(--faint); margin-top:4px; } .ttl .src a { color:inherit; }
+.eyebrow { font-size:9px; letter-spacing:.22em; color:var(--faint); margin-bottom:4px; text-transform:uppercase; }
+h1 { margin:0; font-weight:600; font-size:18px; letter-spacing:.04em; }
+nav { grid-column:1 / -1; display:flex; gap:6px; padding:8px 20px; border-top:1px solid var(--line); background:var(--panel); }
+.hfile { padding:12px 20px; }
+.hsel { display:grid; grid-template-columns:auto 280px auto; column-gap:10px; row-gap:4px; align-items:center; }
+.hsel .hlab { font-size:9px; letter-spacing:.2em; text-transform:uppercase; color:var(--faint); }
+.hsel select { grid-column:2; } .hbtns { grid-column:3; display:flex; gap:4px; } .hbtns button { padding:5px 12px; }
+@media (max-width:700px) { header { grid-template-columns:1fr; } .hsel { grid-template-columns:1fr; } .hsel select, .hbtns { grid-column:1; } }
+.hfile button { font:inherit; font-size:9px; letter-spacing:.12em; text-transform:uppercase; background:none; border:1px solid var(--line); color:var(--base); padding:3px 8px; cursor:pointer; }
+.hmsg { padding:6px 20px; font-size:11px; color:var(--red); border-bottom:1px solid var(--line); }
+.hfile select { font:inherit; font-size:10px; letter-spacing:.06em; color:var(--ink); border:1px solid var(--line); background:var(--paper); padding:4px 6px; width:100%; }
+.hmsg a { color:inherit; text-decoration:underline; cursor:pointer; margin-left:8px; }
+.hmsg.ok { color:var(--ink); }
+.hfile button:hover { color:var(--ink); border-color:var(--ink); }
+.toggle { font-family:var(--mono); font-size:10px; letter-spacing:.1em; padding:4px 12px; cursor:pointer; border:1px solid var(--line); background:transparent; color:var(--ink); text-transform:uppercase; }
+.toggle.on { background:var(--red); color:var(--paper); border-color:var(--red); }
+main { display:flex; flex:1 1 auto; align-items:flex-start; }
+aside { flex:0 0 262px; min-width:240px; padding:14px 16px 24px; border-right:1px solid var(--line); background:var(--panel);
+        position:sticky; top:0; max-height:100vh; overflow-y:auto; align-self:flex-start; }
+section.out { flex:1 1 460px; min-width:300px; }
+fieldset { border:0; margin:0; padding:0; }
+legend, .sect { font-size:9px; letter-spacing:.2em; color:var(--faint); text-transform:uppercase; padding:10px 0 0; margin:14px 0 8px;
+         border-top:1px solid var(--line); width:100%; display:block; float:left; }
+fieldset > legend + * { clear:both; }
+form > fieldset:first-of-type legend { border-top:none; margin-top:0; padding-top:0; }
+label { display:flex; justify-content:space-between; align-items:baseline; gap:10px; margin:0 0 9px; clear:both;
+        font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); }
+input, select, textarea { text-transform:none; letter-spacing:0; }
+label input:not([type=checkbox]) { width:60px; flex:0 0 60px; font:12px var(--mono); text-align:right; background:transparent; border:none;
+        border-bottom:1px solid var(--line); color:var(--ink); outline:none; padding:1px 2px; }
+label input:not([type=checkbox]):focus { border-bottom-color:var(--ink); }
+label input::placeholder { color:var(--faint); }
+select { font:11px var(--mono); background:var(--paper); border:1px solid var(--line); color:var(--ink); padding:5px 6px; width:100%; }
+label.sel { display:block; margin-bottom:11px; }
+label.sel select { display:block; margin-top:4px; }
+label.sel input.wide { display:block; width:100%; box-sizing:border-box; margin-top:4px; font:11px var(--mono); border:1px solid var(--line); padding:5px 6px; background:var(--paper); color:var(--ink); text-align:left; }
+.param { margin-bottom:11px; }
+.off { opacity:.45; } .off input { pointer-events:none; }
+.param label { margin:0 0 3px; }
+.ltext { flex:1 1 auto; }
+.nwrap { display:flex; align-items:baseline; flex:0 0 auto; }
+.reset { border:0; background:none; color:var(--faint); cursor:pointer; font:10px var(--mono); padding:0 0 0 4px; }
+.reset:hover { color:var(--red); }
+.punit { font-size:9px; color:var(--faint); margin-left:3px; min-width:12px; text-transform:none; letter-spacing:0; }
+input[type=range] { width:100%; accent-color:var(--red); height:2px; -webkit-appearance:none; appearance:none; background:var(--line); margin:6px 0 4px; display:block; }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:9px; height:15px; background:var(--ink); cursor:ew-resize; border-radius:0; }
+input[type=range]::-moz-range-thumb { width:9px; height:15px; background:var(--ink); cursor:ew-resize; border-radius:0; border:0; }
+input[type=checkbox] { accent-color:var(--red); }
+textarea { width:100%; height:90px; font:11px/1.35 var(--mono); border:1px solid var(--line); padding:6px; background:var(--paper); color:var(--ink); }
+input:focus-visible, button:focus-visible, select:focus-visible { outline:2px solid var(--red); outline-offset:2px; }
+.row { display:flex; gap:8px; margin-top:12px; }
+.btn { font-family:var(--mono); font-size:10px; letter-spacing:.08em; padding:8px 0; width:100%; background:transparent; border:1px solid var(--ink);
+       color:var(--ink); cursor:pointer; text-transform:uppercase; }
+.btn:hover { background:var(--ink); color:var(--paper); }
+.btn.on { background:var(--red); border-color:var(--red); color:var(--paper); }
+.btn:disabled { opacity:.4; cursor:wait; background:transparent; color:var(--ink); }
+.status { color:var(--faint); font-size:10px; letter-spacing:.04em; margin-top:8px; min-height:1em; overflow-wrap:anywhere; }
+#s-all { margin-bottom:16px; }
+nav button[hidden] { display:none; }
+.no3 [data-three] { display:none !important; }
+.drvinfo { font-size:9.5px; line-height:1.5; margin:-4px 0 6px; } .drvinfo a { color:inherit; }
+/* while a build runs: what it will replace is dimmed under a spinner */
+.stale { position:relative; }
+.stale > .busy { position:absolute; inset:0; z-index:5; background:rgba(255,255,255,.62); display:flex; align-items:center; justify-content:center;
+  gap:10px; font-size:9px; letter-spacing:.12em; text-transform:uppercase; color:var(--base); pointer-events:all; }
+.spin { width:14px; height:14px; border:1.5px solid var(--gridmaj); border-top-color:var(--red); border-radius:50%; display:inline-block;
+  animation:spin .8s linear infinite; flex:0 0 auto; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.btn .spin { width:10px; height:10px; vertical-align:-2px; margin-right:8px; }
+.band { padding:12px 16px; border-bottom:1px solid var(--line); }
+.grid2 { display:flex; flex-wrap:wrap; }
+.grid2 > * { flex:1 1 320px; min-width:0; }
+.grid2 > * + * { border-left:1px solid var(--line); }
+.band img { width:100%; height:auto; display:block; }
+.stats { display:flex; flex-wrap:wrap; border-bottom:1px solid var(--line); }
+.stat { padding:9px 14px; border-right:1px solid var(--line); }
+.stat .k { font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); margin-bottom:2px; }
+.stat .v { font-size:15px; }
+table { border-collapse:collapse; width:100%; font-size:11px; }
+td { padding:4px 4px; border-bottom:1px solid var(--grid); vertical-align:top; }
+td:first-child { color:var(--faint); text-transform:uppercase; font-size:9px; letter-spacing:.08em; padding-top:6px; }
+td.v { text-align:right; font-variant-numeric:tabular-nums; }
+.notes:empty { display:none; }
+.notes div { font-size:10px; line-height:1.4; padding:4px 0 4px 8px; border-left:2px solid var(--faint); margin:4px 0; color:var(--base); }
+.notes div.err { border-color:var(--red); color:var(--red); }
+.status.bad, .failtxt { color:var(--red); }
+#built tr.failrow td { color:var(--red); }
+.files { display:flex; flex-wrap:wrap; gap:4px; }
+.files a, .files button { font:10px var(--mono); letter-spacing:.06em; border:1px solid var(--line); padding:3px 9px; color:var(--ink);
+        text-decoration:none; background:transparent; cursor:pointer; }
+.files a:hover, .files button:hover { border-color:var(--ink); }
+/* Parts: the object (tabs, joined to the panel under them) and its parts (a list beside the 3-D view) */
+.objpick { display:flex; gap:0; border-bottom:1px solid var(--ink); margin-bottom:12px; }
+.objpick button { font:10px var(--mono); letter-spacing:.12em; text-transform:uppercase; background:none; border:1px solid transparent; border-bottom:none;
+  padding:7px 14px; color:var(--base); cursor:pointer; margin-bottom:-1px; }
+.objpick button:hover { color:var(--ink); }
+.objpick button.on { border-color:var(--ink); background:var(--paper); color:var(--ink); border-bottom:1px solid var(--paper); }
+.partrow { display:flex; gap:12px; align-items:stretch; }
+.partrow .viewer { flex:1 1 auto; }
+.partlist { flex:0 0 190px; max-height:420px; overflow:auto; border-right:1px solid var(--line); padding-right:8px; }
+.partlist button { display:block; width:100%; text-align:left; font:10px var(--mono); background:none; border:none; border-left:2px solid transparent;
+  padding:4px 8px; color:var(--base); cursor:pointer; }
+.partlist button:hover { color:var(--ink); }
+.partlist button .n { float:right; color:var(--faint); }
+.partlist .lvl0 { color:var(--ink); text-transform:uppercase; letter-spacing:.1em; font-size:9px; }
+.partlist .lvl1 { padding-left:16px; color:var(--ink); }
+.partlist .lvl2 { padding-left:30px; font-size:9px; }
+.viewer .exp { position:absolute; right:10px; top:8px; display:flex; align-items:center; gap:8px; font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--base);
+  background:rgba(255,255,255,.85); padding:4px 8px; border:1px solid var(--line); }
+.viewer .exp input { width:140px; }
+.viewer .exp.hidden { display:none; }
+.partlist button.on { border-left-color:var(--red); color:var(--ink); background:#F4F4F4; }
+@media (max-width:900px) { .partrow { flex-direction:column; } .partlist { flex:none; max-height:none; border-right:none; } }
+.files button.on { background:var(--red); color:var(--paper); border-color:var(--red); }
+.viewer { width:100%; height:420px; border:1px solid var(--line); background:#FFFFFF; position:relative; cursor:grab; margin-top:8px; }
+.viewer .vbar { position:absolute; left:10px; top:8px; display:flex; flex-wrap:wrap; gap:3px; z-index:2; }
+.viewer .vbar button { font:inherit; font-size:8.5px; letter-spacing:.1em; text-transform:uppercase; background:rgba(255,255,255,.85); border:1px solid var(--line); color:var(--base); padding:2px 6px; cursor:pointer; }
+.viewer .vbar button:hover { color:var(--ink); border-color:var(--ink); }
+.viewer .hint { position:absolute; left:10px; bottom:8px; color:var(--faint); font-size:9px; letter-spacing:.1em; text-transform:uppercase; pointer-events:none; }
+.muted { color:var(--faint); font-size:10px; }
+.phint { font-size:9px; line-height:1.35; letter-spacing:.03em; color:var(--faint); border-left:2px solid var(--line); padding-left:6px; margin-bottom:12px; }
+footer a { color:inherit; }
+footer { border-top:1px solid var(--gridmaj); padding:8px 20px; font-size:9px; letter-spacing:.06em; color:var(--faint); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+.hidden { display:none !important; }
+.draw svg, .charts svg { width:100%; height:auto; display:block; }
+#box-draw svg { width:auto; max-width:100%; height:480px; margin:0 auto; }
+#mould-sec { display:flex; justify-content:center; gap:16px; } #mould-sec .mould1 { flex:1 1 0; min-width:0; }
+#br-flat { display:flex; justify-content:center; gap:24px; } #br-flat .flat1 { flex:0 1 auto; min-width:0; } #br-flat svg { width:auto; max-width:100%; }
+#spk-draw { padding:18px 0 8px; } #spk-draw svg { width:auto; max-width:82%; max-height:520px; margin:0 auto; }
+.charts { display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; }
+@media (max-width:900px) { .charts { grid-template-columns:1fr; } }
+/* the horn tab fills the side panel's height: section on the left; 3-D (taking the slack) over the report on the right */
+section.out { display:flex; flex-direction:column; }
+#o-horn, #o-horn2 { flex:1 1 auto; display:flex; flex-direction:column; }
+#o-spk + #o-horn, #o-spk + #o-horn2 { border-top:1px solid var(--line); }
+#br-notes:empty { display:none; } #br-notes { margin-top:10px; }
+#o-horn .hornpair, #o-horn2 .hornpair { flex:1 1 auto; align-items:stretch; }
+.hornpair > .band { display:flex; flex-direction:column; }
+.hornpair [id^=horn-sec] { flex:1 1 auto; display:flex; align-items:center; }
+.hornpair [id^=horn-sec] svg { max-height:640px; margin:0 auto; }
+.hornpair [id^=horn-3d] { flex:1 1 auto; min-height:300px; height:auto; margin-top:0; }
+.legend { display:flex; flex-wrap:wrap; gap:14px; justify-content:center; font-size:10px; margin-top:6px; }
+.legend span { display:inline-flex; align-items:center; gap:6px; }
+.legend i { width:26px; height:14px; border:1px solid var(--ink); background:#F4F4F4; display:inline-block; }
+@media (max-width:900px) { .frame { height:auto; } main { flex-wrap:wrap; } aside { flex:1 1 100%; overflow:visible; position:static; max-height:none; border-right:none; border-bottom:1px solid var(--line); } section.out { overflow:visible; }
+  .grid2 > * + * { border-left:none; border-top:1px solid var(--line); } .viewer { height:300px; } }
+</style>
+</head>
+<body>
+<div id="app"><div class="frame">
+<header>
+  <div class="ttl"><h1>HORN SPEAKERS</h1><div class="src">Based on <a href="https://mroushdy.github.io/Hornstudio/">https://mroushdy.github.io/Hornstudio/</a></div></div>
+  <select id="drivers" hidden><option value="2">2 · woofer + horn</option><option value="3">3 · woofer + 2 horns</option></select>
+  <div class="hfile"><div class="hsel"><span class="hlab">Design</span><select id="presetPick" title="your own design (one or two horns), or a ready-made one: a preset replaces every setting (Undo brings yours back)"><optgroup label="Your own"><option value="custom-single-2">Custom · woofer + horn</option><option value="custom-single-3">Custom · woofer + 2 horns</option><option value="custom-dual-2">Custom · sub + midbass + horn</option><option value="custom-dual-3">Custom · sub + midbass + 2 horns</option></optgroup><optgroup label="Presets" id="presetGroup"></optgroup></select><div class="hbtns"><button type="button" id="saveDesign" title="download every setting of this design as a .json file">Save</button><button type="button" id="loadDesign" title="open a design saved with Save: it replaces every setting">Load</button></div></div>
+    <input type="file" id="loadFile" accept=".json,application/json" hidden></div>
+  <nav>
+    <button data-tab="box" class="toggle on">Woofer box</button>
+    <button data-tab="horn" class="toggle" id="navHorn">Horn</button>
+    <button data-tab="horn2" class="toggle" id="navHorn2" hidden>Horn 2</button>
+    <button data-tab="build" class="toggle">Build &amp; assemble</button>
+  </nav>
+</header>
+
+<main>
+<aside>
+  <!-- HORN: shape and look -->
+  <form id="f-horn" data-tab="horn" class="hidden">
+    <fieldset><legend>Compression driver</legend>
+      <label title="fills the throat, the bolt pattern and the bracket's room for the driver; you can still change them">Driver <select name="hdriver"></select></label>
+      <div class="drvinfo muted"></div>
+    </fieldset>
+    <fieldset><legend>Shape</legend>
+      <div>
+        <label>Family <select name="family">
+          <option>jmlc</option><option>tractrix</option><option>hypex</option><option>swh</option><option>conical</option><option>os</option><option>rosse</option></select></label>
+        <label>Cutoff fc (Hz) <input name="fc" value="600" data-range="150,3000,10"></label>
+        <label title="JMLC and hypex">T <input name="T0" value="0.707" data-range="0.4,1.3,0.01"></label>
+        <label>Roll-back (°) <input name="trunc" value="180" data-range="45,300,5"></label>
+        <label>Throat ⌀ (mm) <input name="throatD" value="50" data-range="12,110,0.5"></label>
+        <label title="any other Horn Studio engine parameter, name=value, separated by spaces; it overrides the fields above">Other Horn Studio settings <input name="hs_extra" class="wide" value="" placeholder="e.g. entryAuto=0 entryDeg=15"></label>
+      </div>
+    </fieldset>
+    <fieldset><legend>Wall</legend>
+      <label>At the lip (mm) <input name="thickness" value="10" data-range="2,40,0.5"></label>
+      <label>At the throat (mm) <input name="thickness_throat" value="20" data-range="3,60,0.5"></label>
+      <label title="1 = linear along the curve; above 1 stays thick for longer">Taper shape <input name="taper_power" value="1" data-range="0.1,5,0.1"></label>
+    </fieldset>
+    <fieldset><legend>Driver plate</legend>
+      <label>Diameter (mm) <input name="flange_od" value="170" data-range="80,400,1"></label>
+      <label>Thickness (mm) <input name="flange_t" value="12" data-range="3,50,0.5"></label>
+      <label>Bolt circle (mm) <input name="bolt_circle" value="102"></label>
+      <label>Bolt holes ⌀ (mm) <input name="bolt_d" value="6.5"></label>
+      <label>Bolts <input name="bolt_n" value="4"></label>
+      <label>First bolt at (°) <input name="bolt_angle" value="45"></label>
+      <label>Plate fillet (mm) <input name="fillet" value="6" data-range="0,30,0.5"></label>
+    </fieldset>
+    <div class="phint">How it is made — mould, fill and vent holes, printing — is on Build &amp; assemble.</div>
+  </form>
+
+  <!-- BOX: sound and look -->
+  <form id="f-box" data-tab="box">
+    <fieldset hidden><legend>Layout</legend>
+      <label title="one woofer; or a 3-way's woofer box: a subwoofer and a midbass, each in its own sealed chamber, joined in the DSP">Drivers in the box <select name="layout"><option value="single">One woofer</option><option value="dual">Subwoofer + midbass, two sealed chambers</option></select></label>
+    </fieldset>
+    <fieldset><legend class="lg-mid">Driver &amp; alignment</legend>
+      <label>Driver <select name="driver"></select></label>
+      <label data-show="layout=single">Box <select name="type"><option value="vented">Vented</option><option value="sealed">Sealed</option></select></label>
+      <label>Net volume (L) <input name="vb" value="23" data-range="2,200,0.5"></label>
+      <label data-show="type=vented" title="empty: chosen for the flattest response">Tuning fb (Hz) <input name="fb" value="" data-range="15,150,0.25" placeholder="auto"></label>
+      <label data-show="type=vented" title="instead of a volume: the smallest box reaching this -3 dB point">Target f3 (Hz) <input name="f3" value="" data-range="15,200,1" placeholder="auto"></label>
+      <label data-show="type=sealed" title="used when the volume is empty">Qtc <input name="qtc" value="0.707" data-range="0.4,1.5,0.01"></label>
+      <label title="7 vented, 50 sealed if empty">Leakage QL <input name="ql" value="" placeholder="auto"></label>
+      <label data-show="layout=single">Compare other type <input type="checkbox" name="compare" checked></label>
+    </fieldset>
+    <fieldset data-show="layout=dual"><legend>Subwoofer, lower chamber</legend>
+      <label>Driver <select name="sub_driver"></select></label>
+      <label title="empty: from the Qtc below">Net volume (L) <input name="sub_vb" value="" placeholder="auto" data-range="5,200,0.5"></label>
+      <label title="used when the volume is empty">Qtc <input name="sub_qtc" value="0.707" data-range="0.4,1.5,0.01"></label>
+      <label title="a Linkwitz transform in the DSP: the sealed roll-off moved down to this frequency (empty: none)">Bass boost to (Hz) <input name="sub_lt" value="30" placeholder="none" data-range="15,60,1"></label>
+      <label title="Linkwitz-Riley 24 dB/oct, in the DSP">Crossover to the midbass (Hz) <input name="xo_lo" value="90" data-range="40,250,1"></label>
+      <label>Sub amp max output (V rms) <input name="sub_amp_v" value="25" data-range="1,100,0.5"></label>
+    </fieldset>
+    <fieldset><legend>Box</legend>
+      <label>Wall (mm) <input name="wall" value="35" data-range="10,100,1"></label>
+      <label title="inside; empty: the woofer's frame plus a margin each side">Inside width (mm) <input name="width" value="" placeholder="auto" data-range="100,1000,5"></label>
+      <label data-show="layout=single" title="inside; empty: from the proportions, or from the volume when the depth is set">Inside height (mm) <input name="height" value="" placeholder="auto" data-range="100,1500,5"></label>
+      <label title="inside; empty: from the volume. With the height set too, the box is set and the volume follows">Inside depth (mm) <input name="depth" value="" placeholder="auto" data-range="100,1200,5"></label>
+      <div data-show="layout=single"><div data-show="height=">
+        <label data-show="depth=" title="inside; empty: set by depth / height">Height / width <input name="hw_ratio" value="" placeholder="auto" data-range="0.5,4,0.01"></label>
+      </div>
+      <div data-show="height="><div data-show="depth="><div data-show="hw_ratio=">
+        <label title="inside, when nothing else sets the proportions">Depth / height <input name="ratio" value="1.17" data-range="0.3,3,0.01"></label>
+      </div></div></div></div>
+      <label data-show="layout=single" title="from the bottom of the box; empty: as high as its hole fits">Woofer centre height (mm) <input name="driver_y" value="" placeholder="auto" data-range="50,1200,1"></label>
+    </fieldset>
+    <fieldset data-show="type=vented"><legend>Port</legend>
+      <label>Shape <select name="port_shape"><option value="slot">Slot along the bottom</option><option value="round">Round tube</option></select></label>
+      <label data-show="port_shape=slot" title="empty: the area of a round port of the diameter below">Slot height (mm) <input name="slot_h" value="" placeholder="auto" data-range="5,120,0.5"></label>
+      <label title="the round port's bore; for a slot, its default area">Round ⌀ (mm) <input name="port_d" value="75" data-range="25,200,1"></label>
+      <label>Edge radius (mm) <input name="flare" value="15" data-range="0,80,1"></label>
+      <label class="sel" title="auto: the back for a slot; for a round tube, the front if it fits under the driver">Opening on <select name="port_on"><option value="auto">auto</option><option value="rear">back</option><option value="front">front</option></select></label>
+    </fieldset>
+    <fieldset><legend>Amplifier &amp; DSP</legend>
+      <div class="phint" style="margin:0 0 8px">Not part of the box: what drives the woofer. The high-pass (in the DSP) keeps it from over-moving below the tuning; the maximum voltage is the amplifier's. They set the excursion, port air speed and maximum SPL shown on the right.</div>
+      <label data-show="layout=single">High-pass (Hz) <input name="hpf" value="32" data-range="0,150,1"></label>
+      <label data-show="layout=single">High-pass order <select name="hpf_order"><option>2</option><option>4</option><option>1</option></select></label>
+      <label class="ampv">Max output (V rms) <input name="amp_v" value="15" data-range="1,100,0.5"></label>
+    </fieldset>
+    <div class="phint">How it is made — formwork, formers, cable hole — is on Build &amp; assemble.</div>
+  </form>
+
+  <!-- BRACKET: shape and placement -->
+  <form id="f-bracket" data-tab="horn" class="hidden">
+    <fieldset><legend>Bracket</legend>
+      <div class="phint" style="margin:0 0 8px">Holds this horn on the box<span data-three>, each horn on its own</span>; cutting and bending are on Build &amp; assemble.</div>
+      <label>Shape <select name="type"><option value="L">L: foot back</option><option value="C">C: feet front &amp; back</option></select></label>
+      <label>Plate (mm) <input name="t" value="5" data-range="1,20,0.5"></label>
+      <label title="leg and feet; narrower than the driver, the leg ends in a round plate that fits it">Bracket width (mm) <input name="width" value="170" data-range="20,600,1"></label>
+      <label>Foot back (mm) <input name="foot_back" value="120" data-range="20,500,5"></label>
+      <label data-show="type=C">Front tabs (mm) <input name="foot_front" value="60" data-range="10,300,5"></label>
+      <label>Bolt holes ⌀ (mm) <input name="hole" value="6.6"></label>
+      <label title="2.66 aluminium, 7.85 steel">Density (g/cm³) <input name="density" value="2.66"></label>
+    </fieldset>
+    <fieldset><legend>Placement</legend>
+      <label>Mouth above box (mm) <input name="clearance" value="10" data-range="0,600,1"></label>
+      <label title="negative: the horn sticks out in front">Horn front set back (mm) <input name="setback" value="0" data-range="-300,400,1"></label>
+      <label class="xpos">Horizontal shift (mm) <input name="xpos" value="" placeholder="auto" data-range="-300,300,1"></label>
+      <label data-three class="xswap" title="swap the two horns' sides: each keeps its distance from its side">Horn 1 on the right (swap sides) <input type="checkbox" name="xswap"></label>
+      <label data-three class="xlock" title="the two horns the same distance from their own side of the box, so they move together, mirrored. Empty: symmetric, 20 mm between the mouths">Locked to the other horn <input type="checkbox" name="xlock"></label>
+    </fieldset>
+  </form>
+
+  <!-- BUILD & ASSEMBLE: how it is made -->
+  <form id="f-build" data-tab="build" class="hidden">
+    <div class="row"><button type="button" class="btn" id="buildAll">Build</button></div>
+    <div class="status" id="s-all"></div>
+    <fieldset><legend>Printer</legend>
+      <label>Bed W×D×H (mm) <input name="bed" value="250x250x250"></label>
+    </fieldset>
+    <fieldset><legend>Woofer box</legend>
+      <label class="sel">Make it as <select name="box_mat"><option value="concrete">Concrete, cast</option><option value="wood">Wood panels, 45° mitres</option></select></label>
+      <div class="phint" data-show="box_mat=wood">Six panels from sheet, every edge bevelled at 45° and glued; the wall is the sheet.</div>
+      <label data-show="box_mat=wood" title="the box's wall: the Woofer box tab's Wall follows it">Sheet (mm) <input name="b_sheet_t" value="18" data-range="9,40,0.5"></label>
+      <label data-show="box_mat=wood" title="0.68 birch plywood, 0.75 MDF">Wood density (g/cm³) <input name="b_density" value="0.68"></label>
+      <label>Cable hole ⌀ (mm) <input name="cable_d" value="24"></label>
+      <label title="round port only">Port tube wall (mm) <input name="tube_wall" value="3"></label>
+      <label data-show="box_mat=concrete">Form board (mm) <input name="board" value="18"></label>
+      <label data-show="box_mat=concrete">Foam sheets (mm) <input name="xps" value="50"></label>
+      <div class="status" id="s-box"></div>
+    </fieldset>
+    <fieldset><legend>Horn</legend>
+      <label class="sel">Make it as <select name="mode"><option value="mould">Mould, cast solid</option><option value="skin">Printed skin, filled</option>
+        <option value="stack">CNC: stacked rings, sanded</option><option value="carve">CNC: carved from a glued block</option></select></label>
+      <div class="phint" data-show="mode=stack">Rings cut from sheet on a flat-bed CNC, glued in a stack, sanded to the curve with a profile template.</div>
+      <div class="phint" data-show="mode=carve">Slightly oversize rings glued into a blank; a CNC shop carves it to the exact shape (STL given).</div>
+      <label data-show="mode=skin">Skin (mm) <input name="skin" value="1.6"></label>
+      <label data-show="mode=mould|skin">Fill hole ⌀ (mm) <input name="fill_d" value="8"></label>
+      <label data-show="mode=mould|skin">Vent holes ⌀ (mm) <input name="vent_d" value="3"></label>
+      <label data-show="mode=stack|carve" title="the plate is a disc of its own, from a sheet as thick as the plate (Horn tab)">Sheet (mm) <input name="h_sheet_t" value="18" data-range="6,40,0.5"></label>
+      <label data-show="mode=stack|carve">Sheet size W×H (mm) <input name="h_sheet" value="2440x1220"></label>
+      <label data-show="mode=stack|carve" title="between parts on the sheet: the cutter and a margin">Gap on the sheet (mm) <input name="h_gap" value="10"></label>
+      <label data-show="mode=carve" title="extra wood on each side of the rings for the carving">Carving margin (mm) <input name="h_margin" value="4" data-range="1,15,0.5"></label>
+      <label data-show="mode=stack|carve" title="0.68 birch plywood, 0.75 MDF">Wood density (g/cm³) <input name="h_density" value="0.68"></label>
+      <label data-show="mode=mould">Lip vents <input name="lip_vents" value="12"></label>
+      <label data-show="mode=mould">Mould wall (mm) <input name="mould_wall" value="15" data-range="4,60,1"></label>
+      <label data-show="mode=mould">Rear plate (mm) <input name="mould_base" value="15"></label>
+      <label data-show="mode=mould" title="through the hollow bolt pins, holding the flange ring up; 0 = none">Hold screws (mm) <input name="hold_screw" value="3"></label>
+      <div class="status" id="s-horn"></div>
+    </fieldset>
+    <fieldset><legend>Bracket</legend>
+      <label>Inside bend radius (mm) <input name="bend_r" value="" placeholder="= plate"></label>
+      <label title="ask the laser cutter / bender">K-factor <input name="k" value="0.33"></label>
+      <div class="status" id="s-bracket"></div>
+    </fieldset>
+    <fieldset><legend>Prices, for the cost estimate</legend>
+      <div class="phint" style="margin:0 0 8px">Rough prices, in euro, incl. VAT; change them to yours. The drivers' come from their files (shop and date beside each).</div>
+      <label>Plywood (€/m², of the sheet) <input name="p_ply" value="40"></label>
+      <label>Casting resin (€/kg) <input name="p_resin" value="25"></label>
+      <label>Filament (€/kg) <input name="p_fil" value="20"></label>
+      <label>Concrete mix (€/kg) <input name="p_concrete" value="0.25"></label>
+      <label title="melamine boards, XPS foam, release agent: per concrete box">Formwork &amp; foam (€/box) <input name="p_form" value="60"></label>
+      <label title="laser cutting and bending, per bracket">Bracket cut &amp; bend (€) <input name="p_bend" value="45"></label>
+      <label>Aluminium sheet (€/kg) <input name="p_alu" value="8"></label>
+      <label title="a CNC shop carving the glued blank, per horn">CNC carving (€/horn) <input name="p_cnc" value="150"></label>
+      <label title="bolts, inserts, gasket, terminal, cable, damping">Hardware (€/speaker) <input name="p_hw" value="30"></label>
+      <label title="DSP and an amplifier channel for each driver (active speakers). 30: a 2 x 50 W DSP amplifier board (Wondom JAB3-50, €41.95 at Soundimports) and a share of its power supply">DSP + amp (€/channel) <input name="p_amp" value="30"></label>
+    </fieldset>
+    <div class="status" id="s-build"></div>
+  </form>
+</aside>
+
+<section class="out">
+  <!-- the whole speaker, side and front, at the top of each horn tab (moved to the open one) -->
+  <div id="o-spk" data-tab="horn" class="hidden">
+    <div class="stats" id="br-stats"></div>
+    <div class="band"><div class="eyebrow">The speaker — side and front · live · mm</div><div id="spk-draw" class="draw"></div><div class="notes" id="br-notes"></div></div>
+  </div>
+  <div id="o-horn" data-tab="horn" class="hidden">
+    <div class="stats" id="horn-stats"></div>
+    <div class="grid2 hornpair">
+      <div class="band"><div class="eyebrow">Section · live · mm</div><div id="horn-sec" class="draw"></div></div>
+      <div class="band hcol">
+        <div class="eyebrow">Shape — 3-D · live · drag rotate · wheel zoom</div>
+        <div class="viewer" id="horn-3d"><div class="hint">drag rotate · wheel zoom · right-drag pan</div></div>
+        <div class="eyebrow" style="margin-top:14px">Report</div><table id="horn-num"></table><div class="notes" id="horn-notes"></div>
+      </div>
+    </div>
+    <div class="band"><div class="eyebrow">Acoustics — Horn Studio's 1-D Webster and geometric estimates · live · not a BEM substitute</div>
+      <div class="stats" id="horn-ac-stats" style="border:none;margin:-4px -20px 6px"></div>
+      <div id="horn-charts" class="charts"></div>
+      <div class="muted" id="horn-ac-note" style="margin-top:6px;line-height:1.6"></div></div>
+  </div>
+
+  <div id="o-box" data-tab="box">
+    <div class="stats" id="box-stats"></div>
+    <div class="band"><div class="eyebrow">Box — front and section through the woofer · live · mm</div><div id="box-draw" class="draw"></div></div>
+    <div class="band"><div class="eyebrow">Response — lumped model, half space, 1 m · live</div><div id="box-charts" class="charts"></div></div>
+    <div class="grid2">
+      <div class="band"><div class="eyebrow">Alignments</div><table id="box-designs"></table></div>
+      <div class="band"><div class="eyebrow">Box</div><table id="box-num"></table><div class="notes" id="box-notes"></div></div>
+    </div>
+  </div>
+
+  <div id="o-bracket" data-tab="horn" class="hidden">
+    <div class="band"><div class="eyebrow">Bracket — report</div><table id="br-num"></table></div>
+  </div>
+
+  <div id="o-build" data-tab="build" class="hidden">
+    <div class="band"><div class="eyebrow">The speaker, assembled · live, from the settings (not checked: Build for that)</div><div id="stepText" class="muted"></div>
+      <div class="viewer" id="asmView" style="height:520px"><div class="hint">drag rotate · wheel zoom · right-drag pan</div></div></div>
+    <div class="band"><div class="eyebrow">Cost — a rough estimate from the settings, live</div><table id="costTable"></table><div class="muted" id="costNote" style="margin-top:6px"></div>
+      <div class="eyebrow" style="margin-top:16px">Every preset, the same way and at your prices, cheapest first</div><table id="costAll"></table></div>
+    <div class="band"><div class="eyebrow">Builds</div><table id="built"></table></div>
+    <div class="grid2 drawpair">
+      <div class="band"><div class="eyebrow" id="mould-title">Horn mould — section as cast, throat up · live</div><div id="mould-sec" class="draw"></div><div id="mould-legend" class="legend"></div><div id="mould-warn"></div></div>
+      <div class="band"><div class="eyebrow">Bracket — flat pattern, seen from the driver side · live</div><div id="br-flat" class="draw"></div><div class="muted">Black: cut. Red, dashed: bend lines.</div></div>
+    </div>
+    <div class="band"><div class="eyebrow">Parts — from Build</div>
+      <div class="objpick" id="parts-pick"><button type="button" data-parts="box">box &amp; formers</button><button type="button" data-parts="horn">horn mould</button><button type="button" data-parts="horn2" data-three>horn 2 mould</button><button type="button" data-parts="bracket">bracket<span data-three>s</span></button></div>
+      <div id="parts"><div class="muted">Build to see the parts.</div></div></div>
+    <div class="band"><div class="eyebrow">Pieces to print — for a pair</div><table id="printList"></table></div>
+    <div class="band"><div class="eyebrow">Not printed</div><table id="otherList"></table></div>
+  </div>
+</section>
+</main>
+<footer><span>BASED ON HORN STUDIO BY SILENCE PLEASE · <a href="https://mroushdy.github.io/Hornstudio/" style="text-transform:none">https://mroushdy.github.io/Hornstudio/</a> · ITS HORN ENGINE IS USED UNCHANGED UNDER <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></span><span id="where">LOCAL · 127.0.0.1</span></footer>
+</div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="engine.js"></script>
+<script src="live.js"></script>
+<script>
+(function () {
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const last = {};   // last result per tab
+
+  // ---- tabs ----
+  $$("nav button").forEach(b => b.onclick = () => {
+    $$("nav button").forEach(x => x.classList.toggle("on", x === b));
+    $$("[data-tab]").forEach(el => { if (el.tagName !== "BUTTON") el.classList.toggle("hidden", el.dataset.tab !== b.dataset.tab); });
+    try { localStorage.setItem("tab", b.dataset.tab); } catch (e) {}
+    window.dispatchEvent(new Event("resize"));
+  });
+
+  // ---- forms ----
+  function formData(f) {
+    const o = {};
+    $$("input, select, textarea", f).forEach(el => { if (el.name) o[el.name] = el.type === "checkbox" ? el.checked : el.value; });
+    return o;
+  }
+  function showHide(f) {
+    const d = formData(f);
+    $$("[data-show]", f).forEach(el => { const [k, v] = el.dataset.show.split("="); el.classList.toggle("hidden", !v.split("|").includes(String(d[k]))); });
+  }
+  function saveForm(f) { try { localStorage.setItem("form:" + f.id, JSON.stringify(formData(f))); } catch (e) {} }
+  function loadForm(f) {
+    try { const d = JSON.parse(localStorage.getItem("form:" + f.id) || "null"); if (!d) return;
+      $$("input, select, textarea", f).forEach(el => { if (el.name in d) { if (el.type === "checkbox") el.checked = d[el.name]; else el.value = d[el.name]; } });
+    } catch (e) {}
+  }
+  // online (GitHub Pages) the design is live, but building needs the Python programs on your computer
+  const STATIC = !/^(127\.0\.0\.1|localhost|\[::1\])$/.test(location.hostname);
+  const NOBUILD = "Building the STLs, DXFs and formwork runs the Python programs on your computer: run python app/server.py and open http://127.0.0.1:8765";
+  async function post(url, body) {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return r.json();
+  }
+  const fmt = v => typeof v === "number" ? (Math.abs(v) >= 100 ? v.toFixed(0) : +v.toFixed(2)) : Array.isArray(v) ? v.map(fmt).join(" × ") : esc(v);
+  function table(el, rows) { el.innerHTML = rows.filter(r => r[1] !== undefined && r[1] !== null).map(r => `<tr><td>${r[0]}</td><td class="v">${fmt(r[1])}${r[2] ? " " + r[2] : ""}</td></tr>`).join(""); }
+  function stats(el, items) {
+    el.innerHTML = items.filter(i => i[1] !== undefined && i[1] !== null).map(i => `<div class="stat"><div class="k">${i[0]}</div><div class="v">${fmt(i[1])}${i[2] ? `<span class="muted"> ${i[2]}</span>` : ""}</div></div>`).join("");
+  }
+  // a status line: red when something failed
+  function status(el, text, bad) { el.textContent = text; el.classList.toggle("bad", !!bad); }
+  function notes(el, res) {
+    const n = (res.notes || []).map(x => `<div>${esc(x)}</div>`);
+    if (!res.ok && res.error) n.unshift(`<div class="err">${esc(res.error)}</div>`);
+    el.innerHTML = n.join("");
+  }
+  const fileUrl = (run, f) => `/runs/${run}/${f}`;
+
+  // ---- 3-D viewer ----
+  // Parts: a tree of the object's pieces. A parent (the whole object, or a group such as "plug") shows
+  // every piece in it where it goes, with an Explode slider; a single piece shows on its own.
+  const GROUP_NAMES = { form: "formwork boards", former: "driver hole formers", core: "foam core", tray_former: "back panel formers",
+    jig: "insert jig", concrete: "concrete", tray: "back panel tray", rings: "rings", plate: "driver plate", carved: "carved horn",
+    panel: "panels", port: "port tube" };
+  async function viewer(container, run, files, initial, opts) {
+    container.innerHTML = "";
+    const dlFiles = files.filter(f => !f.startsWith("asm_") && f !== "assembly.json");
+    let asmd = null;
+    if (opts.useAsm && files.includes("assembly.json"))
+      try { asmd = await (await fetch(fileUrl(run, "assembly.json"))).json(); } catch (e) { asmd = null; }
+    // pieces: {id, file, group, explode|null, color}
+    const nice = t => t.replace(/\.stl$/, "").replace(/^asm_/, "").replace(/sector(\d+)of(\d+)/, "$1 of $2").replace(/(\d+)of(\d+)$/, "$1 of $2").replace(/_/g, " ");
+    const groupOf = f => f.replace(/\.stl$/, "").replace(/_?(sector)?\d+of\d+$/, "").replace(/_[AB]$/, "");
+    const pieces = asmd ? asmd.parts.map(p => ({ id: p.id, file: p.file, group: p.group, explode: p.explode, color: p.color }))
+      : dlFiles.filter(f => f.endsWith(".stl")).map(f => ({ id: f.replace(/\.stl$/, ""), file: f, group: groupOf(f), explode: null, color: null }));
+    const groups = []; pieces.forEach(p => { let g = groups.find(x => x.name === p.group); if (!g) groups.push(g = { name: p.group, items: [] }); g.items.push(p); });
+    const bar = document.createElement("div"); bar.className = "partlist";
+    const rowBtn = (cls, key, label, n) => `<button type="button" class="${cls}" data-sel="${esc(key)}">${esc(label)}${n ? `<span class="n">${n}</span>` : ""}</button>`;
+    let html = rowBtn("lvl0", "*", opts.title || "whole", pieces.length);
+    groups.forEach(g => {
+      if (g.items.length > 1) { html += rowBtn("lvl1", "g:" + g.name, GROUP_NAMES[g.name] || nice(g.name), g.items.length);
+        g.items.forEach(p => html += rowBtn("lvl2", "p:" + p.id, nice(p.id).replace(nice(g.name), "").trim() || nice(p.id))); }
+      else html += rowBtn("lvl1 leaf", "p:" + g.items[0].id, nice(g.items[0].id));
+    });
+    bar.innerHTML = html;
+    const dl = document.createElement("div"); dl.className = "files"; dl.style.marginTop = "8px";
+    dl.innerHTML = (STATIC ? "" : `<a href="/api/zip?run=${encodeURIComponent(run)}">⬇ all files (zip)</a>`) +
+      dlFiles.map(f => `<a href="${fileUrl(run, f)}" download>${esc(f)}</a>`).join("");
+    const box = document.createElement("div"); box.className = "viewer"; box.style.marginTop = "0";
+    box.innerHTML = `<div class="hint">drag rotate · wheel zoom · right-drag pan</div>
+      <div class="exp hidden"><span>Explode</span><input type="range" min="0" max="1" step="0.01" value="0"><span class="v">0%</span></div>`;
+    const row = document.createElement("div"); row.className = "partrow"; row.append(bar, box);
+    container.append(row, dl);
+    const exp = $(".exp", box), slider = $("input", exp);
+    let sel = [], show = () => {};
+    const select = key => {
+      sel = key === "*" ? pieces : key.startsWith("g:") ? pieces.filter(p => p.group === key.slice(2)) : pieces.filter(p => p.id === key.slice(2));
+      $$("button", bar).forEach(b => b.classList.toggle("on", b.dataset.sel === key));
+      exp.classList.toggle("hidden", sel.length < 2); slider.value = 0; $(".v", exp).textContent = "0%";
+      show();
+    };
+    bar.onclick = e => { const b = e.target.closest("[data-sel]"); if (b) select(b.dataset.sel); };
+    const first = pieces.find(p => p.file === initial), start = first && !asmd ? "p:" + first.id : "*";
+    if (!window.THREE) { box.innerHTML = '<div class="hint">3-D viewer needs internet for three.js</div>'; select(start); return; }
+    const w = () => box.clientWidth, h = () => box.clientHeight;
+    let renderer;
+    try { renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true }); } catch (e) { select(start); return; }
+    renderer.setPixelRatio(window.devicePixelRatio); renderer.setSize(w(), h()); box.prepend(renderer.domElement);
+    const scene = new THREE.Scene(), grp = new THREE.Group(); scene.add(grp);
+    grp.rotation.x = asmd ? ({ "throat-up": Math.PI / 2, "z-up": -Math.PI / 2 }[asmd.frame] || 0) : opts.zUp ? -Math.PI / 2 : 0;
+    const cam = new THREE.PerspectiveCamera(35, w() / h(), 1, 50000);
+    cozy(scene, cam, renderer);
+    const ctl = new THREE.OrbitControls(cam, renderer.domElement);
+    const meshes = {}, loading = {};
+    viewBar(box, SPK_VIEWS.concat([["bottom", "Bottom", [0, -1, 1e-4]]]), dir => aimCam(cam, ctl, visibleBox(grp, Object.values(meshes)), dir));
+    const gi = name => groups.findIndex(g => g.name === name);
+    function mesh(p) {     // load each piece once
+      if (meshes[p.id]) return Promise.resolve(meshes[p.id]);
+      return loading[p.id] || (loading[p.id] = new Promise(ok => new THREE.STLLoader().load(fileUrl(run, p.file) + "?t=" + Date.now(), g => {
+        g.computeVertexNormals(); g.computeBoundingBox();
+        const c = new THREE.Color(COLORS[p.color] || 0xd9d9d9);
+        if (!p.color || ["mould", "form"].includes(p.color)) c.multiplyScalar(1 - 0.07 * (gi(p.group) % 5));   // tell the groups apart
+        const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: c, roughness: 0.95, metalness: 0, side: THREE.DoubleSide,
+          transparent: p.color === "foam", opacity: p.color === "foam" ? 0.85 : 1 }));
+        m.visible = false; m.userData = { p, c: g.boundingBox.getCenter(new THREE.Vector3()) }; meshes[p.id] = m; grp.add(m); ok(m);
+      }, undefined, () => ok(null))));
+    }
+    let token = 0;
+    show = async () => {
+      const t = ++token, ms = (await Promise.all(sel.map(mesh))).filter(Boolean);
+      if (t !== token) return;
+      Object.values(meshes).forEach(m => m.visible = false);
+      ms.forEach(m => m.visible = true);
+      // pieces with no explode of their own move away from the selection's centre
+      const cen = new THREE.Vector3(); ms.forEach(m => cen.add(m.userData.c)); if (ms.length) cen.divideScalar(ms.length);
+      ms.forEach(m => m.userData.ex = m.userData.p.explode ? new THREE.Vector3().fromArray(m.userData.p.explode) : m.userData.c.clone().sub(cen));
+      place(); fit(ms);
+    };
+    function place() {
+      const k = parseFloat(slider.value);
+      Object.values(meshes).forEach(m => { if (m.visible) m.position.copy(m.userData.ex || new THREE.Vector3()).multiplyScalar(k); });
+      $(".v", exp).textContent = Math.round(k * 100) + "%";
+    }
+    function fit(ms) {   // frame the selection as assembled
+      grp.updateMatrixWorld(true);
+      const bb = new THREE.Box3(); ms.forEach(m => bb.expandByObject(m)); if (bb.isEmpty()) return;
+      const c = bb.getCenter(new THREE.Vector3()), s = bb.getSize(new THREE.Vector3()).length();
+      ctl.target.copy(c); cam.position.copy(c).add(new THREE.Vector3(-0.8, 0.55, -0.9).normalize().multiplyScalar(s * 1.6));
+      cam.near = s / 200; cam.far = s * 30; cam.updateProjectionMatrix(); ctl.update();
+    }
+    slider.addEventListener("input", e => { e.stopPropagation(); place(); });
+    (function loop() { if (!box.isConnected) return; requestAnimationFrame(loop); renderer.render(scene, cam); })();
+    new ResizeObserver(() => { if (!w()) return; renderer.setSize(w(), h()); cam.aspect = w() / h(); cam.updateProjectionMatrix(); }).observe(box);
+    select(start);
+  }
+
+
+  // ---- Build: the design (Horn / Woofer box / Bracket tabs) plus how it is made (this tab) ----
+  (function makeHorn2() {   // Horn 2 is Horn 1's form and page again, with its own settings
+    const f = $("#f-horn").cloneNode(true); f.id = "f-horn2"; f.dataset.tab = "horn2"; f.classList.add("hidden");
+    const fc = f.querySelector("[name=fc]"); fc.value = fc.defaultValue = "1000";
+    $("#f-horn").after(f);
+    const fb2 = $("#f-bracket").cloneNode(true); fb2.id = "f-bracket2"; fb2.dataset.tab = "horn2"; fb2.classList.add("hidden");
+    f.after(fb2);
+    $(".xlock", $("#f-bracket")).firstChild.textContent = "Same distance from its side as Horn 2 ";
+    $(".xlock", fb2).firstChild.textContent = "Same distance from its side as Horn 1 ";
+    const o = $("#o-horn").cloneNode(true); o.id = "o-horn2"; o.dataset.tab = "horn2"; o.classList.add("hidden");
+    o.querySelectorAll("[id]").forEach(el => el.id += "2");
+    $("#o-horn").after(o);
+  })();
+  const fh = $("#f-horn"), fh2 = $("#f-horn2"), fb = $("#f-box"), fbr = $("#f-bracket"), fbr2 = $("#f-bracket2"), fmk = $("#f-build");
+  const HB = n => n === 2 ? fbr2 : fbr;
+  const threeWay = () => $("#drivers").value === "3";
+  try { const v = localStorage.getItem("drivers") || (JSON.parse(localStorage.getItem("form:f-horn") || "{}").drivers); if (v) $("#drivers").value = v; } catch (e) {}
+  const HF = n => n === 2 ? fh2 : fh, SX = n => n === 2 ? "2" : "";
+  const mk = () => formData(fmk);
+  const bedZ = () => (String(mk().bed || "").match(/(\d+(?:\.\d+)?)\s*$/) || [0, ""])[1];
+  const woodHorn = () => ["stack", "carve"].includes(mk().mode);
+  const hornBuildForm = (n = 1) => { const m = mk(); return Object.assign(formData(HF(n)), { mode: m.mode, skin: m.skin, fill_d: m.fill_d, vent_d: m.vent_d,
+    lip_vents: m.lip_vents, wall: m.mould_wall, base: m.mould_base, hold_screw: m.hold_screw, bed: m.bed },
+    woodHorn() ? { sheet_t: m.h_sheet_t, sheet: m.h_sheet, gap: m.h_gap, carve_margin: m.h_margin, wood_density: m.h_density } : {}, n === 2 ? { slot: "2" } : {}); };
+  // the box's material: wood takes its wall (and the slot's shelf) from the sheet
+  const woodBox = () => mk().box_mat === "wood";
+  const boxMat = () => woodBox() ? { material: "wood", wall: mk().b_sheet_t, shelf: mk().b_sheet_t, wood_density: mk().b_density } : {};
+  const boxBuildForm = () => { const m = mk(); return Object.assign(formData(fb), { cable_d: m.cable_d, tube_wall: m.tube_wall, board: m.board, xps: m.xps, bed_z: bedZ() }, boxMat()); };
+  const bracketBuildForm = () => { const m = mk(), d1 = drvDims(1), d2 = threeWay() ? drvDims(2) : {};
+    const out = Object.assign(formData(fbr), { bend_r: m.bend_r, k: m.k, horns: threeWay() ? "2" : "1" }, d1,
+      d2.driver_d ? { driver_d2: d2.driver_d, driver_depth2: d2.driver_depth } : {});
+    delete out.xpos; delete out.xlock; delete out.xswap;
+    if (threeWay()) for (const [k, v] of Object.entries(formData(fbr2))) if (!["xpos", "xlock", "xswap"].includes(k)) out[k + "2"] = v;
+    if (liveBr && liveB) liveBr.forEach((x, i) => out["x" + (i + 1)] = Math.round((x.b.geo.Xa - liveB.box.geom.We / 2) * 10) / 10);
+    return out; };
+  const built = { horn: null, horn2: null, box: null, bracket: null };
+  const KINDS = () => threeWay() ? ["box", "horn", "horn2", "bracket"] : ["box", "horn", "bracket"];
+  const NAME = { horn: "horn", horn2: "horn 2", box: "box", bracket: "bracket" };
+  const building = new Set();
+  let buildAgain = false;            // a change asked for a build while one was running
+  function stale(el, label) {
+    if (!el) return; el.classList.add("stale"); let o = el.querySelector(":scope > .busy");
+    if (!o) { o = document.createElement("div"); o.className = "busy"; el.appendChild(o); }
+    o.innerHTML = `<span class="spin"></span><span>${esc(label)}</span>`;
+  }
+  function fresh(el) { if (!el) return; el.classList.remove("stale"); const o = el.querySelector(":scope > .busy"); if (o) o.remove(); }
+  function builtTable() {
+    const row = (k, lab, res, extra) => [lab, building.has(k) ? "building…" + (res && res.run ? ` (replacing ${res.run.replace(/^[a-z0-9]+-/, "")})` : "") : failed[k] ? `FAILED — ${failed[k]}` + (res && res.run ? ` (last good build ${res.run.replace(/^[a-z0-9]+-/, "")})` : "") :
+      res && res.ok !== false && res.run ? `${res.run.replace(/^[a-z0-9]+-/, "")}${extra ? " · " + extra : ""}` : "not built yet"];
+    const h = built.horn && built.horn.report || {}, b = built.box && built.box.report || {}, br = built.bracket && built.bracket.report || {};
+    const hk = h.checks ? `${(h.files || []).every(f => f.watertight) ? "all watertight" : "NOT all watertight"}, stray voids ${h.checks.stray_voids_cm3.length ? h.checks.stray_voids_cm3.join(", ") : "none"}` : "";
+    const h2 = built.horn2 && built.horn2.report || {};
+    const hk2 = h2.checks ? `${(h2.files || []).every(f => f.watertight) ? "all watertight" : "NOT all watertight"}, stray voids ${h2.checks.stray_voids_cm3.length ? h2.checks.stray_voids_cm3.join(", ") : "none"}` : "";
+    const hw = r => r.wood ? `${r.wood.method}: ${r.wood.rings} rings, ${r.wood.sheets} sheet${r.wood.sheets > 1 ? "s" : ""} of ${r.wood.sheet_mm} mm · ≈ ${fmt(r.wood.mass_kg_finished)} kg` : "";
+    const ins = b.top_inserts_x_z_mm ? b.top_inserts_x_z_mm.length + " bracket inserts" : "no bracket inserts yet";
+    table($("#built"), [row("box", b.wood ? "Box panels" : "Box & formwork", built.box, b.wood ? `wood, ${b.wood.sheet_mm} mm · ≈ ${fmt(b.wood.mass_kg_per_box)} kg · ${ins}`
+        : b.concrete ? `${fmt(b.concrete.mass_kg_per_box_at_density["2.2"])} kg · ${ins}` : ""), row("horn", threeWay() ? "Horn 1 parts" : "Horn parts", built.horn, h.wood ? hw(h) : h.resin_cm3 ? `${fmt(h.resin_cm3)} cm³ resin · ${hk}` : "")]
+      .concat(threeWay() ? [row("horn2", "Horn 2 parts", built.horn2, h2.wood ? hw(h2) : h2.resin_cm3 ? `${fmt(h2.resin_cm3)} cm³ resin · ${hk2}` : "")] : []).concat([
+      row("bracket", threeWay() ? "Brackets" : "Bracket", built.bracket, br.mass_kg ? `${fmt(br.mass_kg)} kg, ${br.type}${br.brackets ? " ×2" : ""}` : "")]));
+    $$("#built tr").forEach(tr => { const v = tr.querySelector("td.v"); tr.classList.toggle("failrow", !!v && v.textContent.startsWith("FAILED")); });
+  }
+  const PARTS_FIRST = { horn: "horn.stl", horn2: "horn.stl", box: "body.stl", bracket: "bracket.stl" };
+  function showParts(kind) {
+    $$("#parts-pick button").forEach(b => b.classList.toggle("on", b.dataset.parts === kind));
+    const res = built[kind];
+    if (!res || !res.run) { $("#parts").innerHTML = '<div class="muted">Not built yet.</div>'; return; }
+    viewer($("#parts"), res.run, res.files.filter(f => f !== "assembly.stl"), PARTS_FIRST[kind],
+      { zUp: kind.startsWith("horn"), useAsm: kind !== "bracket", title: { horn: threeWay() ? "horn 1" : "horn", horn2: "horn 2", box: res.report && res.report.wood ? "wood box" : "concrete box", bracket: threeWay() ? "brackets" : "bracket" }[kind] });
+  }
+  $("#parts-pick").addEventListener("click", e => { const b = e.target.closest("[data-parts]"); if (b) showParts(b.dataset.parts); });
+  const failed = { horn: null, horn2: null, box: null, bracket: null };
+  function hornShow(res, n = 1) { const k = n === 2 ? "horn2" : "horn";
+    failed[k] = res && !res.ok ? res.error : null; if (res && res.ok && res.report && res.report.horn) { built[k] = res; last[k] = res; } builtTable(); }
+  function boxShow(res) { failed.box = res && !res.ok ? res.error : null; if (res && res.ok && res.report && res.report.box) { built.box = res; last.box = res; } builtTable(); }
+  function bracketShow(res) { failed.bracket = res && !res.ok ? res.error : null; if (res && res.ok && res.report && (res.report.flat_pattern || res.report.brackets)) { built.bracket = res; } builtTable(); return !!(res && res.ok); }
+  async function hornRun(n = 1) {
+    const s = $("#s-horn"); s.textContent = `Building the horn${n === 2 ? " 2" : ""} parts… (10–40 s)`;
+    try { const res = await post("/api/horn", hornBuildForm(n)); hornShow(res, n); if (res.ok) showParts(n === 2 ? "horn2" : "horn");
+      status(s, res.ok ? `Built in ${res.seconds} s` + (res.notes.length ? " — " + res.notes.join(" ") : "") : "Failed: " + (res.error || ""), !res.ok); return res.ok; }
+    catch (e) { s.textContent = "Server not reachable"; return false; }
+  }
+  async function boxRun() {
+    const s = $("#s-box"); s.textContent = "Building the box and its formwork… (10–30 s)";
+    try { const d = boxBuildForm(); d.geometry = true; const res = await post("/api/box", d); boxShow(res); if (res.ok) showParts("box");
+      status(s, res.ok ? `Built in ${res.seconds} s` : "Failed: " + (res.error || ""), !res.ok); return res.ok; }
+    catch (e) { s.textContent = "Server not reachable"; return false; }
+  }
+  async function bracketRun() {
+    const s = $("#s-bracket"); s.textContent = "Building the bracket and the box with its inserts… (10–40 s)";
+    try {
+      const res = await post("/api/bracket", bracketPayload());
+      if (bracketShow(res)) { if (res.box) boxShow(res.box); showParts("bracket");
+        s.textContent = `Built in ${res.seconds} s; the box has its inserts.` + (res.notes.length ? " " + res.notes.join(" ") : ""); return true; }
+      status(s, "Failed: " + (res.error || ""), true); return false;
+    } catch (e) { s.textContent = "Server not reachable"; return false; }
+  }
+  // ---- Build / Rebuild: what changed since the last builds (they keep the settings they were made from)
+  const bracketPayload = () => Object.assign({ bracket: bracketBuildForm(), box: boxBuildForm(), horn: hornBuildForm() }, threeWay() ? { horn2: hornBuildForm(2) } : {});
+  const IGNORE = new Set(["geometry", "top_inserts", "preview", "live", "drivers"]);
+  const sig = o => JSON.stringify(o, (k, v) => IGNORE.has(k) ? undefined :
+    (v && typeof v === "object" && !Array.isArray(v) ? Object.keys(v).sort().reduce((a, kk) => (a[kk] = v[kk], a), {}) : v));
+  function changed() {
+    const has = r => r && r.ok !== false && r.request;
+    const horn = !has(built.horn) || sig(hornBuildForm()) !== sig(built.horn.request);
+    const horn2 = threeWay() && (!has(built.horn2) || sig(hornBuildForm(2)) !== sig(built.horn2.request));
+    const box = !has(built.box) || sig(boxBuildForm()) !== sig(built.box.request);
+    const bracket = horn || horn2 || box || !has(built.bracket) || sig(bracketPayload()) !== sig(built.bracket.request);
+    return { horn, horn2, box, bracket };
+  }
+  function buildButton() {
+    const b = $("#buildAll"), c = changed(), any = built.horn || built.box || built.bracket, st = $("#s-all");
+    if (b.dataset.busy || building.size) {            // building: keep the spinner; say what's waiting
+      if (buildAgain) st.textContent = "Building… then again with your changes.";
+      return; }
+    if (STATIC) { b.textContent = "Build"; b.disabled = true; b.title = NOBUILD; st.textContent = NOBUILD + "."; return; }
+    b.textContent = any ? "Rebuild" : "Build";
+    const parts = KINDS().filter(k => c[k]);
+    b.disabled = any && !parts.length;
+    if (!any) st.textContent = "";
+    else if (!parts.length) st.textContent = "Everything is up to date.";
+    else {
+      const direct = KINDS().filter(k => k !== "bracket" && c[k]).map(k => NAME[k]), brn = threeWay() ? "brackets" : "bracket";
+      st.textContent = "Changed: " + (direct.length ? direct.join(", ") + (c.bracket ? " → also the " + brn : "") : brn) + ".";
+    }
+  }
+  async function buildAll() {
+    if (building.size) { buildAgain = true; buildButton(); return; }   // one build at a time: run again when this one ends
+    // the horn and the box don't depend on each other: a failure in one doesn't stop the other.
+    // The bracket needs both (its place and the box's inserts follow from them).
+    const st = $("#s-all"), c = changed(), todo = KINDS().filter(k => c[k]);
+    const ok = [], bad = [];
+    st.textContent = "Building: " + todo.map(k => NAME[k]).join(", ") + "…";
+    $("#buildAll").innerHTML = '<span class="spin"></span>Building…';
+    // everything made from the builds is out of date until they finish
+    const what = "rebuilding " + todo.map(k => NAME[k]).join(", ");
+    todo.forEach(k => building.add(k)); builtTable();
+    const outdated = ["#asmView", "#parts", "#printList", "#otherList"].map(q => $(q)).map(el => el.tagName === "TABLE" ? el.parentNode : el);
+    outdated.forEach(el => stale(el, what + "…"));
+    const done = k => { building.delete(k); builtTable(); };
+    try {
+      for (const [k, run] of [["box", boxRun], ["horn", () => hornRun(1)], ["horn2", () => hornRun(2)]]) if (c[k]) { ((await run()) ? ok : bad).push(k); done(k); }
+      if (c.bracket) {
+        if (bad.length) { failed.bracket = "not built: it needs the " + bad.map(k => NAME[k]).join(" and "); bad.push("bracket"); }
+        else ((await bracketRun()) ? ok : bad).push("bracket");
+        done("bracket");
+      }
+      st.innerHTML = (ok.length ? esc("Built: " + ok.map(k => NAME[k]).join(", ") + ". ") : "") +
+        (bad.length ? `<span class="failtxt">${esc("Not built: " + bad.map(k => NAME[k]).join(", ") + " — see Builds.")}</span>` : "");
+      await buildSheet();
+    } finally { building.clear(); builtTable(); outdated.forEach(fresh);
+      if (buildAgain) { buildAgain = false; setTimeout(buildAll, 0); } }
+  }
+
+  // ---- live view: redrawn on every change, in the page (app/live.js); Build makes the files ----
+  const NS = "http://www.w3.org/2000/svg", INK = "#1C1C1C", FAINT = "#A6A6A6", GRIDC = "#EFEFEF", RED = "#C8331D", HATCH = "#B4B4B4";
+  const MONO = "ui-monospace,SF Mono,Menlo,monospace";
+  const P2 = (pts, close = true) => "M" + pts.map(p => (+p[0]).toFixed(2) + " " + (+p[1]).toFixed(2)).join("L") + (close ? "Z" : "");
+  const NSS = 'vector-effect="non-scaling-stroke"';
+
+  // horn section, as cast (throat up): x = r, y = z, in mm
+  const HATCH_ANGLE = { plug: 45, K_rear_plate: -45, J_jacket: 0, I_flange_ring: 90 };
+  const HATCH_NAME = { plug: "plug", K_rear_plate: "K rear plate", J_jacket: "J jacket", I_flange_ring: "I flange ring" };
+  function sectionSvg(h) {
+    const b = h.bounds, pad = 14, x0 = -pad, y0 = b.zb - pad, W = b.Er + 2 * pad, Hh = b.ztop - b.zb + 2 * pad;
+    const fs = Math.max(3, W / 95);
+    let s = `<svg viewBox="${x0} ${y0} ${W} ${Hh}" xmlns="${NS}" font-family="${MONO}" font-size="${fs}"><defs>`;
+    for (const [k, a] of Object.entries(HATCH_ANGLE))
+      s += `<pattern id="h-${k}" patternUnits="userSpaceOnUse" width="3.5" height="3.5" patternTransform="rotate(${a})"><rect width="3.5" height="3.5" fill="#F4F4F4"/><line x1="0" y1="1.75" x2="3.5" y2="1.75" stroke="${HATCH}" stroke-width="0.32"/></pattern>`;
+    s += "</defs>";
+    for (let g = Math.ceil(b.zb / 25) * 25; g <= b.ztop; g += 25) s += `<line x1="0" y1="${g}" x2="${b.Er}" y2="${g}" stroke="${GRIDC}" ${NSS} stroke-width="1"/><text x="${-3}" y="${g + fs / 3}" text-anchor="end" fill="${FAINT}">${-g}</text>`;
+    for (let g = 0; g <= b.Er; g += 25) s += `<line x1="${g}" y1="${b.zb}" x2="${g}" y2="${b.ztop}" stroke="${GRIDC}" ${NSS} stroke-width="1"/><text x="${g}" y="${b.ztop + fs * 1.6}" text-anchor="middle" fill="${FAINT}">${g}</text>`;
+    const edge = `stroke="${INK}" stroke-width="0.9" ${NSS} stroke-linejoin="round"`;
+    if (h.opts.mode === "stack" || h.opts.mode === "carve") {
+      const o = h.opts, w = h.wood || {}, m = o.mode === "carve" ? (parseFloat(w.margin) || 4) : 0;
+      s += `<path d="${P2(h.lathe)}" fill="${WOOD}" ${edge}/>`;
+      const thin = `fill="none" stroke="${INK}" stroke-width="0.5" ${NSS}`;
+      for (const L of ringLayers(h.lathe, parseFloat(w.ts) || 18, h.bounds.zmax, m))
+        for (const [ri, ro] of L.rings) s += `<path d="${P2([[ri, L.z0], [ro, L.z0], [ro, L.z1], [ri, L.z1]])}" ${thin}/>`;
+      const rb = h.chain[0][0], Rf = o.flange_od / 2;
+      s += `<path d="${P2([[rb, -o.flange_t], [Rf, -o.flange_t], [Rf, 0], [rb, 0]])}" ${thin}/>`;
+    } else if (h.opts.mode === "mould") {
+      for (const k of ["J_jacket", "I_flange_ring", "plug"]) s += `<path d="${P2(h.regions[k])}" fill="url(#h-${k})" ${edge}/>`;
+      s += resinPaths(h, RED, edge);
+      s += `<path d="${P2(h.regions.K_rear_plate)}" fill="url(#h-K_rear_plate)" ${edge}/>`;
+    } else {
+      s += resinPaths(h, "#7A7A7A", edge);
+      // the resin inside: the whole horn inset by the skin, as the build makes it (one chamber, plate and wall together)
+      s += `<path d="${P2(inset(h.lathe, h.opts.skin))}" fill="${RED}"/>`;
+    }
+    s += `<text x="${b.Er / 2}" y="${b.ztop + fs * 3.2}" text-anchor="middle" fill="${FAINT}">R (MM)</text></svg>`;
+    return s;
+  }
+  // the horn's section as one outline (plate, fillet, wall), so no seams show where the pieces meet
+  function resinPaths(h, fill, edge) { return `<path d="${P2(h.lathe)}" fill="${fill}" ${edge}/>`; }
+  // a polygon moved inwards by d, mitred corners (capped, as shapely's mitre limit)
+  function inset(poly, d) {
+    const p = poly.filter((q, i) => { const n = poly[(i + 1) % poly.length]; return Math.hypot(n[0] - q[0], n[1] - q[1]) > 1e-6; }), n = p.length;
+    let A = 0; for (let i = 0; i < n; i++) { const a = p[i], b = p[(i + 1) % n]; A += a[0] * b[1] - b[0] * a[1]; }
+    const sg = A > 0 ? 1 : -1;   // inward normal of edge (dx, dy): sg * (-dy, dx)
+    const nrm = (a, b) => { const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy); return [-sg * dy / L, sg * dx / L]; };
+    return p.map((q, i) => {
+      const a = p[(i - 1 + n) % n], c = p[(i + 1) % n], n1 = nrm(a, q), n2 = nrm(q, c);
+      const m = [n1[0] + n2[0], n1[1] + n2[1]], dot = (m[0] * n1[0] + m[1] * n1[1]) || 1e-9;
+      let k = d / dot; k = Math.min(k, 5 * d);   // the mitre: along the bisector, to reach d from both edges
+      return [q[0] + m[0] * k, q[1] + m[1] * k];
+    });
+  }
+  // the wood horn's rings: the body (z >= 0) in slabs of the sheet; in each slab the r-ranges the section covers
+  // (sampled), merged where they touch or are closer than a cutter, plus any carving margin
+  const WOOD = "#C9A27A";
+  function ringLayers(poly, ts, zmax, margin = 0, minGap = 6) {
+    const out = [], n = Math.max(1, Math.ceil(zmax / ts - 1e-6));
+    for (let k = 0; k < n; k++) {
+      const z0 = k * ts, z1 = Math.min((k + 1) * ts, zmax), ivs = [];
+      for (let j = 0; j <= 16; j++) {
+        const z = z0 + (z1 - z0) * (0.002 + 0.996 * j / 16), xs = [];
+        for (let i = 0; i < poly.length; i++) { const p = poly[i], q = poly[(i + 1) % poly.length];
+          if ((p[1] <= z) !== (q[1] <= z)) xs.push(p[0] + (z - p[1]) / (q[1] - p[1]) * (q[0] - p[0])); }
+        xs.sort((a, b) => a - b);
+        for (let i = 0; i + 1 < xs.length; i += 2) ivs.push([xs[i], xs[i + 1]]);
+      }
+      ivs.sort((a, b) => a[0] - b[0]);
+      const rings = [];
+      for (const [lo, hi] of ivs) { const l = Math.max(0, lo - margin), h = hi + margin;
+        if (rings.length && l <= rings[rings.length - 1][1] + minGap) rings[rings.length - 1][1] = Math.max(rings[rings.length - 1][1], h);
+        else rings.push([l, h]); }
+      out.push({ z0, z1: (k + 1) * ts, rings });
+    }
+    return out;
+  }
+  function hornLegend(mode) {
+    if (mode === "stack" || mode === "carve") return `<span><i style="background:${WOOD}"></i>wood, finished</span><span><i style="background:#fff;border:1px solid ${INK}"></i>${mode === "carve" ? "the blank's rings" : "rings, as cut"}</span>`;
+    const sw = a => `background:repeating-linear-gradient(${90 - a}deg, ${HATCH} 0 0.6px, #F4F4F4 0.6px 5px)`;
+    if (mode !== "mould") return `<span><i style="background:#7A7A7A"></i>printed skin</span><span><i style="background:${RED}"></i>resin</span>`;
+    return Object.entries(HATCH_ANGLE).map(([k, a]) => `<span><i style="${sw(a)}"></i>${HATCH_NAME[k]}</span>`).join("") +
+      `<span><i style="background:${RED}"></i>resin</span>`;
+  }
+
+  // a persistent 3-D view of the horn, updated in place (the camera stays where you put it)
+  const h3s = { 1: {}, 2: {} };
+  function horn3d(lathe, n = 1) {
+    const h3 = h3s[n], el = $("#horn-3d" + SX(n)); if (!window.THREE || !el.clientWidth) return;
+    if (!h3.r) {
+      h3.r = new THREE.WebGLRenderer({ antialias: true, alpha: true }); h3.r.setPixelRatio(window.devicePixelRatio);
+      h3.r.setSize(el.clientWidth, el.clientHeight); el.prepend(h3.r.domElement);
+      h3.sc = new THREE.Scene(); h3.cam = new THREE.PerspectiveCamera(32, el.clientWidth / el.clientHeight, 1, 20000);
+      cozy(h3.sc, h3.cam, h3.r);
+      h3.ctl = new THREE.OrbitControls(h3.cam, h3.r.domElement);
+      h3.ctl.addEventListener("start", () => { h3.touched = true; });        // once turned by hand, keep the view
+      h3.mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({ color: 0xE2E2E2, roughness: 0.95, metalness: 0, side: THREE.DoubleSide }));
+      h3.mesh.rotation.z = -Math.PI / 2; h3.sc.add(h3.mesh);
+      viewBar(el, [["front", "Front", [1, 0, 0]], ["back", "Back", [-1, 0, 0]], ["side", "Side", [0, 0, 1]], ["top", "Top", [0, 1, 1e-4]], ["iso", "3/4", [0.8, 0.5, 0.9]]],
+        dir => { h3.touched = true; aimCam(h3.cam, h3.ctl, new THREE.Box3().setFromObject(h3.mesh), dir); });
+      (function loop() { requestAnimationFrame(loop); h3.r.render(h3.sc, h3.cam); })();
+      new ResizeObserver(() => { if (!el.clientWidth) return; h3.r.setSize(el.clientWidth, el.clientHeight); h3.cam.aspect = el.clientWidth / el.clientHeight; h3.cam.updateProjectionMatrix(); if (!h3.touched) h3Fit(h3); }).observe(el);
+    }
+    h3.mesh.geometry.dispose();
+    h3.mesh.geometry = new THREE.LatheGeometry(lathe.map(p => new THREE.Vector2(Math.max(0, p[0]), p[1])), 160);
+    h3.mesh.geometry.computeVertexNormals();
+    if (!h3.touched) h3Fit(h3);
+  }
+
+  // the horn itself, cut through its axis: axis horizontal, throat left, mouth right (as Horn Studio draws it)
+  function hornSvg(h, sx = "") {   // sx: ids of its own, so two horns can be on the page
+    const b = h.bounds, pad = 16, tf = h.opts.flange_t, R = b.rmax, x0 = -tf - pad, W = b.zmax + tf + 2 * pad + 20, y0 = -R - pad, Hh = 2 * R + 2 * pad + 18;
+    const fs = Math.max(4, W / 42), X = z => z, Yp = r => -r, Ym = r => r;
+    let s = `<svg viewBox="${x0} ${y0} ${W} ${Hh}" xmlns="${NS}" font-family="${MONO}" font-size="${fs}"><defs>` +
+      `<pattern id="hcut${sx}" patternUnits="userSpaceOnUse" width="3" height="3" patternTransform="rotate(45)"><rect width="3" height="3" fill="#F2F2F2"/><line x1="0" y1="1.5" x2="3" y2="1.5" stroke="${HATCH}" stroke-width="0.3"/></pattern>` +
+      `<marker id="ar2${sx}" viewBox="0 0 6 6" refX="3" refY="3" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L6 3L0 6z" fill="${INK}"/></marker></defs>`;
+    const edge = `stroke="${INK}" stroke-width="0.9" ${NSS} stroke-linejoin="round"`;
+    for (const sgn of [1, -1]) {
+      const map = poly => poly.map(q => [X(q[1]), sgn > 0 ? Yp(q[0]) : Ym(q[0])]);
+      for (const poly of [h.flange, h.shell].concat(h.fillet ? [h.fillet.poly] : [])) s += `<path d="${P2(map(poly))}" fill="url(#hcut${sx})" ${edge}/>`;
+      s += `<path d="${P2(map(h.chain), false)}" fill="none" stroke="${INK}" stroke-width="1.6" ${NSS}/>`;   // the acoustic surface
+    }
+    s += `<line x1="${x0 + 4}" y1="0" x2="${b.zmax + 14}" y2="0" stroke="${RED}" stroke-width="0.8" ${NSS} stroke-dasharray="10 3 2 3"/>`;
+    const st = h.stats, zm = b.zmax + 10;
+    s += `<line x1="${zm}" y1="${-st.mouth_d / 2}" x2="${zm}" y2="${st.mouth_d / 2}" stroke="${INK}" stroke-width="0.6" ${NSS} marker-start="url(#ar2${sx})" marker-end="url(#ar2${sx})"/>`;
+    s += `<text x="${zm + 2}" y="${fs / 3}">⌀${Math.round(st.mouth_d)}</text>`;
+    const yd = R + 9;
+    s += `<line x1="${-tf}" y1="${yd}" x2="${b.zmax}" y2="${yd}" stroke="${INK}" stroke-width="0.6" ${NSS} marker-start="url(#ar2${sx})" marker-end="url(#ar2${sx})"/>`;
+    s += `<text x="${(b.zmax - tf) / 2}" y="${yd - 2}" text-anchor="middle">${Math.round(b.zmax + tf)}</text>`;
+    return s + "</svg>";
+  }
+  let liveH = null, liveH2 = null;
+  // frame the horn so it fits the viewport whatever its shape (vertical field of view, scaled for narrow views)
+  function h3Fit(h3) {
+    const bb = new THREE.Box3().setFromObject(h3.mesh); if (bb.isEmpty()) return;
+    const c = bb.getCenter(new THREE.Vector3()), rad = bb.getSize(new THREE.Vector3()).length() / 2;
+    const fov = h3.cam.fov * Math.PI / 180, fit = rad / Math.sin(fov / 2) / Math.min(1, h3.cam.aspect) * 0.78;
+    h3.ctl.target.copy(c); h3.cam.position.copy(c).add(new THREE.Vector3(0.55, 0.35, 1).normalize().multiplyScalar(fit));
+    h3.cam.near = rad / 50; h3.cam.far = rad * 60; h3.cam.updateProjectionMatrix(); h3.ctl.update();
+  }
+  function liveHorn(n = 1) {
+    const F = HF(n), sx = SX(n), el = id => $("#" + id + sx);
+    if (!window.Live || !window.computeFamily) { el("horn-sec").innerHTML = '<div class="muted">The Horn Studio engine did not load.</div>'; return; }
+    const d = formData(F);
+    if (d.source === "profile") { el("horn-sec").innerHTML = '<div class="muted">A pasted profile is drawn when you build the horn parts.</div>'; return; }
+    let h;
+    try { h = Live.hornLive(computeFamily, d); }
+    catch (e) { notes(el("horn-notes"), { ok: false, error: e.message, notes: [] }); return; }
+    if (n === 2) liveH2 = h; else liveH = h;
+    el("horn-sec").innerHTML = hornSvg(h, sx);
+    const st = h.stats;
+    stats(el("horn-stats"), [["Mouth ⌀", st.mouth_d, "mm"], ["Depth", st.depth, "mm"], ["Throat ⌀", st.throat_d, "mm"],
+      ["Wall throat→lip", `${fmt(st.wall[0])}→${fmt(st.wall[2])}`, "mm"], ["Resin", st.resin_kg, "kg"]]);
+    table(el("horn-num"), [["Mouth ⌀", st.mouth_d, "mm"], ["Depth, throat to front", st.depth, "mm"], ["Throat ⌀", st.throat_d, "mm"],
+      ["Entry angle", st.entry, "°"], ["Wall: throat / middle / lip", st.wall, "mm"], ["Horn volume", st.volume_cm3, "cm³"],
+      ["Resin (horn)", st.resin_kg, "kg"], ["Lip end r, z", st.lip_end, "mm"], ["Horn Studio", h.res.terminated]]);
+    notes(el("horn-notes"), { ok: true, notes: h.notes });
+    horn3d(h.lathe, n);
+    try { acData[n] = hornAcData(h, d); } catch (e) { acData[n] = { error: e.message }; }
+    drawAc(1); if (threeWay()) drawAc(2);
+    liveMould(); liveBracket();
+  }
+  // Horn Studio's own estimates, called as Horn Studio calls them for a round JMLC (wavefront coordinate)
+  const acData = { 1: null, 2: null };
+  function hornAcData(h, d) {
+    const r = h.res, prof = { H: r.wall, V: r.wall, shape: "ellipse", rho: 0 };
+    const sm = r.Ttrace && r.Ttrace.length === r.wall.length ? r.wall.map((w, i) => ({ z: w.z, s: r.Ttrace[i].s })) : null;
+    const mode = sm ? "wavefront" : "axial", f = [];
+    for (let i = 0; i < 90; i++) f.push(100 * Math.pow(200, i / 89));
+    const Z = throatImpedance(prof, f, mode, sm), P = hornResponse(prof, f, mode, sm);
+    const mouth = 2 * Math.max.apply(null, r.wall.map(q => q.r));
+    const D = directivityEstimate(f, mouth, mouth, null, null);
+    const M = hornMaxSPL(prof, f, mode, sm, { qArr: D.bwH.map((t, i) => 32400 / (t * D.bwV[i])) });
+    // loading converged? (Horn Studio's test: top-octave ripple under 15 % of the asymptote)
+    const top = Z.slice(-20), asym = top.reduce((a, z) => a + z.re, 0) / top.length, rip = Math.max.apply(null, top.map(z => Math.abs(z.re - asym)));
+    const cross = (ys, lvl) => { for (let i = ys.length - 1; i > 0; i--) if (ys[i - 1] < lvl && ys[i] >= lvl) {
+      const t = (lvl - ys[i - 1]) / (ys[i] - ys[i - 1]); return Math.exp(Math.log(f[i - 1]) + t * (Math.log(f[i]) - Math.log(f[i - 1]))); } return null; };
+    const re = Z.map(z => z.re), db = P.map(p => p.db);
+    return { f, re, im: Z.map(z => z.im), db, bw: D.bwH, di: D.di, mx: M.map(m => m.maxSPL10), fc: +d.fc || 600, asym, rip,
+      conv: isFinite(asym) && asym > 0.3 && rip / asym < 0.15, fHalf: cross(re, 0.5 * asym), f3: cross(db, -3) };
+  }
+  function drawAc(n) {
+    const a = acData[n], sx = SX(n), el = id => $("#" + id + sx);
+    if (!a) return;
+    if (a.error) { el("horn-charts").innerHTML = `<div class="muted">${esc(a.error)}</div>`; return; }
+    const o = threeWay() ? acData[n === 2 ? 1 : 2] : null, other = o && !o.error ? o : null;
+    const me = threeWay() ? `horn ${n}` : "this horn", them = `horn ${n === 2 ? 1 : 2}`;
+    const f = a.f, at = (ys, x) => interpAt(Math.log(x), f.map(Math.log), ys);
+    stats(el("horn-ac-stats"), [["Design fc", a.fc, "Hz"], ["Response −3 dB", a.f3 && Math.round(a.f3), "Hz"], ["Loading ½", a.fHalf && Math.round(a.fHalf), "Hz"],
+      ["Beamwidth 2 kHz", Math.round(at(a.bw, 2000)), "°"], ["Beamwidth 10 kHz", Math.round(at(a.bw, 10000)), "°"],
+      ["DI 5 kHz", +at(a.di, 5000).toFixed(1), "dB"], ["Max SPL 2 kHz", Math.round(at(a.mx, 2000)), "dB"]]);
+    const dv = (typeof hdrv !== "undefined") && hdrv[formData(HF(n)).hdriver], xo = dv && dv.crossover_min_hz;
+    const FX = { fx: [100, 20000] }, vfc = { x: a.fc, color: FAINT, label: "fc" }, vxo = xo ? [{ x: xo, color: "#7A7A7A", dash: "1 2", label: "driver xo", top: true, row: 1 }] : [];
+    const pair = (mine, theirs, label) => [{ y: mine, color: INK, label: me + (label ? " " + label : "") }]
+      .concat(other ? [{ y: theirs, color: "#B9B9B9", width: 1, label: them + (label ? " " + label : "") }] : []);
+    el("horn-charts").innerHTML =
+      chartSvg("THROAT LOADING — Z / ρc (REAL PART" + (other ? "" : "; DASHED: IMAGINARY") + ")", f,
+        pair(a.re, other && other.re).concat(other ? [] : [{ y: a.im, color: FAINT, dash: "3 2", label: "imaginary" }]),
+        Object.assign({ ylim: [0, 1.6], hlines: [{ y: 1, color: GRIDC }], vlines: [vfc].concat(vxo, a.fHalf ? [{ x: a.fHalf, color: RED, label: "½ loaded", top: true }] : []) }, FX)) +
+      chartSvg("RADIATED POWER — DB RE PASSBAND (SHAPE)", f, pair(a.db, other && other.db),
+        Object.assign({ ylim: [-30, 5], hlines: [{ y: -3, color: RED, dash: "1.5 2.5", label: "−3 dB" }], vlines: [vfc].concat(vxo) }, FX)) +
+      chartSvg("BEAMWIDTH −6 DB (°) · KEELE ESTIMATE", f, pair(a.bw, other && other.bw), Object.assign({ ylim: [0, 190], vlines: [vfc] }, FX)) +
+      chartSvg("MAX SPL AT 1 M — AIR DISTORTION, 10 % H2 (DB)", f, pair(a.mx, other && other.mx), Object.assign({ ylim: [100, 160], vlines: [vfc] }, FX));
+    el("horn-ac-note").innerHTML = (a.conv ? "" : `<span class="err">The 1-D model doesn't converge for this shape (asymptote ${a.asym.toFixed(2)}, ripple ±${a.rip.toFixed(2)}): read the loading as shape only.</span><br>`) +
+      (other ? `Grey: ${them} (fc ${fmt(other.fc)} Hz), to see where the two horns overlap. ` : "") +
+      (xo ? `Dotted: the ${esc(dv.name)}'s lowest crossover, ${xo} Hz${dv.crossover_min_slope_db_oct ? ` at ≥ ${dv.crossover_min_slope_db_oct} dB/oct` : ""}` +
+        (a.f3 && a.f3 > xo ? ` — the horn's −3 dB point (${Math.round(a.f3)} Hz) is above it, so the horn sets the crossover. ` : ". ") : "") +
+      "Loading: where the real part reaches 1 the horn loads the driver fully; below about half of it the driver works unloaded. " +
+      "Power response: a shape, not SPL — the driver sets the level, on-axis also depends on directivity. " +
+      "Beamwidth: the trend from the mouth size (a JMLC keeps narrowing), not polars. " +
+      "Max SPL: the ceiling air sets in the horn itself; a real driver sits a few dB lower. Check with BEM before committing.";
+  }
+
+  // the mould, as cast (build tab): the horn's design with the mould settings
+  // the bracket's flat pattern drawn as tall as the mould's section beside it
+  function pairHeights() {
+    const m = $("#mould-sec svg"), fs9 = $$("#br-flat svg"); if (!fs9.length) return;
+    const h = m ? m.getBoundingClientRect().height : 0; fs9.forEach(f => f.style.height = h ? h + "px" : ""); }
+  new ResizeObserver(() => pairHeights()).observe($("#mould-sec"));
+  function liveMould() {
+    if (!window.Live || !window.computeFamily) return;
+    const m = mk(), ns = threeWay() ? [1, 2] : [1], svgs = [], warns = [];
+    let mode = m.mode;
+    for (const n of ns) {
+      const d = Object.assign(formData(HF(n)), { mode: m.mode, skin: m.skin, wall: m.mould_wall, base: m.mould_base });
+      const lab = ns.length > 1 ? `<div class="muted" style="text-align:center">horn ${n}</div>` : "";
+      if (d.source === "profile") { svgs.push(`<div class="mould1">${lab}<div class="muted">A pasted profile is drawn when you build the horn parts.</div></div>`); continue; }
+      try { const h = Live.hornLive(computeFamily, d); h.wood = { ts: m.h_sheet_t, margin: m.h_margin }; svgs.push(`<div class="mould1">${lab}${sectionSvg(h)}</div>`); mode = h.opts.mode;
+        const thin = Math.min(h.opts.thickness, h.opts.thickness_throat || Infinity), sk = h.opts.skin;
+        if (h.opts.mode === "skin" && thin < 2 * sk + 2) warns.push(`${ns.length > 1 ? `Horn ${n}: a` : "A"} ${fmt(thin)} mm wall can't hold two ${fmt(sk)} mm skins with resin between them: make the wall at least ${fmt(2 * sk + 2)} mm (${ns.length > 1 ? `Horn ${n}` : "Horn"} tab), thin the skin, or cast it solid.`); }
+      catch (e) { svgs.push(`<div class="mould1">${lab}<div class="muted">${esc(e.message)}</div></div>`); }
+    }
+    $("#mould-title").textContent = { stack: "Horn — the stacked rings over the finished shape, throat up · live",
+      carve: "Horn — the glued blank's rings over the carved shape, throat up · live", skin: "Horn skin — section as printed, throat up · live" }[mode]
+      || "Horn mould — section as cast, throat up · live";
+    $("#mould-sec").innerHTML = svgs.join(""); $("#mould-legend").innerHTML = hornLegend(mode);
+    $("#mould-warn").innerHTML = warns.length ? `<div class="notes">${warns.map(w => `<div class="err">${w}</div>`).join("")}</div>` : "";
+    pairHeights();
+  }
+
+
+  // response charts
+  function chartSvg(title, f, series, o) {
+    const W = 460, H = 250, L = 36, R = 8, T = 20, B = 24, pw = W - L - R, ph = H - T - B;
+    const fx0 = o.fx ? o.fx[0] : 10, fx1 = o.fx ? o.fx[1] : 2000;
+    const lx = v => L + (Math.log10(v) - Math.log10(fx0)) / (Math.log10(fx1) - Math.log10(fx0)) * pw;
+    let lo = o.ylim ? o.ylim[0] : Infinity, hi = o.ylim ? o.ylim[1] : -Infinity;
+    if (!o.ylim) { series.forEach(sr => sr.y.forEach(v => { if (isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); } })); const p = (hi - lo) * 0.08 || 1; lo -= p; hi += p; }
+    const ly = v => T + (1 - (Math.min(hi, Math.max(lo, v)) - lo) / (hi - lo)) * ph;
+    const step = [1, 2, 5, 10, 20, 25, 50, 100].find(s => (hi - lo) / s <= 7) || 100;
+    let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="${NS}" font-family="${MONO}" font-size="8">`;
+    s += `<text x="${L}" y="11" fill="${INK}" font-size="8.5">${title}</text>`;
+    for (let dec = 10; dec <= 10000; dec *= 10) for (let m = 1; m < 10; m++) { const v = dec * m; if (v < fx0 || v > fx1) continue;
+      s += `<line x1="${lx(v)}" y1="${T}" x2="${lx(v)}" y2="${T + ph}" stroke="${GRIDC}"/>`; }
+    [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000].filter(v => v >= fx0 && v <= fx1)
+      .forEach(v => s += `<text x="${lx(v)}" y="${H - 9}" text-anchor="middle" fill="${FAINT}">${v >= 1000 ? v / 1000 + "k" : v}</text>`);
+    (o.vlines || []).forEach(vl => { if (vl.x < fx0 || vl.x > fx1) return;
+      s += `<line x1="${lx(vl.x)}" y1="${T}" x2="${lx(vl.x)}" y2="${T + ph}" stroke="${vl.color}" stroke-width="0.8" stroke-dasharray="${vl.dash || "3 2"}"/>` +
+        (vl.label ? `<text x="${lx(vl.x) + 3}" y="${vl.top ? T + 8 + 10 * (vl.row || 0) : T + ph - 4}" fill="${vl.color}" font-size="7">${esc(vl.label)}</text>` : ""); });
+    for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) s += `<line x1="${L}" y1="${ly(v)}" x2="${L + pw}" y2="${ly(v)}" stroke="${GRIDC}"/><text x="${L - 4}" y="${ly(v) + 3}" text-anchor="end" fill="${FAINT}">${v}</text>`;
+    (o.hlines || []).forEach(hl => s += `<line x1="${L}" y1="${ly(hl.y)}" x2="${L + pw}" y2="${ly(hl.y)}" stroke="${hl.color}" stroke-width="0.8" ${hl.dash ? `stroke-dasharray="${hl.dash}"` : ""}/>`);
+    series.forEach(sr => s += `<path d="${P2(f.map((v, i) => [lx(v), ly(sr.y[i])]), false)}" fill="none" stroke="${sr.color}" stroke-width="${sr.width || 1.2}" ${sr.dash ? `stroke-dasharray="${sr.dash}"` : ""}/>`);
+    const leg = series.filter(sr => sr.label).concat((o.hlines || []).filter(hl => hl.label).map(hl => ({ color: hl.color, dash: hl.dash, label: hl.label, width: 0.8 })));
+    leg.forEach((sr, i) => { const y = T + 8 + i * 10, x = o.legendLeft ? L + 8 : W - R - 150;
+      s += `<line x1="${x}" y1="${y}" x2="${x + 16}" y2="${y}" stroke="${sr.color}" stroke-width="${sr.width || 1.2}" ${sr.dash ? `stroke-dasharray="${sr.dash}"` : ""}/><text x="${x + 21}" y="${y + 3}" fill="${INK}">${esc(sr.label)}</text>`; });
+    s += `<text x="${L + pw / 2}" y="${H - 1}" text-anchor="middle" fill="${FAINT}" font-size="7">HZ</text></svg>`;
+    return s;
+  }
+  let drv = null;
+  async function loadDriver() {
+    const name = $("select[name=driver]", fb).value || "dsa215-8";
+    try { drv = await (await fetch(STATIC ? "drivers/" + encodeURIComponent(name) + ".json" : "/api/driver?name=" + encodeURIComponent(name))).json(); } catch (e) { drv = null; }
+    liveBox();
+  }
+  const interpAt = (x, xs, ys) => { for (let i = 1; i < xs.length; i++) if (xs[i] >= x) { const t = (x - xs[i - 1]) / (xs[i] - xs[i - 1]); return ys[i - 1] + t * (ys[i] - ys[i - 1]); } return ys[ys.length - 1]; };
+  // the box, drawn to scale: front elevation and the section through the woofer's centre (mm; y up)
+  function boxDrawSvg(g) {
+    const gap = 70, dimL = 64, W = dimL + g.We + gap + g.De + 40, Hh = g.He + 66, top = 18;
+    const fx = dimL, sx = dimL + g.We + gap, Y = y => top + g.He - y;         // y up -> svg down
+    const fs = Math.max(6, Hh / 55), ln = `stroke="${INK}" stroke-width="1" ${NSS} fill="none"`, thin = `stroke="${INK}" stroke-width="0.6" ${NSS} fill="none"`;   // drawn 480 px tall: the same text size whatever the box
+    const dash = `stroke="${INK}" stroke-width="0.6" ${NSS} fill="none" stroke-dasharray="4 3"`, grey = `stroke="${FAINT}" stroke-width="0.7" ${NSS} fill="none"`;
+    const red = `stroke="${RED}" stroke-width="1" ${NSS} fill="none"`;
+    let s = `<svg viewBox="0 0 ${W} ${Hh}" xmlns="${NS}" font-family="${MONO}" font-size="${fs}"><defs>` +
+      `<pattern id="hc" patternUnits="userSpaceOnUse" width="4" height="4" patternTransform="rotate(45)"><rect width="4" height="4" fill="#F4F4F4"/><line x1="0" y1="2" x2="4" y2="2" stroke="${HATCH}" stroke-width="0.4"/></pattern>` +
+      `<marker id="ar" viewBox="0 0 6 6" refX="3" refY="3" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L6 3L0 6z" fill="${INK}"/></marker></defs>`;
+    const dim = (x1, y1, x2, y2, txt, off) => {   // a dimension line with arrows and its value
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2, vert = Math.abs(x1 - x2) < 1e-6;
+      return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${INK}" stroke-width="0.6" ${NSS} marker-start="url(#ar)" marker-end="url(#ar)"/>` +
+        (vert ? `<text transform="translate(${mx - 4} ${my}) rotate(-90)" text-anchor="middle">${txt}</text>`
+              : `<text x="${mx}" y="${my - 3}" text-anchor="middle">${txt}</text>`); };
+    const r1 = v => Math.round(v);
+    // ---- front elevation
+    s += `<text x="${fx}" y="${top - 6}" fill="${FAINT}">FRONT</text>`;
+    s += `<rect x="${fx}" y="${Y(g.He)}" width="${g.We}" height="${g.He}" fill="#F4F4F4" ${ln}/>`;
+    s += `<rect x="${fx + g.t}" y="${Y(g.He - g.t)}" width="${g.Wi}" height="${g.Hi}" ${dash}/>`;          // the inside, hidden
+    const cx = fx + g.We / 2, cy = Y(g.yd);
+    s += `<circle cx="${cx}" cy="${cy}" r="${g.od / 2 + 0.75}" ${thin}/><circle cx="${cx}" cy="${cy}" r="${g.cut / 2}" fill="#FFFFFF" ${ln}/>`;
+    s += `<circle cx="${cx}" cy="${cy}" r="${g.rch}" ${dash}/>`;
+    for (let k = 0; k < g.screw_n; k++) { const a = (90 + 360 * k / g.screw_n) * Math.PI / 180;
+      s += `<circle cx="${cx + g.screw_bc / 2 * Math.cos(a)}" cy="${cy - g.screw_bc / 2 * Math.sin(a)}" r="3" ${thin}/>`; }
+    s += `<line x1="${cx - 14}" y1="${cy}" x2="${cx + 14}" y2="${cy}" ${red}/><line x1="${cx}" y1="${cy - 14}" x2="${cx}" y2="${cy + 14}" ${red}/>`;
+    const P = g.port;
+    if (P && P.kind === "slot" && P.side === "front") s += `<rect x="${fx + g.t}" y="${Y(g.t + P.h)}" width="${g.Wi}" height="${P.h}" fill="#FFFFFF" ${ln}/>`;
+    if (P && P.kind === "round" && P.side === "front") s += `<circle cx="${cx}" cy="${Y(P.yp)}" r="${P.Dp / 2}" fill="#FFFFFF" ${ln}/><circle cx="${cx}" cy="${Y(P.yp)}" r="${P.Dout / 2 + P.flare}" ${thin}/>`;
+    s += dim(fx - 10, Y(0), fx - 10, cy, `${r1(g.yd)}`);                                       // woofer centre height
+    s += `<line x1="${fx - 14}" y1="${cy}" x2="${cx - g.od / 2}" y2="${cy}" stroke="${FAINT}" stroke-width="0.5" ${NSS} stroke-dasharray="2 2"/>`;
+    s += dim(fx - 32, Y(0), fx - 32, Y(g.He), `${r1(g.He)}`);
+    s += dim(fx, Y(0) + 14, fx + g.We, Y(0) + 14, `${r1(g.We)}`);
+    s += `<text x="${fx - 10}" y="${Y(0) + 30}" fill="${RED}">WOOFER CENTRE ${r1(g.yd)} FROM THE BOTTOM</text>`;
+    // ---- section through the woofer's centre (looking from the left; the front is on the left)
+    const X = z => sx + z;
+    s += `<text x="${sx}" y="${top - 6}" fill="${FAINT}">SECTION</text>`;
+    // walls, cut (hatched), each drawn with its real outline: openings and their rounded edges included
+    const t = g.t, He = g.He, De = g.De, Db = De - t;
+    const arc = (cz, cy, r, a0, a1, n = 10) => { const out = []; for (let k = 0; k <= n; k++) { const a = (a0 + (a1 - a0) * k / n) * Math.PI / 180; out.push([cz + r * Math.cos(a), cy + r * Math.sin(a)]); } return out; };
+    const cut = poly => `<path d="${P2(poly.map(q => [X(q[0]), Y(q[1])]))}" fill="url(#hc)" ${ln}/>`;
+    const tube = poly => `<path d="${P2(poly.map(q => [X(q[0]), Y(q[1])]))}" fill="#D9D9D9" ${thin}/>`;
+    const rect = (z0, y0, z1, y1) => [[z0, y0], [z1, y0], [z1, y1], [z0, y1]];
+    const slotF = P && P.kind === "slot" && P.side === "front", slotB = P && P.kind === "slot" && P.side === "back";
+    const roundF = P && P.kind === "round" && P.side === "front", roundB = P && P.kind === "round" && P.side === "back";
+    // top wall
+    s += cut(rect(0, He - t, Db, He));
+    // bottom wall: its front top corner is the slot's rounded lower edge when the slot opens at the front
+    s += cut(slotF ? [[0, 0], [Db, 0], [Db, t]].concat(arc(P.R, t - P.R, P.R, 90, 180)) : rect(0, 0, Db, t));
+    // front wall: below the woofer's hole (rebate, straight cutout, chamfer to the inside) and above it
+    const reb = g.frame_t, zs = reb + g.straight, rc = g.cut / 2, ro = g.od / 2 + 0.75;
+    const holeLow = [[0, g.yd - ro], [reb, g.yd - ro], [reb, g.yd - rc], [zs, g.yd - rc], [t, g.yd - g.rch]];
+    if (slotF) s += cut([[t, t + P.h]].concat(arc(P.R, t + P.h + P.R, P.R, -90, -180)).concat(holeLow));
+    else if (roundF) {
+      s += cut(rect(0, t, t, P.yp - P.Dout / 2));
+      s += cut([[t, P.yp + P.Dout / 2], [0, P.yp + P.Dout / 2]].concat(holeLow));
+    } else s += cut([[t, t], [0, t]].concat(holeLow));
+    s += cut([[0, He - t], [0, g.yd + ro], [reb, g.yd + ro], [reb, g.yd + rc], [zs, g.yd + rc], [t, g.yd + g.rch], [t, He - t]]);
+    // back panel: whole, or split round the opening (rounded edges on its outside face)
+    if (slotB) {
+      s += cut([[Db, 0], [De, 0]].concat(arc(De - P.R, t - P.R, P.R, 0, 90)).concat([[Db, t]]));
+      s += cut([[Db, t + P.h]].concat(arc(De - P.R, t + P.h + P.R, P.R, -90, 0)).concat([[De, He], [Db, He]]));
+    } else if (roundB) {
+      s += cut(rect(Db, 0, De, P.yp - P.Dout / 2)) + cut(rect(Db, P.yp + P.Dout / 2, De, He));
+    } else s += cut(rect(Db, 0, De, He));
+    // the slot's shelf (cast with the body), its inner end rounded
+    if (P && P.kind === "slot") {
+      const R2 = Math.min(P.R, P.ts - 2), yb = t + P.h, yt = t + P.h + P.ts;
+      if (slotF) s += cut([[t, yb]].concat(arc(P.L - R2, yb + R2, R2, -90, 0)).concat([[P.L, yt], [t, yt]]));
+      else { const z0 = De - P.L; s += cut([[z0 + R2, yb], [Db, yb], [Db, yt], [z0, yt]].concat(arc(z0 + R2, yb + R2, R2, 180, 270))); }
+      s += dim(X(slotF ? 0 : De - P.L), Y(t + P.h / 2), X(slotF ? P.L : De), Y(t + P.h / 2), `slot ${r1(P.L)}`);
+    }
+    // the round port: a printed tube cast through its wall
+    if (P && P.kind === "round") {
+      const z0 = roundF ? 0 : De - P.L, z1 = roundF ? P.L : De;
+      s += tube(rect(z0, P.yp - P.Dout / 2, z1, P.yp - P.Dp / 2)) + tube(rect(z0, P.yp + P.Dp / 2, z1, P.yp + P.Dout / 2));
+      s += dim(X(z0), Y(P.yp), X(z1), Y(P.yp), `port ${r1(P.L)}`);
+    }
+    // the woofer, in outline: frame, basket, magnet
+    const fz = reb, bz = 58.5, mz = g.depth;
+    s += `<path d="${P2([[X(0), Y(g.yd + g.od / 2)], [X(fz), Y(g.yd + g.od / 2)], [X(fz), Y(g.yd + g.cut / 2)], [X(bz), Y(g.yd + g.mag / 2)],
+      [X(bz), Y(g.yd - g.mag / 2)], [X(fz), Y(g.yd - g.cut / 2)], [X(fz), Y(g.yd - g.od / 2)], [X(0), Y(g.yd - g.od / 2)]])}" ${grey}/>`;
+    s += `<rect x="${X(bz)}" y="${Y(g.yd + g.mag / 2)}" width="${mz - bz}" height="${g.mag}" ${grey}/>`;
+    s += `<line x1="${X(-6)}" y1="${Y(g.yd)}" x2="${X(mz + 10)}" y2="${Y(g.yd)}" stroke="${RED}" stroke-width="0.8" ${NSS} stroke-dasharray="8 3 2 3"/>`;
+    s += dim(X(0), Y(0) + 14, X(g.De), Y(0) + 14, `${r1(g.De)}`);
+    s += dim(X(g.De) + 16, Y(0), X(g.De) + 16, Y(g.He), `${r1(g.He)}`).replace(`translate(${X(g.De) + 16 - 4} `, `translate(${X(g.De) + 16 + 10} `);
+    return s + "</svg>";
+  }
+
+
+  // ---- a 3-way's woofer box: sub + midbass, two sealed chambers (Live.dualLive) ----
+  let drvSub = null;
+  async function loadSubDriver() {
+    const name = $("select[name=sub_driver]", fb).value; if (!name) { drvSub = null; return liveBox(); }
+    try { drvSub = await (await fetch(STATIC ? "drivers/" + encodeURIComponent(name) + ".json" : "/api/driver?name=" + encodeURIComponent(name))).json(); } catch (e) { drvSub = null; }
+    liveBox();
+  }
+  function liveDual(d) {
+    if (!drvSub) { notes($("#box-notes"), { ok: false, error: "Choose the subwoofer's driver.", notes: [] }); return; }
+    let r;
+    try { r = Live.dualLive(drv, drvSub, d, 500); liveB = r; }
+    catch (e) { notes($("#box-notes"), { ok: false, error: e.message, notes: [] }); return; }
+    const f = r.f, D = r.dual, em = r.mid, es = r.sub, o = r.opts;
+    $("#box-draw").innerHTML = dualDrawSvg(r.box.geom);
+    const xo = [{ x: D.xo, color: FAINT, label: `crossover ${D.xo} Hz` }];
+    $("#box-charts").innerHTML =
+      chartSvg("SPL — THE PAIR, AS THE DSP JOINS THEM, 2.83 V REF / 1 M, HALF SPACE (DB)", f,
+        [{ y: D.spl, color: INK, label: "sub + midbass" }, { y: D.splM, color: "#7A7A7A", width: 1, label: `midbass, ${esc(drv.name)}` },
+         { y: D.splS, color: "#B9B9B9", width: 1, label: `sub, ${esc(drvSub.name)}${D.f0 ? `, boosted to ${D.f0} Hz` : ""}` }], { ylim: [60, 105], vlines: xo }) +
+      chartSvg("MAX SPL — XMAX, AMP, POWER (DB)", f,
+        [{ y: D.mx, color: INK, label: "the pair" }, { y: em.mx, color: "#7A7A7A", width: 1, label: `midbass alone, ${o.amp_v} V` },
+         { y: es.mx, color: "#B9B9B9", width: 1, label: `sub alone, ${num0(d.sub_amp_v, 25)} V` }], { ylim: [70, 125], vlines: xo }) +
+      chartSvg("EXCURSION (MM PEAK) AT MAX AMP, UNFILTERED", f,
+        [{ y: em.rh.x.map(v => v * 1000 * o.amp_v / 2.83), color: "#7A7A7A", label: "midbass" },
+         { y: es.rh.x.map(v => v * 1000 * num0(d.sub_amp_v, 25) / 2.83), color: "#B9B9B9", label: "sub" }],
+        { ylim: [0, 25], hlines: [{ y: drv.xmax_mm, color: RED, label: `midbass Xmax ${drv.xmax_mm}` }, { y: drvSub.xmax_mm, color: RED, dash: "1.5 2.5", label: `sub Xmax ${drvSub.xmax_mm}` }] }) +
+      chartSvg("IMPEDANCE (OHM)", f, [{ y: em.r.Zin, color: "#7A7A7A", label: "midbass" }, { y: es.r.Zin, color: "#B9B9B9", label: "sub" }], {});
+    const Dz = [em, es], row = (l, fn, u) => `<tr><td>${l}</td>${Dz.map(e => { const v = fn(e); return `<td class="v">${v === undefined || v === null ? "" : fmt(v) + (u ? " " + u : "")}</td>`; }).join("")}</tr>`;
+    $("#box-designs").innerHTML = `<tr><td></td><td class="v"><b>midbass</b></td><td class="v"><b>sub</b></td></tr>` +
+      row("Driver", e => e === em ? drv.name : drvSub.name) + row("Net volume", e => e.net_volume_L, "L") + row("fc", e => e.fc, "Hz") + row("Qtc", e => e.Qtc) +
+      row("f3 (alone)", e => e.f3, "Hz") + row("Sensitivity 2.83 V/1 m", e => e.passband_spl, "dB") +
+      [30, 40, 60, 100].map(q => row(`Max SPL ${q} Hz (alone)`, e => interpAt(q, f, e.mx), "dB")).join("");
+    const bx = r.box, g = bx.geom;
+    stats($("#box-stats"), [["Layout", "sub + midbass"], ["Midbass", `${fmt(em.net_volume_L)} L`], ["Sub", `${fmt(es.net_volume_L)} L`], ["f3 (pair)", D.f3, "Hz"],
+      ["Crossover", D.xo, "Hz"], ["Max SPL 40 Hz", interpAt(40, f, D.mx), "dB"], [bx.material === "wood" ? "Wood ≈" : "Concrete ≈", bx.mass_kg, "kg"]]);
+    table($("#box-num"), [["Outside", bx.outer, "mm"], ["Inside, sub chamber", [g.Wi, g.dual.Hs, g.Di], "mm"], ["Inside, midbass chamber", [g.Wi, g.dual.Hm, g.Di], "mm"],
+      ["Midbass centre from bottom", g.dual.mid.yd, "mm"], ["Sub centre from bottom", g.dual.sub.yd, "mm"],
+      ["Sub in the DSP", `+${fmt(D.gain_db)} dB${D.f0 ? `, bass boost to ${D.f0} Hz (up to +${fmt(D.boost_db)} dB)` : ""}`],
+      [bx.material === "wood" ? `Wood ≈ (at ${fmt(+mk().b_density || 0.68)} g/cm³)` : "Concrete ≈ (at 2.2 kg/L)", bx.mass_kg, "kg"]]);
+    const extra = bx.material !== "wood" ? ["Two chambers are built in wood for now: on Build & assemble, make the woofer box as wood panels."] : [];
+    notes($("#box-notes"), { ok: true, notes: extra.concat(r.notes) });
+    for (const [k, v] of Object.entries({ width: g.Wi, depth: g.Di, sub_vb: es.net_volume_L })) { const el = fb.querySelector(`[name="${k}"]`); if (el) { el.placeholder = `${fmt(v)}`; el.title = "automatic: " + fmt(v); } }
+    liveBracket();
+  }
+  // the 3-way's box drawn to scale: front elevation and the section through the drivers (mm; y up)
+  function dualDrawSvg(g) {
+    const gap = 70, dimL = 70, W = dimL + g.We + gap + g.De + 40, Hh = g.He + 66, top = 18, G = g.dual;
+    const fx = dimL, sx = dimL + g.We + gap, Y = y => top + g.He - y;
+    const fs = Math.max(6, Hh / 55), ln = `stroke="${INK}" stroke-width="1" ${NSS} fill="none"`, thin = `stroke="${INK}" stroke-width="0.6" ${NSS} fill="none"`;   // drawn 480 px tall: the same text size whatever the box
+    const dash = `stroke="${INK}" stroke-width="0.6" ${NSS} fill="none" stroke-dasharray="4 3"`, grey = `stroke="${FAINT}" stroke-width="0.7" ${NSS} fill="none"`;
+    const red = `stroke="${RED}" stroke-width="1" ${NSS} fill="none"`;
+    let s = `<svg viewBox="0 0 ${W} ${Hh}" xmlns="${NS}" font-family="${MONO}" font-size="${fs}"><defs>` +
+      `<pattern id="hc2" patternUnits="userSpaceOnUse" width="4" height="4" patternTransform="rotate(45)"><rect width="4" height="4" fill="#F4F4F4"/><line x1="0" y1="2" x2="4" y2="2" stroke="${HATCH}" stroke-width="0.4"/></pattern>` +
+      `<marker id="ar3" viewBox="0 0 6 6" refX="3" refY="3" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L6 3L0 6z" fill="${INK}"/></marker></defs>`;
+    const dim = (x1, y1, x2, y2, txt) => { const mx = (x1 + x2) / 2, my = (y1 + y2) / 2, vert = Math.abs(x1 - x2) < 1e-6;
+      return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${INK}" stroke-width="0.6" ${NSS} marker-start="url(#ar3)" marker-end="url(#ar3)"/>` +
+        (vert ? `<text transform="translate(${mx - 4} ${my}) rotate(-90)" text-anchor="middle">${txt}</text>` : `<text x="${mx}" y="${my - 3}" text-anchor="middle">${txt}</text>`); };
+    const r1 = Math.round, t = g.t, [p0, p1] = G.partition;
+    s += `<text x="${fx}" y="${top - 6}" fill="${FAINT}">FRONT</text>`;
+    s += `<rect x="${fx}" y="${Y(g.He)}" width="${g.We}" height="${g.He}" fill="#F4F4F4" ${ln}/>`;
+    s += `<rect x="${fx + t}" y="${Y(g.He - t)}" width="${g.Wi}" height="${g.He - 2 * t}" ${dash}/>`;
+    s += `<line x1="${fx + t}" y1="${Y(p0)}" x2="${fx + t + g.Wi}" y2="${Y(p0)}" ${dash}/><line x1="${fx + t}" y1="${Y(p1)}" x2="${fx + t + g.Wi}" y2="${Y(p1)}" ${dash}/>`;
+    const cx = fx + g.We / 2;
+    [["MIDBASS", G.mid], ["SUB", G.sub]].forEach(([nm, q], i) => { const cy = Y(q.yd);
+      s += `<circle cx="${cx}" cy="${cy}" r="${q.od / 2}" ${thin}/><circle cx="${cx}" cy="${cy}" r="${q.cut / 2}" fill="#FFFFFF" ${ln}/>`;
+      for (let k = 0; k < q.screw_n; k++) { const a = (90 + 360 * k / q.screw_n) * Math.PI / 180;
+        s += `<circle cx="${cx + q.screw_bc / 2 * Math.cos(a)}" cy="${cy - q.screw_bc / 2 * Math.sin(a)}" r="3" ${thin}/>`; }
+      s += `<line x1="${cx - 14}" y1="${cy}" x2="${cx + 14}" y2="${cy}" ${red}/><line x1="${cx}" y1="${cy - 14}" x2="${cx}" y2="${cy + 14}" ${red}/>`;
+      s += `<text x="${cx}" y="${cy + q.cut / 2 - 8}" text-anchor="middle" fill="${FAINT}">${nm}</text>`;
+      s += dim(fx - 14 - 18 * i, Y(0), fx - 14 - 18 * i, cy, `${nm.toLowerCase()} ${r1(q.yd)}`); });
+    s += dim(fx - 54, Y(0), fx - 54, Y(g.He), `${r1(g.He)}`);
+    s += dim(fx, Y(0) + 14, fx + g.We, Y(0) + 14, `${r1(g.We)}`);
+    // section: walls and the partition cut, the drivers in outline
+    const X = z => sx + z, De = g.De, Db = De - t, He = g.He;
+    s += `<text x="${sx}" y="${top - 6}" fill="${FAINT}">SECTION</text>`;
+    const cut = poly => `<path d="${P2(poly.map(q => [X(q[0]), Y(q[1])]))}" fill="url(#hc2)" ${ln}/>`;
+    const rect = (z0, y0, z1, y1) => [[z0, y0], [z1, y0], [z1, y1], [z0, y1]];
+    s += cut(rect(0, He - t, Db, He)) + cut(rect(0, 0, Db, t)) + cut(rect(Db, 0, De, He)) + cut(rect(t, p0, Db, p1));
+    const holes = [G.sub, G.mid].map(q => [q.yd - q.cut / 2, q.yd + q.cut / 2]);
+    let y = t; for (const [a, b] of holes) { s += cut(rect(0, y, t, a)); y = b; } s += cut(rect(0, y, t, He - t));
+    [G.mid, G.sub].forEach(q => { const fz = q.frame_t <= t / 2 ? q.frame_t : 0, bz = Math.min(q.depth * 0.45, q.depth - 20), mz = q.depth;
+      s += `<path d="${P2([[X(fz - (fz ? 0 : q.frame_t)), Y(q.yd + q.od / 2)], [X(fz), Y(q.yd + q.od / 2)], [X(fz), Y(q.yd + q.cut / 2)], [X(bz), Y(q.yd + q.mag / 2)],
+        [X(bz), Y(q.yd - q.mag / 2)], [X(fz), Y(q.yd - q.cut / 2)], [X(fz), Y(q.yd - q.od / 2)], [X(fz - (fz ? 0 : q.frame_t)), Y(q.yd - q.od / 2)]])}" ${grey}/>`;
+      s += `<rect x="${X(bz)}" y="${Y(q.yd + q.mag / 2)}" width="${mz - bz}" height="${q.mag}" ${grey}/>`;
+      s += `<line x1="${X(-6)}" y1="${Y(q.yd)}" x2="${X(mz + 10)}" y2="${Y(q.yd)}" stroke="${RED}" stroke-width="0.8" ${NSS} stroke-dasharray="8 3 2 3"/>`; });
+    s += dim(X(0), Y(0) + 14, X(De), Y(0) + 14, `${r1(De)}`);
+    return s + "</svg>";
+  }
+
+  let liveB = null;
+  function liveBox() {
+    if (!window.Live || !drv) return;
+    const d = Object.assign(formData(fb), { tube_wall: mk().tube_wall, cable_d: mk().cable_d }, boxMat());
+    // wood: the wall and the slot's shelf are the sheet (Build & assemble), shown here, greyed
+    for (const k of ["wall", "shelf"]) {          // the concrete values stay as they are, for going back
+      const e = $(`[name=${k}]`, fb); if (!e) continue;
+      const wrap = e.closest(".param") || e.closest("label"), lt = $(".ltext", wrap);
+      if (lt && lt.dataset.orig === undefined) lt.dataset.orig = lt.textContent;
+      e.disabled = woodBox(); wrap.classList.toggle("off", woodBox());
+      if (lt) lt.textContent = lt.dataset.orig + (woodBox() ? ` · wood: ${fmt(+mk().b_sheet_t)} mm sheet` : "");
+      wrap.title = woodBox() ? "Wood box: the sheet thickness, set on Build & assemble" : ""; }
+    const dual = d.layout === "dual";
+    $(".lg-mid", fb).textContent = dual ? "Midbass, upper chamber (sealed)" : "Driver & alignment";
+    $(".ampv .ltext", fb) && ($(".ampv .ltext", fb).textContent = dual ? "Midbass amp max output" : "Max output");
+    if (dual) return liveDual(d);
+    let r;
+    try { r = Live.boxLive(drv, d, 500); liveB = r; }
+    catch (e) { notes($("#box-notes"), { ok: false, error: e.message, notes: [] }); return; }
+    const o = r.opts, f = r.f, ink = { vented: INK, sealed: FAINT };
+    const lab = e => `${e.type} ${fmt(e.net_volume_L)} L` + (e.fb ? `, fb ${(+e.fb).toFixed(1)} Hz` : "");
+    const spl = [], mxs = [], exc = [], imp = [];
+    r.designs.forEach(e => {
+      spl.push({ y: e.r.spl, color: ink[e.type], label: lab(e) }); if (o.hpf) spl.push({ y: e.rh.spl, color: ink[e.type], dash: "4 3", label: `  + ${o.hpf} Hz high-pass` });
+      mxs.push({ y: e.mx, color: ink[e.type], label: lab(e) });
+      exc.push({ y: e.rh.x.map(v => v * 1000 * o.amp_v / 2.83), color: ink[e.type], label: `${lab(e)}, ${o.amp_v} V` });
+      if (e.rh.vport) exc.push({ y: e.rh.vport.map(v => v * o.amp_v / 2.83), color: ink[e.type], dash: "1.5 2.5", label: "  port speed m/s (peak)" });
+      imp.push({ y: e.r.Zin, color: ink[e.type], label: lab(e) });
+    });
+    $("#box-draw").innerHTML = boxDrawSvg(r.box.geom);
+    $("#box-charts").innerHTML = chartSvg("SPL — 2.83 V / 1 M, HALF SPACE (DB)", f, spl, { ylim: [60, 100] }) +
+      chartSvg("MAX SPL — XMAX, PORT, AMP, POWER (DB)", f, mxs, { ylim: [40, 110] }) +
+      chartSvg("EXCURSION (MM PEAK) · PORT AIR SPEED (M/S) AT MAX AMP", f, exc, { ylim: [0, 25], hlines: [{ y: drv.xmax_mm, color: RED, label: `Xmax ${drv.xmax_mm} mm` }, { y: 17, color: RED, dash: "1.5 2.5", label: "17 m/s" }] }) +
+      chartSvg("IMPEDANCE (OHM)", f, imp, {});
+    const D = r.designs, row = (l, fn, u) => D.some(e => fn(e) !== undefined && fn(e) !== null) ?
+      `<tr><td>${l}</td>${D.map(e => { const v = fn(e); return `<td class="v">${v === undefined || v === null ? "" : fmt(v) + (u ? " " + u : "")}</td>`; }).join("")}</tr>` : "";
+    $("#box-designs").innerHTML = `<tr><td></td>${D.map(e => `<td class="v"><b>${esc(e.type)}</b></td>`).join("")}</tr>` +
+      row("Net volume", e => e.net_volume_L, "L") + row("Tuning fb", e => e.fb, "Hz") + row("fc", e => e.fc, "Hz") + row("Qtc", e => e.Qtc) +
+      row("f3", e => e.f3, "Hz") + row("f3 with high-pass", e => e.f3_hpf, "Hz") + row("Sensitivity 2.83 V/1 m", e => e.passband_spl, "dB") +
+      row("Port", e => e.port) + row("Port length", e => e.port_phys_mm, "mm") + row("Port pipe resonance", e => e.pipe_res, "Hz") +
+      row("Port air speed (peak, max V)", e => e.port_speed, "m/s") +
+      [40, 60, 100].map(q => row(`Max SPL ${q} Hz`, e => interpAt(q, f, e.mx), "dB")).join("");
+    const bx = r.box, e0 = D[0];
+    stats($("#box-stats"), [["Type", e0.type], ["Net", e0.net_volume_L, "L"], [e0.fb ? "fb" : "fc", e0.fb || e0.fc, "Hz"], ["f3", e0.f3, "Hz"],
+      ["Sensitivity", e0.passband_spl, "dB"], ["Max SPL 60 Hz", interpAt(60, f, e0.mx), "dB"], [bx.material === "wood" ? "Wood ≈" : "Concrete ≈", bx.mass_kg, "kg"]]);
+    table($("#box-num"), [["Outside", bx.outer, "mm"], ["Inside", bx.inner, "mm"], ["Gross / net", [bx.gross, bx.net], "L"],
+      ["Height / width · depth / height", `${fmt(bx.hw)} · ${fmt(bx.dh)}`], ["Port", e0.type === "vented" ? `${bx.port_on}, ${fmt(e0.port_phys_mm)} mm` : undefined],
+      ["Woofer centre from bottom", bx.driver_y, "mm"], [bx.material === "wood" ? `Wood ≈ (at ${fmt(+mk().b_density || 0.68)} g/cm³)` : "Concrete ≈ (at 2.2 kg/L)", bx.mass_kg, "kg"]]);
+    notes($("#box-notes"), { ok: true, notes: r.notes });
+    // empty size fields show what the volume makes them, greyed
+    const autoVal = { width: bx.inner[0], height: bx.inner[1], depth: bx.inner[2], hw_ratio: bx.hw, driver_y: bx.driver_y,
+      f3: e0.f3, ql: r.opts.ql || (e0.type === "vented" ? 7 : 50) };
+    if (e0.type === "vented") autoVal.fb = e0.fb;
+    if (r.opts.port_shape === "slot" && r.opts.slot_h_eff) autoVal.slot_h = r.opts.slot_h_eff;
+    for (const [k, v] of Object.entries(autoVal)) { const el = fb.querySelector(`[name="${k}"]`); if (el) { el.placeholder = `${fmt(v)}`; el.title = "automatic: " + fmt(v) + " (type a value to set it)"; } }
+    liveBracket();
+  }
+
+  // bracket flat pattern (u across, v down from the top; drawn y = -v)
+  function flatSvg(b) {
+    const pts = b.outline, xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+    const x0 = Math.min.apply(null, xs) - 22, x1 = Math.max.apply(null, xs) + 12, y0 = -Math.max.apply(null, ys) - 12, y1 = -Math.min.apply(null, ys) + 16;
+    let s = `<svg viewBox="${x0} ${y0} ${x1 - x0} ${y1 - y0}" xmlns="${NS}" font-family="${MONO}" font-size="6">`;
+    for (let g = Math.ceil(y0 / 50) * 50; g <= y1; g += 50) s += `<line x1="${x0 + 18}" y1="${g}" x2="${x1}" y2="${g}" stroke="${GRIDC}" ${NSS}/><text x="${x0 + 16}" y="${g + 2}" text-anchor="end" fill="${FAINT}">${-g}</text>`;
+    const cut = `fill="none" stroke="${INK}" stroke-width="1" ${NSS}`;
+    s += `<path d="${P2(pts.map(p => [p[0], -p[1]]))}" ${cut}/>`;
+    [b.throat].concat(b.bolts).concat(b.holes).forEach(([c, r]) => s += `<circle cx="${c[0]}" cy="${-c[1]}" r="${r}" ${cut}/>`);
+    b.bends.forEach(bd => { s += `<line x1="${bd.u0}" y1="${-bd.v}" x2="${bd.u1}" y2="${-bd.v}" stroke="${RED}" stroke-dasharray="4 3" ${NSS}/>`;
+      const lab = bd.u1 - bd.u0 > 45 ? (bd.dir > 0 ? "UP 90°" : "DOWN 90°") : (bd.dir > 0 ? "UP" : "DN");
+      s += `<text x="${(bd.u0 + bd.u1) / 2}" y="${-bd.v + 8}" text-anchor="middle" fill="${RED}" font-size="5">${lab}</text>`; });
+    return s + "</svg>";
+  }
+  // the whole speaker, side and front, to scale (mm): box, bracket, driver, horn
+  function speakerSvg(list, g) {     // list: [{ h: horn, b: its bracket }], one per horn
+    const gap = 200, dimL = 66 + 20 * (list.length - 1);
+    const fx0 = Math.min(0, ...list.map(x => x.b.geo.Xa - x.h.bounds.rmax)), fx1 = Math.max(g.We, ...list.map(x => x.b.geo.Xa + x.h.bounds.rmax));
+    const top = Math.max(...list.map(x => x.b.geo.Ya + x.h.bounds.rmax)), topY = top + 10;
+    const Wtot = dimL + g.De + gap + (fx1 - fx0) + 90, Htot = topY + 46;
+    const sx = dimL, fx = dimL + g.De + gap - fx0, Y = y => topY - y, fs = Math.max(6, Wtot / 120);
+    const ln = `stroke="${INK}" stroke-width="1" ${NSS}`, thin = `stroke="${INK}" stroke-width="0.6" ${NSS}`, hid = `stroke="${INK}" stroke-width="0.6" ${NSS} stroke-dasharray="4 3" fill="none"`;
+    let s = `<svg viewBox="0 0 ${Wtot} ${Htot}" xmlns="${NS}" font-family="${MONO}" font-size="${fs}"><defs>` +
+      `<marker id="ar3" viewBox="0 0 6 6" refX="3" refY="3" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L6 3L0 6z" fill="${INK}"/></marker></defs>`;
+    const dim = (x1, y1, x2, y2, txt, side) => `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" ${thin} marker-start="url(#ar3)" marker-end="url(#ar3)"/>` +
+      (x1 === x2 ? `<text x="${x1 + (side || -3)}" y="${(y1 + y2) / 2}" text-anchor="${side > 0 ? "start" : "end"}" dominant-baseline="middle">${txt}</text>`
+                 : `<text x="${(x1 + x2) / 2}" y="${y1 - 3}" text-anchor="middle">${txt}</text>`);
+    // ---- side elevation: front of the box on the left, z to the right
+    const Z = z => sx + z;
+    s += `<text x="${sx}" y="${Htot - 4}" fill="${FAINT}">SIDE</text>`;
+    s += `<rect x="${Z(0)}" y="${Y(g.He)}" width="${g.De}" height="${g.He}" fill="#EDEBE7" ${ln}/>`;
+    s += `<line x1="${Z(g.De - g.t)}" y1="${Y(g.He)}" x2="${Z(g.De - g.t)}" y2="${Y(0)}" ${thin}/>`;    // the back panel's joint
+    // the taller horn behind, so both read
+    list.slice().sort((p, q) => q.b.geo.Ya - p.b.geo.Ya).forEach(({ h, b }) => {
+      const G = b.geo;
+      // horn: as seen from the side, its silhouette (at each z, the largest radius of the solid), mouth to the front
+      const hornFront = G.Zp - h.opts.flange_t, sil = hornSilhouette(h);
+      const up = sil.map(q => [Z(hornFront - q[0]), Y(G.Ya + q[1])]), dn = sil.slice().reverse().map(q => [Z(hornFront - q[0]), Y(G.Ya - q[1])]);
+      s += `<path d="${P2(up.concat(dn))}" fill="#F7F7F7" ${ln} stroke-linejoin="round"/>`;
+      const lipZ = h.stats.lip_end[1], lipR = h.stats.lip_end[0];       // the lip's edge, seen from the side
+      s += `<line x1="${Z(hornFront - lipZ)}" y1="${Y(G.Ya + lipR)}" x2="${Z(hornFront - lipZ)}" y2="${Y(G.Ya - lipR)}" ${thin} stroke-dasharray="2 2"/>`;
+      // driver behind the bracket's leg
+      s += `<rect x="${Z(G.Zp + G.t)}" y="${Y(G.Ya + G.driver_d / 2)}" width="${G.driver_depth}" height="${G.driver_d}" fill="#D9D9D9" ${thin}/>`;
+      // bracket: leg, foot (and front tabs)
+      s += `<rect x="${Z(G.Zp)}" y="${Y(G.Ytop)}" width="${G.t}" height="${G.Ytop - g.He}" fill="${INK}"/>`;
+      s += `<rect x="${Z(G.Zp)}" y="${Y(g.He + G.t)}" width="${G.t + G.foot_back}" height="${G.t}" fill="${INK}"/>`;
+      if (G.type === "C") s += `<rect x="${Z(G.Zp - G.foot_front)}" y="${Y(g.He + G.t)}" width="${G.foot_front + G.t}" height="${G.t}" fill="${INK}"/>`;
+      s += `<line x1="${Z(-8)}" y1="${Y(G.Ya)}" x2="${Z(g.De + 8)}" y2="${Y(G.Ya)}" stroke="${RED}" stroke-width="0.7" ${NSS} stroke-dasharray="10 3 2 3"/>`;
+    });
+    s += dim(Z(-14), Y(0), Z(-14), Y(top), `${Math.round(top)}`);
+    list.forEach(({ b }, i) => s += dim(Z(-34 - 20 * i), Y(0), Z(-34 - 20 * i), Y(b.geo.Ya), `${Math.round(b.geo.Ya)}`));
+    s += dim(Z(0), Y(0) + 16, Z(g.De), Y(0) + 16, `${Math.round(g.De)}`);
+    // ---- front elevation
+    const X = x => fx + x;
+    s += `<text x="${X(fx0)}" y="${Htot - 4}" fill="${FAINT}">FRONT</text>`;
+    s += `<rect x="${X(0)}" y="${Y(g.He)}" width="${g.We}" height="${g.He}" fill="#EDEBE7" ${ln}/>`;
+    for (const q of g.dual ? [g.dual.mid, g.dual.sub] : [g])
+      s += `<circle cx="${X(g.We / 2)}" cy="${Y(q.yd)}" r="${q.od / 2}" fill="#D9D9D9" ${thin}/><circle cx="${X(g.We / 2)}" cy="${Y(q.yd)}" r="${q.cut / 2 - 6}" fill="#C4C4C4" ${thin}/>`;
+    if (g.port && g.port.kind === "slot" && g.port.side === "front") s += `<rect x="${X(g.t)}" y="${Y(g.t + g.port.h)}" width="${g.Wi}" height="${g.port.h}" fill="#2B2B2B"/>`;
+    if (g.port && g.port.kind === "round" && g.port.side === "front") s += `<circle cx="${X(g.We / 2)}" cy="${Y(g.port.yp)}" r="${g.port.Dp / 2}" fill="#2B2B2B"/>`;
+    // the brackets behind the horns (hidden), the horns' mouths in front
+    list.forEach(({ b }) => { const G = b.geo;
+      s += `<rect x="${X(G.Xa - G.W / 2)}" y="${Y(G.Ya)}" width="${G.W}" height="${G.Ya - g.He}" ${hid}/><circle cx="${X(G.Xa)}" cy="${Y(G.Ya)}" r="${G.Rd}" ${hid}/>`; });
+    list.forEach(({ h, b }, i) => { const G = b.geo, mouthR = h.stats.mouth_d / 2, outerR = h.bounds.rmax;
+      s += `<circle cx="${X(G.Xa)}" cy="${Y(G.Ya)}" r="${outerR}" fill="#F7F7F7" ${ln}/><circle cx="${X(G.Xa)}" cy="${Y(G.Ya)}" r="${mouthR - 2}" fill="none" ${thin}/>`;
+      s += `<circle cx="${X(G.Xa)}" cy="${Y(G.Ya)}" r="${h.stats.throat_d / 2}" fill="#2B2B2B"/>`;
+      if (list.length > 1) s += `<text x="${X(G.Xa)}" y="${Y(G.Ya + outerR) - 4}" text-anchor="middle" fill="${FAINT}">HORN ${i + 1}</text>`;
+      const right = i === list.length - 1 || G.Xa > list[1 - i].b.geo.Xa;
+      s += right ? dim(X(G.Xa + outerR) + 12, Y(G.Ya - outerR), X(G.Xa + outerR) + 12, Y(G.Ya + outerR), `⌀${Math.round(2 * outerR)}`, 3)
+                 : dim(X(G.Xa - outerR) - 12, Y(G.Ya - outerR), X(G.Xa - outerR) - 12, Y(G.Ya + outerR), `⌀${Math.round(2 * outerR)}`); });
+    s += dim(X(0), Y(0) + 16, X(g.We), Y(0) + 16, `${Math.round(g.We)}`);
+    s += dim(X(Math.max(g.We, fx1)) + 14, Y(0), X(Math.max(g.We, fx1)) + 14, Y(g.yd), `${Math.round(g.yd)}`, 3);
+    return s + "</svg>";
+  }
+  // the horn's side silhouette: at each z (throat plane 0, mouth +z), the largest radius of plate, wall and fillet
+  function hornSilhouette(h) {
+    const polys = [h.flange, h.shell].concat(h.fillet ? [h.fillet.poly] : []);
+    const z0 = -h.opts.flange_t, z1 = h.bounds.zmax, n = 260, out = [];
+    for (let k = 0; k <= n; k++) {
+      const z = z0 + (z1 - z0) * k / n; let rmax = null;
+      for (const P of polys) for (let i = 0; i < P.length; i++) {
+        const a = P[i], b = P[(i + 1) % P.length];          // points are (r, z)
+        if ((a[1] - z) * (b[1] - z) <= 0 && a[1] !== b[1]) { const r = a[0] + (z - a[1]) / (b[1] - a[1]) * (b[0] - a[0]); if (rmax === null || r > rmax) rmax = r; }
+        else if (a[1] === z && (rmax === null || a[0] > rmax)) rmax = a[0];
+      }
+      if (rmax !== null) out.push([z, rmax]);
+    }
+    return out;
+  }
+  // the horn as bracket.py reads it from its build
+  const hornRep = h => ({ horn: { throat_d_mm: h.stats.throat_d, outer_r_mm: h.bounds.rmax, front_z_mm: h.bounds.zmax,
+    plate: { od: h.opts.flange_od, t: h.opts.flange_t, bolt_n: h.opts.bolt_n, bolt_circle: h.opts.bolt_circle, bolt_d: h.opts.bolt_d, bolt_angle: h.opts.bolt_angle } } });
+  let liveBr = null;
+  const drvDims = n => { const d = (typeof hdrv !== "undefined") && hdrv[formData(HF(n)).hdriver]; return d ? { driver_d: d.body_d_mm, driver_depth: d.depth_mm } : {}; };
+  function liveBracket() {
+    if (!window.Live || !liveH || !liveB) return;
+    const g = liveB.box.geom, two = threeWay() && liveH2;
+    const B = { box: { outer_mm: [g.We, g.He, g.De], wall_mm: g.t } };
+    const d = formData(fbr), hs = two ? [liveH, liveH2] : [liveH];
+    // across the box: each horn's own setting, or automatic (centred; two horns side by side, 20 mm apart, horn 1 left)
+    const swap = two && $("[name=xswap]", fbr).checked;   // horn 1 on the right
+    const auto = two ? Live.pairX(g.We, liveH.bounds.rmax, liveH2.bounds.rmax, 20, swap ? "right" : "left") : [g.We / 2];
+    // the setting: one horn, its axis from the box's centre line (+ to the right); two horns, each axis from
+    // its own side of the box (horn 1 the left, horn 2 the right), measured inwards. Empty: automatic.
+    const ref = i => !two ? { from: "centre", x: v => g.We / 2 + v, back: X => X - g.We / 2, lo: -g.We / 2, hi: g.We / 2,
+        tip: "the horn's axis from the box's centre line; positive to the right, seen from the front" }
+      : (i === 0) !== swap ? { from: "left side", x: v => v, back: X => X, lo: 0, hi: g.We, tip: `horn ${i + 1}'s axis from the box's left side, seen from the front` }
+      : { from: "right side", x: v => g.We - v, back: X => g.We - X, lo: 0, hi: g.We, tip: `horn ${i + 1}'s axis from the box's right side, seen from the front` };
+    // locked: both the same distance from their own side; automatic then symmetric, 20 mm between the mouths
+    const locked = two && $("[name=xlock]", fbr).checked;
+    const symD = two ? (g.We - liveH.bounds.rmax - liveH2.bounds.rmax - 20) / 2 : 0;
+    const xs = hs.map((h, i) => {
+      const R = ref(i), e = $("[name=xpos]", HB(i + 1)), a = Math.round((locked ? symD : R.back(auto[i])) * 10) / 10, v = parseFloat(e.value);
+      const lab = e.closest("label"), r = e.closest(".param") && e.closest(".param").querySelector("input[type=range]");
+      lab.querySelector(".ltext").textContent = `Horizontal shift from ${R.from}`;
+      lab.title = `${R.tip}. Automatic: ${fmt(a)} mm (${locked ? "symmetric, 20 mm between the mouths" : two ? "side by side, 20 mm between the mouths" : "centred"}); drag or type to set it, ↺ back to automatic.`;
+      e.placeholder = fmt(a); e.dataset.autoval = a;
+      if (r) { r.min = Math.floor(R.lo); r.max = Math.ceil(R.hi); } e._sync && e._sync();
+      return R.x(isNaN(v) ? a : v);
+    });
+    let list;
+    try {
+      list = hs.map((h, i) => ({ h, b: Live.bracketLive(hornRep(h), B, Object.assign({}, formData(HB(i + 1)), { bend_r: mk().bend_r, k: mk().k },
+        { xa: xs[i], name: two ? `Horn ${i + 1}'s bracket` : "The bracket" }, drvDims(i + 1))) }));
+    } catch (e) { notes($("#br-notes"), { ok: false, error: e.message, notes: [] }); $("#br-flat").innerHTML = `<div class="muted">${esc(e.message)}</div>`; return; }
+    liveBr = list; if (typeof asmNow === "function") asmNow();
+    const bendR = $("[name=bend_r]", fmk); if (bendR) { const t = parseFloat(d.t) || 5; bendR.placeholder = fmt(t); bendR.title = `automatic: ${fmt(t)}, the plate thickness (type a value to set it)`; }
+    const extra = [];
+    if (two) {   // do the two brackets' feet clash, and do the horns hang over the box?
+      const [a, b] = list.map(x => x.b.geo), gapFeet = Math.abs(a.Xa - b.Xa) - (a.W + b.W) / 2;
+      if (gapFeet < 10) extra.push(`The two brackets' feet are ${gapFeet < 0 ? "on top of each other" : Math.round(gapFeet) + " mm apart"}: move a horn sideways, or narrow a bracket.`);
+      const lo = Math.min(...list.map(x => x.b.geo.Xa - x.h.bounds.rmax)), hi = Math.max(...list.map(x => x.b.geo.Xa + x.h.bounds.rmax));
+      if (lo < 0 || hi > g.We) extra.push(`The horns are ${Math.round(hi - lo)} mm wide side by side, on a ${Math.round(g.We)} mm wide box: they overhang it by ${Math.round(Math.max(0, -lo))} mm on the left and ${Math.round(Math.max(0, hi - g.We))} mm on the right.`);
+    }
+    $("#spk-draw").innerHTML = speakerSvg(list, g);
+    $("#br-flat").innerHTML = list.map((x, i) => `<div class="flat1">${two ? `<div class="muted" style="text-align:center">horn ${i + 1}</div>` : ""}${flatSvg(x.b)}</div>`).join("");
+    pairHeights();
+    const total = Math.max(...list.map(x => x.b.geo.Ya + x.h.bounds.rmax)), b0 = list[0].b, st = b0.stats, mass = list.reduce((s9, x) => s9 + x.b.stats.mass_kg, 0);
+    stats($("#br-stats"), [["Height overall", total, "mm"]].concat(list.map((x, i) => [two ? `Horn ${i + 1} axis` : "Horn axis", x.b.geo.Ya, "mm"]))
+      .concat([["Bracket", `${st.type} · ${fmt(st.t)} mm${two ? " ×2" : ""}`], ["Mass", mass, "kg"]]));
+    const rows = [["Height overall", total, "mm"]];
+    list.forEach((x, i) => { const p = two ? `Horn ${i + 1}: ` : "", s2 = x.b.stats;
+      rows.push([p + "axis from the floor of the box", x.b.geo.Ya, "mm"], [p + "axis above the box top", s2.axis_above_box, "mm"]);
+      if (!two) rows.push(["Axis from the box's centre line (+ right)", Math.round((x.b.geo.Xa - g.We / 2) * 10) / 10, "mm"]);
+      rows.push(two && ((i === 1) !== swap) ? [p + "axis from the box's right side", Math.round((g.We - x.b.geo.Xa) * 10) / 10, "mm"] : [p + "axis from the box's left side", x.b.geo.Xa, "mm"]);
+      rows.push([p + "driver back from the box's front", s2.driver_back, "mm"], [p + "driver plate ⌀", s2.plate_d, "mm"]); });
+    rows.push(["Box depth", st.box_depth, "mm"], ["Bracket", `${st.type}, ${fmt(st.t)} mm, ${fmt(st.width)} wide${two ? ", two" : ""}`], ["Mass", mass, "kg"],
+      ["Inserts on the box top (x from the box's left seen from behind, z from the front; as the box is built)",
+        list.flatMap(x => x.b.inserts).map(p => `(${fmt(Math.round((g.We - p[0]) * 10) / 10)}, ${p[1]})`).join(" ")]);
+    table($("#br-num"), rows);
+    const all = extra.concat(...list.map(x => x.b.notes)), noRoom = t => /runs off the box top|on top of each other|mm apart: more gap/.test(t);
+    $("#br-notes").innerHTML = all.filter(noRoom).map(t => `<div class="err">No room: ${esc(t)} Build stops here until it fits.</div>`)
+      .concat(all.filter(t => !noRoom(t)).map(t => `<div>${esc(t)}</div>`)).join("");
+  }
+  const num0 = (v, dflt) => { const x = parseFloat(v); return isNaN(x) ? dflt : x; };
+
+  // soft, warm light for the 3-D views: a warm sky and a warm-grey ground, and a gentle key light that rides with
+  // the camera (up and to the left of it), so every view is lit the same way and nothing glares
+  function cozy(scene, cam, renderer) {
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 0.92;
+    scene.add(new THREE.HemisphereLight(0xFFF1DF, 0x7E746C, 0.8));
+    scene.add(new THREE.AmbientLight(0xFFEFE0, 0.18));
+    const key = new THREE.DirectionalLight(0xFFE3C4, 0.5); key.position.set(-1, 1.3, 0.4);
+    const aim = new THREE.Object3D(); aim.position.set(0, 0, -1); key.target = aim;
+    cam.add(key, aim); scene.add(cam);
+  }
+
+  // ---- fixed views for the 3-D viewers: buttons on the view, the camera turned to look from there ----
+  // the speaker's frame in the scene: y up, its front toward -z, its own left side (as you face its front) toward +x
+  const SPK_VIEWS = [["front", "Front", [0, 0, -1]], ["back", "Back", [0, 0, 1]], ["left", "Left", [1, 0, 0]], ["right", "Right", [-1, 0, 0]],
+    ["top", "Top", [0, 1, 1e-4]], ["iso", "3/4", [0.75, 0.55, -0.95]]];
+  function viewBar(el, views, go) {
+    const b = document.createElement("div"); b.className = "vbar";
+    b.innerHTML = views.map(([k, l]) => `<button type="button" data-v="${k}" title="look from the ${k === "iso" ? "front-left, from above" : k}">${l}</button>`).join("");
+    b.addEventListener("pointerdown", e => e.stopPropagation());
+    b.addEventListener("click", e => { const x = e.target.closest("[data-v]"); if (x) go(views.find(v => v[0] === x.dataset.v)[2]); });
+    el.appendChild(b);
+  }
+  // look at a box of the scene from a direction, far enough back to see all of it
+  function aimCam(cam, ctl, bb, dir) {
+    if (bb.isEmpty()) return;
+    const c = bb.getCenter(new THREE.Vector3()), rad = bb.getSize(new THREE.Vector3()).length() / 2;
+    const d = rad / Math.sin(cam.fov * Math.PI / 360) / Math.min(1, cam.aspect) * 1.05;
+    ctl.target.copy(c); cam.position.copy(c).add(new THREE.Vector3(...dir).normalize().multiplyScalar(d));
+    cam.near = d / 100; cam.far = d * 30; cam.updateProjectionMatrix(); ctl.update();
+  }
+  const visibleBox = (grp, meshes) => { grp.updateMatrixWorld(true); const bb = new THREE.Box3(); meshes.forEach(m => { if (m.visible) bb.expandByObject(m); }); return bb; };
+
+  // ---- build sheet: print list + step-by-step assembly ----
+  const COLORS = { mould: 0xDCDCDC, form: 0xE6E6E6, foam: 0xEEF2F5, print: 0x8A8A8A, metal: 0x6A6A6A, resin: 0xC8331D, concrete: 0xC8331D, stone: 0xC9C6C0, wood: 0xC9A27A };
+  const asm = { scene: null, meshes: {}, data: null, step: 0, frame: null };
+  function asmViewer(el) {
+    if (asm.scene || !window.THREE) return;
+    const w = () => el.clientWidth, h = () => el.clientHeight;
+    const r = new THREE.WebGLRenderer({ antialias: true, alpha: true }); r.setPixelRatio(window.devicePixelRatio); r.setSize(w(), h());
+    el.prepend(r.domElement);
+    const sc = new THREE.Scene(), cam = new THREE.PerspectiveCamera(35, w() / h(), 1, 50000);
+    cozy(sc, cam, r);
+    const ctl = new THREE.OrbitControls(cam, r.domElement);
+    const grp = new THREE.Group(); sc.add(grp);
+    Object.assign(asm, { scene: sc, cam, ctl, grp, r });
+    viewBar(el, SPK_VIEWS, dir => { aimCam(cam, ctl, asm.live ? new THREE.Box3().setFromObject(asm.live) : visibleBox(grp, Object.values(asm.meshes)), dir); asm.fitted = true; });
+    (function loop() { requestAnimationFrame(loop); r.render(sc, cam); })();
+    new ResizeObserver(() => { if (!w()) return; r.setSize(w(), h()); cam.aspect = w() / h(); cam.updateProjectionMatrix(); }).observe(el);
+  }
+  function asmLoad(kind, run, data) {
+    asmViewer($("#asmView"));
+    if (!asm.scene) return;
+    asm.grp.clear(); asm.meshes = {}; asm.data = data; asm.run = run; asm.fitted = false;
+    asm.grp.rotation.set({ "throat-up": Math.PI / 2, "z-up": -Math.PI / 2 }[data.frame] || 0, 0, 0);
+    let left = data.parts.length;
+    $("#s-build").textContent = `Loading ${left} parts…`;
+    data.parts.forEach(p => new THREE.STLLoader().load(fileUrl(run, p.file), g => {
+      g.computeVertexNormals();
+      const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: COLORS[p.color] || 0xcccccc, roughness: 0.95, metalness: 0, side: THREE.DoubleSide, transparent: true }));
+      m.userData = p; asm.meshes[p.id] = m; asm.grp.add(m);
+      if (--left === 0) { $("#s-build").textContent = ""; asmFinal(); }
+    }, undefined, () => { if (--left === 0) asmFinal(); }));
+  }
+  function asmFit() {   // frame what this step shows
+    asm.grp.updateMatrixWorld(true);
+    const bb = new THREE.Box3(); Object.values(asm.meshes).forEach(m => { if (m.visible) bb.expandByObject(m); });
+    if (bb.isEmpty()) bb.setFromObject(asm.grp);
+    const c = bb.getCenter(new THREE.Vector3()), s = bb.getSize(new THREE.Vector3()).length();
+    // keep the angle the viewer chose; only re-centre and re-zoom
+    const dir = asm.fitted ? asm.cam.position.clone().sub(asm.ctl.target).normalize() : new THREE.Vector3(0.75, 0.55, 0.95).normalize();
+    asm.fitted = true;
+    asm.ctl.target.copy(c); asm.cam.position.copy(c).add(dir.multiplyScalar(s * 1.45));
+    asm.cam.near = s / 200; asm.cam.far = s * 30; asm.cam.updateProjectionMatrix(); asm.ctl.update();
+  }
+  function asmFinal() {   // the finished product: the last step, nothing exploded
+    if (!asm.data) return;
+    const st = asm.data.steps[asm.data.steps.length - 1];
+    Object.values(asm.meshes).forEach(m => { const p = m.userData; m.visible = st.show.includes(p.id); m.position.set(0, 0, 0);
+      m.material.color.setHex(COLORS[p.color] || 0xcccccc); m.material.opacity = p.color === "foam" ? 0.85 : 1; m.material.depthWrite = true; });
+    $("#stepText").textContent = "";
+    if (Object.keys(asm.meshes).length) asmFit();
+  }
+  const PRINT_BOX = { "port_tube_wood.stl": ["Port tube", 2, "collar end on the bed", "its collar glues into the panel's hole"], "former_driver_A_front.stl": ["Driver hole former A", 1, "rebate face on the bed, pins up", "reusable: comes out"],
+    "former_driver_B_chamfer.stl": ["Driver hole former B", 1, "wide face on the bed", "reusable"],
+    "former_port_tube.stl": ["Port tube", 2, "flared end with the rings on the bed", "stays in the concrete"],
+    "former_port_tube_A.stl": ["Port tube, outer half", 2, "flared end on the bed", "stays in the concrete"],
+    "former_port_tube_B.stl": ["Port tube, inner half", 2, "flared end on the bed", "stays in the concrete"],
+    "former_port_sleeve.stl": ["Port tube sleeve", 2, "upright", "glued over the joint"],
+    "former_cable_hole.stl": ["Cable hole former", 1, "upright", "reusable"],
+    "former_slot_edge.stl": ["Slot edge former", 2, "flat faces on the bed", "top and bottom edge of the slot; reusable"] };
+  async function buildSheet() {
+    if (STATIC) { $("#s-build").textContent = NOBUILD + "."; showAsm(); return; }   // online: no builds, the live speaker still
+    let d; try { d = await (await fetch("/api/buildsheet")).json(); } catch (e) { $("#s-build").textContent = "Server not reachable"; return; }
+    asm.sheet = d;
+    const rows = [];
+    if (d.box) (d.box.report.files || []).filter(f => PRINT_BOX[f.file]).forEach(f => { const m = PRINT_BOX[f.file];
+      rows.push({ name: m[0], from: "box", qty: m[1], note: m[3], f, on: m[2], run: d.box.run }); });
+    for (const [k, nm] of threeWay() ? [["horn", "horn 1 mould"], ["horn2", "horn 2 mould"]] : [["horn", "horn mould"]]) if (d[k])
+      (d[k].report.files || []).filter(f => f.part).forEach(f => rows.push({ name: f.part.replace(/_/g, " ") + (f.of > 1 ? ` ${f.sector}/${f.of}` : ""),
+        from: nm, qty: 1, note: "one mould casts the pair", f, on: f.print_on, run: d[k].run }));
+    // slicer-like estimate: 4 walls of 0.4 mm over the whole surface + 12 % infill inside; solid if no area
+    const g = r => { const v = r.f.volume_cm3, a = r.f.area_cm2; const shell = a ? Math.min(v, a * 0.16) : v;
+                     return (shell + 0.12 * (v - shell)) * 1.24 * r.qty; };
+    const tot = rows.reduce((a, r) => a + g(r), 0);
+    $("#printList").innerHTML = rows.length ? `<tr><td>piece</td><td>qty</td><td>size mm</td><td class="v">PLA ≈</td><td>print on the bed</td><td></td></tr>` +
+      rows.map(r => `<tr><td style="color:var(--ink);text-transform:none;font-size:11px;letter-spacing:0">${esc(r.name)}<div class="muted">${esc(r.from)} · ${esc(r.note)}</div></td>
+        <td class="v">${r.qty}</td><td class="v">${r.f.bbox_mm.map(v => Math.round(v)).join("×")}</td><td class="v">${Math.round(g(r))} g</td>
+        <td style="text-transform:none;font-size:10px;letter-spacing:0;color:var(--base)">${esc(r.on || "")}</td>
+        <td class="v"><span class="files"><a href="${fileUrl(r.run, r.f.file)}" download>STL</a></span></td></tr>`).join("") +
+      `<tr><td>total</td><td></td><td></td><td class="v">${(tot / 1000).toFixed(2)} kg</td><td colspan="2" class="muted">4 walls, 12 % infill; solid it would be ${(rows.reduce((a, r) => a + r.f.volume_cm3 * 1.24 * r.qty, 0) / 1000).toFixed(1)} kg</td></tr>`
+      : `<tr><td>${d.horn && d.box ? "Nothing to print: the horn and the box are made from wood." : "Build the horn parts and the box first."}</td></tr>`;
+    const o = [];
+    if (d.box && d.box.report.wood) { const w = d.box.report.wood;
+      o.push(["Box panels ×2 sets", `${w.panels} panels from ${w.sheet_mm} mm sheet, 45° bevels, ≈ ${w.sheet_area_m2_per_box} m² and ${w.mass_kg_per_box} kg per box`, fileUrl(d.box.run, "panels.dxf"), "DXF"]);
+      o.push(["Panel cut list", "sizes, outside and inner face", fileUrl(d.box.run, "cutlist.csv"), "CSV"]); }
+    else if (d.box) { o.push(["Formwork boards", "melamine board, cut list", fileUrl(d.box.run, "cutlist.csv"), "CSV"]);
+      o.push(["Form layout, insert jig", "drawings", fileUrl(d.box.run, "formwork.dxf"), "DXF"]); }
+    for (const [k, nm] of threeWay() ? [["horn", "Horn 1"], ["horn2", "Horn 2"]] : [["horn", "Horn"]]) {
+      const w = d[k] && d[k].report.wood; if (!w) continue;
+      o.push([`${nm}: rings ×2 sets`, `CNC, ${w.rings} rings from ${w.sheets} sheet${w.sheets > 1 ? "s" : ""} of ${w.sheet_mm} mm and the driver plate from ${w.plate_sheet_mm} mm (per horn); ${w.method}`, fileUrl(d[k].run, "rings.dxf"), "DXF"]);
+      o.push([`${nm}: ring cut list`, `${w.layers} layers, ${w.stack_height_mm} mm stack, ⌀${w.stack_d_mm}; bolts: ${w.bolts_through}`, fileUrl(d[k].run, "rings.csv"), "CSV"]);
+      if (w.method === "carved block") o.push([`${nm}: the shape to carve`, `for the CNC shop: carve the glued blank to it; finished ≈ ${w.mass_kg_finished} kg`, fileUrl(d[k].run, "horn_body.stl"), "STL"]);
+      else o.push([`${nm}: profile template`, `3–6 mm hardboard: swung round a rod through the throat while sanding; finished ≈ ${w.mass_kg_finished} kg`, fileUrl(d[k].run, "profile_template.dxf"), "DXF"]);
+    }
+    if (d.bracket) o.push(["Bracket ×2", `laser-cut and bent, ${d.bracket.report.thickness_mm} mm aluminium`, fileUrl(d.bracket.run, "bracket.dxf"), "DXF"]);
+    // the parts' names follow how each is made
+    const pk = (k, t) => { const b = $(`#parts-pick [data-parts=${k}]`); if (b) b.textContent = t; };
+    const hn = r => r && r.report.wood ? (r.report.wood.method === "carved block" ? "carved" : "rings") : r && (r.report.files || []).some(f => /skin/.test(f.file)) ? "skin" : "mould";
+    pk("horn", (threeWay() ? "horn 1 " : "horn ") + hn(d.horn)); pk("horn2", "horn 2 " + hn(d.horn2));
+    pk("box", d.box && d.box.report.wood ? "box panels" : "box & formers");
+    $("#otherList").innerHTML = o.map(x => `<tr><td style="color:var(--ink);text-transform:none;font-size:11px;letter-spacing:0">${x[0]}</td><td style="text-transform:none;font-size:10px;letter-spacing:0;color:var(--base)">${x[1]}</td><td class="v"><span class="files"><a href="${x[2]}" download>${x[3]}</a></span></td></tr>`).join("");
+    showAsm();
+  }
+  // the assembled speaker, drawn straight from the live settings (no build): box, woofers, horns, brackets, drivers
+
+  // ---- the cost of the whole speaker, roughly: from a design's shapes and the prices on Build & assemble ----
+  // ctx: { m: the Build & assemble settings, drv, drvSub (two chambers), hd: each horn's driver, horns: their live shapes,
+  //        box: the live box, brs: the brackets }
+  function costRows(ctx) {
+    const { m, drv: dw, drvSub: ds, hd, horns, box, brs } = ctx, P = k => num0(m[k], 0), g = box.geom, rows = [];
+    const link = d => d && d.price_url ? ` <a href="${esc(d.price_url)}" target="_blank" rel="noopener">${esc(new URL(d.price_url).hostname.replace(/^www\./, ""))}</a>` : "";
+    const add = (item, each, note) => rows.push([item, each, note || ""]);
+    const priced = d => d && d.price_eur ? d.price_eur : null, pnote = d => d && d.price_eur ? esc(d.price_note || "") + link(d) : "no price in its file";
+    const dual = !!(g.dual && ds);
+    add(dual ? `Midbass: ${esc(dw.name)}` : `Woofer: ${esc(dw.name)}`, priced(dw), pnote(dw));
+    if (dual) add(`Sub: ${esc(ds.name)}`, priced(ds), pnote(ds));
+    horns.forEach((h, i) => add(`Horn${horns.length > 1 ? " " + (i + 1) : ""} driver: ${esc(hd[i] ? hd[i].name : "your own")}`, priced(hd[i]), pnote(hd[i])));
+    if (box.material === "wood") {
+      const inner = g.dual ? g.Wi * g.Di : g.port && g.port.kind === "slot" ? g.Wi * Math.max(0, g.port.L - g.t) : 0;
+      const area = (2 * (g.We * g.He + g.We * g.De + g.He * g.De) + inner) / 1e6 * 1.2;
+      add("Box: plywood", area * P("p_ply"), `${area.toFixed(2)} m² of ${fmt(+m.b_sheet_t)} mm sheet, with 20 % for offcuts`);
+    } else {
+      add("Box: concrete", box.mass_kg * P("p_concrete"), `${Math.round(box.mass_kg)} kg`);
+      add("Box: formwork & foam (half)", P("p_form") / 2, "the form casts both boxes");
+    }
+    horns.forEach((h, i) => {
+      const st = h.stats, V = st.volume_cm3, lab = horns.length > 1 ? `Horn ${i + 1}` : "Horn", mode = m.mode;
+      if (mode === "mould") {
+        const b = h.bounds, Vcyl = Math.PI * b.Er * b.Er * (b.ztop - b.zb) / 1000, pla = 0.25 * (Vcyl - V) * 1.24 / 1000;
+        add(`${lab}: resin`, st.resin_kg * P("p_resin"), `${fmt(st.resin_kg)} kg, solid`);
+        add(`${lab}: printed mould (half)`, pla * P("p_fil") / 2, `≈ ${fmt(pla)} kg of PLA at 25 % fill; one mould casts the pair`);
+      } else if (mode === "skin") {
+        const tm = (st.wall[0] + st.wall[2]) / 2, sk = num0(m.skin, 1.6), f = Math.min(0.9, 2 * sk / tm);
+        add(`${lab}: printed skin`, V * f * 1.27 / 1000 * 1.1 * P("p_fil"), `≈ ${fmt(V * f * 1.27 / 1000 * 1.1)} kg of PETG`);
+        add(`${lab}: resin inside`, st.resin_kg * (1 - f) * P("p_resin"), `≈ ${fmt(st.resin_kg * (1 - f))} kg`);
+      } else {
+        const ts = num0(m.h_sheet_t, 18), area = V * 1000 * (mode === "carve" ? 2.0 : 1.7) / ts / 1e6 * 1.2;
+        add(`${lab}: plywood rings`, area * P("p_ply"), `≈ ${area.toFixed(2)} m² of ${fmt(ts)} mm sheet`);
+        if (mode === "carve") add(`${lab}: CNC carving`, P("p_cnc"), "a shop's quote will differ");
+      }
+    });
+    brs.forEach((b, i) => add(`Bracket${brs.length > 1 ? " " + (i + 1) : ""}`, b.stats.mass_kg * P("p_alu") + P("p_bend"), `${fmt(b.stats.mass_kg)} kg aluminium, cut and bent`));
+    add("Hardware", P("p_hw"), "bolts, inserts, gasket, terminal, cable, damping");
+    const ch = (dual ? 2 : 1) + horns.length;
+    add("DSP + amplifiers", ch * P("p_amp"), `${ch} channels`);
+    const total = rows.filter(r => r[1] !== null).reduce((a, r) => a + r[1], 0);
+    return { rows, total, unpriced: rows.filter(r => r[1] === null).length };
+  }
+  const eur = v => v === null ? "?" : "€" + Math.round(v).toLocaleString("en");
+  function liveCost() {
+    const T = $("#costTable"); if (!T || !liveB || !liveH) return;
+    const two = threeWay() && liveH2, horns = two ? [liveH, liveH2] : [liveH];
+    const c = costRows({ m: mk(), drv, drvSub: liveB.box.geom.dual ? drvSub : null, hd: horns.map((h, i) => hdrv[formData(HF(i + 1)).hdriver]),
+      horns, box: liveB.box, brs: (liveBr || []).map(x => x.b) });
+    T.innerHTML = `<tr><td></td><td class="v">per speaker</td><td class="v">pair</td><td></td></tr>` +
+      c.rows.map(r => `<tr><td style="color:var(--ink);text-transform:none;font-size:11px;letter-spacing:0">${r[0]}</td><td class="v">${eur(r[1])}</td><td class="v">${eur(r[1] === null ? null : 2 * r[1])}</td>
+        <td style="text-transform:none;font-size:10px;letter-spacing:0;color:var(--base)">${r[2]}</td></tr>`).join("") +
+      `<tr><td><b>Total</b></td><td class="v"><b>${eur(c.total)}</b></td><td class="v"><b>${eur(2 * c.total)}</b></td><td style="text-transform:none;font-size:10px;letter-spacing:0;color:var(--base)">${c.unpriced ? "without the items marked ?" : ""}</td></tr>`;
+    $("#costNote").textContent = "Rough: the materials are estimated from the live shapes, the driver prices are from one shop at one date, shipping and tools aren't included.";
+    allCosts(c.total);
+  }
+  // every preset's cost, worked out from its settings without loading it (same models, same prices), beside yours
+  const jsonCache = {};
+  const getJSON = url => jsonCache[url] || (jsonCache[url] = fetch(url).then(r => r.json()).catch(() => null));
+  const woofer = n => getJSON(STATIC ? `drivers/${encodeURIComponent(n)}.json` : `/api/driver?name=${encodeURIComponent(n)}`);
+  const hornDrv = n => getJSON(STATIC ? `hdrivers/${encodeURIComponent(n)}.json` : `/api/hdriver?name=${encodeURIComponent(n)}`);
+  const formDefaults = f => { const o = {};
+    $$("input, select, textarea", f).forEach(el => { if (!el.name) return;
+      if (el.type === "checkbox") o[el.name] = el.defaultChecked;
+      else if (el.tagName === "SELECT") { const op = [...el.options].find(x => x.defaultSelected) || el.options[0]; o[el.name] = op ? op.value : ""; }
+      else o[el.name] = el.defaultValue; }); return o; };
+  async function costOfPreset(p) {
+    const forms = { "f-box": fb, "f-horn": fh, "f-horn2": fh2, "f-bracket": fbr, "f-bracket2": fbr2, "f-build": fmk };
+    const DEF = { "f-box": { driver: "dsa215-8", sub_driver: "dayton-dcs305-4" }, "f-horn": { hdriver: "df20-30t" }, "f-horn2": { hdriver: "df20-30t" } };
+    const F = id => Object.assign(formDefaults(forms[id]), DEF[id] || {}, p.forms[id] || {});
+    const m = F("f-build"), b = F("f-box"), two = (p.drivers || "2") === "3";
+    const mat = m.box_mat === "wood" ? { material: "wood", wall: m.b_sheet_t, shelf: m.b_sheet_t, wood_density: m.b_density } : {};
+    const raw = Object.assign(b, { tube_wall: m.tube_wall, cable_d: m.cable_d }, mat);
+    const dw = await woofer(b.driver || "dsa215-8"), ds = b.layout === "dual" ? await woofer(b.sub_driver) : null;
+    const box = (b.layout === "dual" ? Live.dualLive(dw, ds, raw, 200) : Live.boxLive(dw, raw, 200)).box;
+    const hf = two ? [F("f-horn"), F("f-horn2")] : [F("f-horn")];
+    const horns = hf.map(d => Live.hornLive(computeFamily, d)), hd = await Promise.all(hf.map(d => d.hdriver ? hornDrv(d.hdriver) : null));
+    const g = box.geom, B = { box: { outer_mm: [g.We, g.He, g.De], wall_mm: g.t } };
+    const xs = two ? Live.pairX(g.We, horns[0].bounds.rmax, horns[1].bounds.rmax, 20, "left") : [g.We / 2];
+    const brs = horns.map((h, i) => Live.bracketLive(hornRep(h), B, Object.assign({}, F(i ? "f-bracket2" : "f-bracket"), { bend_r: m.bend_r, k: m.k, xa: xs[i] },
+      hd[i] ? { driver_d: hd[i].body_d_mm, driver_depth: hd[i].depth_mm } : {})));
+    // the prices are yours (Build & assemble), whatever the preset
+    const prices = Object.fromEntries(Object.entries(mk()).filter(([k]) => /^p_/.test(k)));
+    return costRows({ m: Object.assign({}, m, prices), drv: dw, drvSub: ds, hd, horns, box, brs });
+  }
+  let costsBusy = false, costsAgain = null;
+  async function allCosts(mine) {
+    const T = $("#costAll"); if (!T) return;
+    if (costsBusy) { costsAgain = mine; return; }
+    costsBusy = true;
+    try {
+      const out = [];
+      for (const p of PRESETS) { try { out.push([p, (await costOfPreset(p)).total]); } catch (e) { out.push([p, null]); } }
+      const cell = 'style="color:var(--ink);text-transform:none;font-size:11px;letter-spacing:0"';
+      T.innerHTML = `<tr><td></td><td class="v">per speaker</td><td class="v">pair</td></tr>` +
+        `<tr><td ${cell}><b>Your design, as it is now</b></td><td class="v"><b>${eur(mine)}</b></td><td class="v"><b>${eur(2 * mine)}</b></td></tr>` +
+        out.sort((a, b) => (a[1] ?? 1e9) - (b[1] ?? 1e9)).map(([p, c]) => `<tr><td ${cell}>${esc(p.name)}</td><td class="v">${eur(c)}</td><td class="v">${eur(c === null ? null : 2 * c)}</td></tr>`).join("");
+      out.forEach(([p, c]) => { const o = $(`#presetGroup option[value="${p.id}"]`); if (o && c !== null) o.textContent = `${p.name} · ≈ ${eur(c)}`; });
+    } finally { costsBusy = false; if (costsAgain !== null) { const v = costsAgain; costsAgain = null; allCosts(v); } }
+  }
+
+  function showAsm() { liveAsm(); }
+  function liveAsm() {
+    try { liveCost(); } catch (e) { $("#costNote").textContent = "Cost: " + e.message; }
+    const el = $("#asmView"); if (!el || !window.THREE || !liveB || !liveBr) return;
+    if (!el.clientWidth) return;                       // drawn when the Build tab is open
+    asmViewer(el); if (!asm.scene) return;
+    asm.grp.visible = false;                           // the built assembly (from a build) stays out of this view
+    if (asm.live) { asm.scene.remove(asm.live); asm.live.traverse(o => { if (o.geometry) o.geometry.dispose(); }); }
+    const L = asm.live = new THREE.Group(); asm.scene.add(L);
+    const g = liveB.box.geom, We = g.We, He = g.He, De = g.De;
+    const mat = (c, opts) => new THREE.MeshStandardMaterial(Object.assign({ color: c, roughness: 0.95, metalness: 0, side: THREE.DoubleSide }, opts || {}));
+    const add = (geo, m, x, y, z, rx, ry) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); if (rx) o.rotation.x = rx; if (ry) o.rotation.y = ry; L.add(o); return o; };
+    const X = xFront => We - xFront;                  // across, from the left as you face the front -> the scene's x (its left is +x)
+    const boxC = woodBox() ? COLORS.wood : COLORS.stone, hornC = woodHorn() ? COLORS.wood : COLORS.resin;
+    add(new THREE.BoxGeometry(We, He, De), mat(boxC), We / 2, He / 2, De / 2);          // the front at z = 0, facing -z
+    // the woofers on the front, the port opening
+    const dark = mat(0x3A3A3A), frame = mat(0x6A6A6A);
+    for (const q of g.dual ? [g.dual.mid, g.dual.sub] : [g]) {
+      add(new THREE.CylinderGeometry(q.od / 2, q.od / 2, 4, 64), frame, We / 2, q.yd, -2, Math.PI / 2);
+      add(new THREE.CylinderGeometry(q.cut / 2 - 6, q.cut / 2 - 10, 6, 64), dark, We / 2, q.yd, -4, Math.PI / 2);
+    }
+    const P = g.port;
+    if (P && P.kind === "slot" && P.side === "front") add(new THREE.BoxGeometry(g.Wi, P.h, 2), dark, We / 2, g.t + P.h / 2, -1);
+    if (P && P.kind === "round" && P.side === "front") add(new THREE.CylinderGeometry(P.Dp / 2, P.Dp / 2, 3, 48), dark, We / 2, P.yp, -1.5, Math.PI / 2);
+    // each horn on its bracket, its compression driver behind
+    const metal = mat(COLORS.metal), hm = mat(hornC);
+    liveBr.forEach(({ h, b }, i) => {
+      const G = b.geo, xw = X(G.Xa), n = i + 1, tf = h.opts.flange_t;
+      const lathe = new THREE.LatheGeometry(h.lathe.map(p => new THREE.Vector2(Math.max(0, p[0]), p[1])), 96);
+      add(lathe, hm, xw, G.Ya, G.Zp - tf, -Math.PI / 2);                // throat plane at Zp - plate, the mouth toward the front
+      const leg = new THREE.Shape(); leg.moveTo(-G.W / 2, He - G.Ya); leg.lineTo(G.W / 2, He - G.Ya); leg.lineTo(G.W / 2, 0);
+      leg.absarc(0, 0, G.Rd, 0, Math.PI, false); leg.lineTo(-G.W / 2, He - G.Ya);
+      const lg = new THREE.ExtrudeGeometry(leg, { depth: G.t, bevelEnabled: false, curveSegments: 48 });
+      add(lg, metal, xw, G.Ya, G.Zp);                                     // the upright with its round plate
+      add(new THREE.BoxGeometry(G.W, G.t, G.foot_back), metal, xw, He + G.t / 2, G.Zp + G.t + G.foot_back / 2);
+      if (G.type === "C") add(new THREE.BoxGeometry(G.W, G.t, G.foot_front), metal, xw, He + G.t / 2, G.Zp - G.foot_front / 2);
+      const dd = drvDims(n), dD = dd.driver_d || 165, dL = dd.driver_depth || 70;
+      add(new THREE.CylinderGeometry(dD / 2, dD / 2 * 0.8, dL, 48), mat(0x555555), xw, G.Ya, G.Zp + G.t + dL / 2, Math.PI / 2);
+    });
+    $("#stepText").textContent = "";
+    if (!asm.liveFitted) { asm.liveFitted = true; asmFitLive(); }
+  }
+  function asmFitLive() {
+    const bb = new THREE.Box3().setFromObject(asm.live); if (bb.isEmpty()) return;
+    aimCam(asm.cam, asm.ctl, bb, [0.75, 0.55, -0.95]);
+  }
+  let asmQ = false;
+  function asmNow() { if (asmQ) return; asmQ = true; requestAnimationFrame(() => { asmQ = false; liveAsm(); }); }
+  $$("nav button").forEach(b => b.addEventListener("click", () => { if (b.dataset.tab === "build") buildSheet(); }));
+
+  // ---- Horn Studio style rows: label · number · unit, slider underneath; full-width selects ----
+  function dress(f) {
+    $$("label", f).forEach(l => {
+      const ctl = l.querySelector("input:not([type=checkbox]), select");
+      if (!ctl) return;
+      const txt = Array.from(l.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join(" ").trim();
+      Array.from(l.childNodes).filter(n => n.nodeType === 3).forEach(n => n.remove());
+      if (ctl.tagName === "SELECT" || ctl.classList.contains("wide")) { l.classList.add("sel"); l.prepend(document.createTextNode(txt)); return; }
+      const m = txt.match(/^(.*?)\s*\(([^)]+)\)\s*$/);
+      const span = document.createElement("span"); span.className = "ltext"; span.textContent = m ? m[1] : txt;
+      const unit = document.createElement("span"); unit.className = "punit"; unit.textContent = m ? m[2] : "";
+      const nw = document.createElement("span"); nw.className = "nwrap"; nw.append(ctl, unit);
+      if (ctl.placeholder && /auto|=/.test(ctl.placeholder)) {   // fields that can go back to automatic
+        const reset = document.createElement("button"); reset.type = "button"; reset.className = "reset"; reset.title = "back to " + ctl.placeholder; reset.textContent = "↺";
+        reset.onclick = () => { ctl.value = ""; ctl.dispatchEvent(new Event("input", { bubbles: true })); };
+        nw.append(reset);
+      }
+      l.prepend(span); l.append(nw);
+      if (!ctl.dataset.range) return;
+      const [lo, hi, st] = ctl.dataset.range.split(",");
+      const wrap = document.createElement("div"); wrap.className = "param";
+      l.parentNode.insertBefore(wrap, l); wrap.appendChild(l);
+      if (l.dataset.show) { wrap.dataset.show = l.dataset.show; delete l.dataset.show; }
+      const r = document.createElement("input"); r.type = "range"; r.min = lo; r.max = hi; r.step = st; r.tabIndex = -1;
+      const auto = !!ctl.placeholder;
+      const sync = () => { const v = parseFloat(ctl.value), av = parseFloat(ctl.dataset.autoval);
+        r.value = isNaN(v) ? (isNaN(av) ? lo : av) : v; r.style.display = (auto && isNaN(v) && isNaN(av)) ? "none" : "block"; };
+      r.addEventListener("input", e => { e.stopPropagation(); ctl.value = r.value; ctl.dispatchEvent(new Event("input", { bubbles: true })); });
+      ctl.addEventListener("input", sync); ctl.addEventListener("change", sync);
+      wrap.appendChild(r); sync(); ctl._sync = sync;
+    });
+  }
+
+  // ---- wiring ----
+  let tH, tB;
+  [fh, fh2, fb, fbr, fbr2, fmk].forEach(f => { dress(f); loadForm(f); $$("input", f).forEach(i => i._sync && i._sync()); showHide(f); f.addEventListener("submit", e => e.preventDefault()); });
+  // ?name=value in the address fills that field (the form it belongs to is given by #tab): for links and tests
+  new URLSearchParams(location.search).forEach((v, k) => {
+    const tab = (location.hash || "#box").slice(1), f = { horn: fh, horn2: fh2, box: fb, bracket: fbr, build: fmk }[tab] || fb;
+    const fbx = tab === "horn2" ? fbr2 : fbr;
+    if ((tab === "horn" || tab === "horn2") && fbx.querySelector(`[name="${CSS.escape(k)}"]`) && !f.querySelector(`[name="${CSS.escape(k)}"]`)) {
+      const e2 = fbx.querySelector(`[name="${CSS.escape(k)}"]`); e2.value = v; e2._sync && e2._sync(); showHide(fbx); return; }
+    const el = f.querySelector(`[name="${CSS.escape(k)}"]`); if (!el) return;
+    if (el.type === "checkbox") el.checked = v === "true"; else el.value = v;
+    el._sync && el._sync(); showHide(f);
+  });
+  // ---- save and load a design: every form's settings and the number of drivers, as one .json file ----
+  const DESIGN_FORMS = () => [fh, fh2, fb, fbr, fbr2, fmk];
+  $("#saveDesign").addEventListener("click", () => {
+    const forms = {}; DESIGN_FORMS().forEach(f => forms[f.id] = formData(f));
+    const blob = new Blob([JSON.stringify({ app: "horn-speakers", version: 1, saved: new Date().toISOString(), drivers: $("#drivers").value, forms }, null, 1)], { type: "application/json" });
+    const a = document.createElement("a"), d = new Date(), p2 = x => String(x).padStart(2, "0");
+    a.href = URL.createObjectURL(blob); a.download = `horn-speakers-design-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}.json`;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  $("#loadDesign").addEventListener("click", () => $("#loadFile").click());
+  $("#loadFile").addEventListener("change", async e => {
+    const file = e.target.files[0]; e.target.value = ""; if (!file) return;
+    let d; try { d = JSON.parse(await file.text()); } catch (err) { d = null; }
+    const ids = DESIGN_FORMS().map(f => f.id);
+    if (!d || d.app !== "horn-speakers" || !d.forms || !Object.keys(d.forms).some(k => ids.includes(k))) {
+      alertBox(`${file.name} isn't a design saved with Save.`); return; }
+    try {
+      for (const id of ids) if (d.forms[id]) localStorage.setItem("form:" + id, JSON.stringify(d.forms[id]));
+      if (d.drivers) localStorage.setItem("drivers", d.drivers);
+    } catch (err) { alertBox("Your browser won't let this page store settings, so the design can't be loaded."); return; }
+    location.reload();   // the page starts up from the loaded settings, as it does from your last ones
+  });
+  // a short message under the header (no browser pop-ups); ok: news, not a problem, and it stays
+  function alertBox(t, ok) { let b = $("#hmsg"); if (!b) { b = document.createElement("div"); b.id = "hmsg"; b.className = "hmsg"; $("header").after(b); }
+    b.textContent = t; b.hidden = false; b.classList.toggle("ok", !!ok); clearTimeout(b._t); if (!ok) b._t = setTimeout(() => b.hidden = true, 6000); }
+  // ---- presets: ready-made designs for the DSA215-8 woofer and the DF20.30T on a horn (a 2-way; the DF20.30T can't
+  // go below 1 kHz, so no 3-way). Each was scored with the app's own models (box: f3, flatness, port air speed at
+  // full power; horn: Horn Studio's loading and response, beamwidth at the crossover against the woofer's).
+  // Only the settings that make the design are given; everything else goes back to its default.
+  const DF = { hdriver: "df20-30t", source: "hs", throatD: "50", bolt_circle: "102", bolt_n: "4", bolt_angle: "45", bolt_d: "6.5", thickness: "10", thickness_throat: "20" };
+  const PRESETS = [
+    { id: "budget250", name: "Budget, small: 20 L wood, 1″ driver, JMLC 1200 rings",
+      about: "The cheapest that still does it properly. The DSA215-8 vented in 20 L of plywood (−3 dB at 47 Hz) and a Celestion CDX1-1745 1″ compression driver (€73) on a small JMLC 1200 horn (Ø154) of stacked rings. Cross at 2.4 kHz, LR4 (the driver's minimum is 2.2 kHz): there the horn spreads about as wide as the woofer (≈ 80° against 86°). Two amplifier channels: a 2 × 50 W DSP board does it.",
+      forms: { "f-box": { type: "vented", vb: "20", fb: "", hpf: "38", hpf_order: "2", port_shape: "slot", amp_v: "15" },
+        "f-horn": Object.assign({ family: "jmlc", fc: "1200", T0: "0.707", trunc: "180" }, { hdriver: "celestion-cdx1-1745", source: "hs", throatD: "25.4", bolt_circle: "76", bolt_n: "2", bolt_angle: "0", bolt_d: "6.5", thickness: "8", thickness_throat: "14", flange_od: "130", flange_t: "12", fillet: "5" }), "f-bracket": { clearance: "10", setback: "0", width: "130" },
+        "f-build": { box_mat: "wood", b_sheet_t: "18", mode: "stack", h_sheet_t: "18" } } },
+    { id: "budget300", name: "Budget, full bass: 40 L wood, 1″ driver, printed JMLC 1200",
+      about: "More bass and a damped horn for a little more: the DSA215-8 in its best box, vented 40 L of plywood (−3 dB at 35 Hz, port air 14 m/s at full power), with the same Celestion CDX1-1745 on a JMLC 1200 printed as a skin and filled with resin, crossed at 2.4 kHz LR4. Two amplifier channels.",
+      forms: { "f-box": { type: "vented", vb: "40", fb: "", hpf: "28", hpf_order: "2", port_shape: "slot", amp_v: "15" },
+        "f-horn": Object.assign({ family: "jmlc", fc: "1200", T0: "0.707", trunc: "180" }, { hdriver: "celestion-cdx1-1745", source: "hs", throatD: "25.4", bolt_circle: "76", bolt_n: "2", bolt_angle: "0", bolt_d: "6.5", thickness: "8", thickness_throat: "14", flange_od: "130", flange_t: "12", fillet: "5" }), "f-bracket": { clearance: "10", setback: "0", width: "130" },
+        "f-build": { box_mat: "wood", b_sheet_t: "18", mode: "skin" } } },
+    { id: "fourway", name: "4-way, two horns: sub + 15″ midbass + DCM50 mid horn + DF20.30T treble horn, wood", drivers: "3",
+      about: "Two horns: a B&C DCM50 midrange compression driver on a JMLC 400 (Ø461, loads to 463 Hz) from 650 Hz to 4 kHz, the DF20.30T on a small JMLC 1000 (Ø188) above 4 kHz. Below: the FaitalPRO 15PR400 midbass (sealed 80 L, 90–650 Hz) and the Dayton DCS305-4 12″ sub (sealed 63 L, DSP boost to 30 Hz): −3 dB at 31 Hz, ≈ 106 dB at 40 Hz. Four amplifier channels, all LR4. A big speaker: 676 × 834 × 336 mm wood box, the mid horn's axis ≈ 1.07 m. The mid horn narrows a lot by 4 kHz, more than the treble horn: a step in the off-axis sound there.",
+      forms: { "f-box": { layout: "dual", driver: "faital-15pr400-8", type: "sealed", vb: "80", qtc: "0.707", amp_v: "9", sub_driver: "dayton-dcs305-4", sub_vb: "63", sub_qtc: "0.707", sub_lt: "30", xo_lo: "90", sub_amp_v: "25", width: "640", depth: "300" },
+        "f-horn": Object.assign({ family: "jmlc", fc: "400", T0: "0.707", trunc: "180" }, DF, { hdriver: "bc-dcm50" }),
+        "f-horn2": Object.assign({ family: "jmlc", fc: "1000", T0: "0.707", trunc: "180" }, DF),
+        "f-bracket": { clearance: "10", setback: "-40", foot_back: "85" }, "f-bracket2": { clearance: "10", setback: "0" },
+        "f-build": { box_mat: "wood", b_sheet_t: "18", mode: "carve", h_sheet_t: "18" } } },
+    { id: "threeway", name: "3-way: 15″ midbass + 12″ sub, JMLC 650, wood",
+      about: "The best of these acoustically. A FaitalPRO 15PR400 midbass (sealed 40 L) spreads like the JMLC 650 at the 1.1 kHz crossover (≈76° against 74°), and a Dayton DCS305-4 12″ sub (sealed 32 L, DSP boost to 30 Hz) below 90 Hz: −3 dB at 30 Hz, ≈ 105 dB at 40 Hz. Three amplifier channels and DSP: sub < 90 Hz, midbass 90 Hz–1.1 kHz, horn above, all LR4. 453 × 819 × 281 mm wood box, ≈ 18 kg.",
+      forms: { "f-box": { layout: "dual", driver: "faital-15pr400-8", type: "sealed", vb: "40", qtc: "0.707", amp_v: "9", sub_driver: "dayton-dcs305-4", sub_vb: "32", sub_qtc: "0.707", sub_lt: "30", xo_lo: "90", sub_amp_v: "25" },
+        "f-horn": Object.assign({ family: "jmlc", fc: "650", T0: "0.707", trunc: "180" }, DF), "f-bracket": { clearance: "10", setback: "0" },
+        "f-build": { box_mat: "wood", b_sheet_t: "18", mode: "carve", h_sheet_t: "18" } } },
+    { id: "reference", name: "Reference: 40 L concrete, JMLC 650",
+      about: "The all-rounder. Vented 40 L, the woofer's sweet spot: −3 dB at 35 Hz, flat (0.04 dB hump), port air 14 m/s at full power. JMLC 650: Ø285 mouth (fits the 310 mm box), loads to 724 Hz. Cross at 1.2 kHz, 24 dB/oct. Cast resin horn, concrete box.",
+      forms: { "f-box": { type: "vented", vb: "40", fb: "", hpf: "28", hpf_order: "2", port_shape: "slot", amp_v: "15", wall: "35" },
+        "f-horn": Object.assign({ family: "jmlc", fc: "650", T0: "0.707", trunc: "180" }, DF), "f-bracket": { clearance: "10", setback: "0" },
+        "f-build": { box_mat: "concrete", mode: "mould" } } },
+    { id: "floor", name: "Floorstander: tall 40 L, JMLC 550",
+      about: "Horn at seated ear height (axis ≈ 0.93 m). The same 40 L tuning in a tall, narrow box (350 × 750 × 295 mm). JMLC 550: Ø336 mouth, loads to 623 Hz, so it crosses at the driver's lowest, 1 kHz, 24 dB/oct; narrower and more direct (DI 21.5 dB at 5 kHz) for a bigger room. Printed skin horn, concrete box.",
+      forms: { "f-box": { type: "vented", vb: "40", fb: "", hpf: "28", hpf_order: "2", port_shape: "slot", amp_v: "15", wall: "35", width: "280", height: "680" },
+        "f-horn": Object.assign({ family: "jmlc", fc: "550", T0: "0.707", trunc: "180" }, DF), "f-bracket": { clearance: "10", setback: "0", foot_back: "75" },
+        "f-build": { box_mat: "concrete", mode: "skin" } } },
+    { id: "compact", name: "Compact wide: 30 L wood, hypex 650",
+      about: "Small and even off-axis. Vented 30 L in 18 mm plywood: −3 dB at 39 Hz, port air 12 m/s. A hypex horn, Ø169 mouth, loads to 733 Hz yet stays wide (≈125° at 1.2 kHz), close to the woofer's own spread there: the smoothest crossover of the five. Cross at 1.2 kHz. CNC stacked-ring horn, wood box.",
+      forms: { "f-box": { type: "vented", vb: "30", fb: "", hpf: "30", hpf_order: "2", port_shape: "slot", amp_v: "15" },
+        "f-horn": Object.assign({ family: "hypex", fc: "650", T0: "0.7", trunc: "180" }, DF), "f-bracket": { clearance: "10", setback: "0" },
+        "f-build": { box_mat: "wood", b_sheet_t: "18", mode: "stack", h_sheet_t: "18" } } },
+    { id: "satellite", name: "Satellite for a subwoofer: sealed 10 L, hypex 700",
+      about: "With a subwoofer below 80 Hz. Sealed, Qtc 0.71 (10.4 L, 310 × 300 × 275 mm): −3 dB at 79 Hz with a gentle 12 dB/oct roll-off that meets a sub crossed at 80 Hz. A hypex 700 horn, Ø157 mouth, loads to 790 Hz, wide at 1.2 kHz. Cross the horn at 1.2 kHz. Printed skin horn, concrete box.",
+      forms: { "f-box": { type: "sealed", qtc: "0.707", vb: "", hpf: "0", amp_v: "15", wall: "35" },
+        "f-horn": Object.assign({ family: "hypex", fc: "700", T0: "0.7", trunc: "180" }, DF), "f-bracket": { clearance: "10", setback: "0", foot_back: "95" },
+        "f-build": { box_mat: "concrete", mode: "skin" } } },
+    { id: "wood", name: "All wood, CNC: 35 L, JMLC 700",
+      about: "Nothing to cast or print. Vented 35 L in 18 mm plywood: −3 dB at 37 Hz, port air 13 m/s. JMLC 700: Ø265 mouth, loads to 771 Hz, the flattest of the JMLCs here. Cross at 1.25 kHz. Horn carved from a glued block by a CNC shop, wood box.",
+      forms: { "f-box": { type: "vented", vb: "35", fb: "", hpf: "30", hpf_order: "2", port_shape: "slot", amp_v: "15" },
+        "f-horn": Object.assign({ family: "jmlc", fc: "700", T0: "0.707", trunc: "180" }, DF), "f-bracket": { clearance: "10", setback: "0" },
+        "f-build": { box_mat: "wood", b_sheet_t: "18", mode: "carve", h_sheet_t: "18" } } },
+  ];
+  PRESETS.forEach(p => { const o = document.createElement("option"); o.value = p.id; o.textContent = p.name; o.title = p.about; $("#presetGroup").appendChild(o); });
+  // the menu shows what you have: a preset just loaded, until you change something; otherwise your own, one or two horns
+  const layoutNow = () => ($("[name=layout]", fb).value === "dual" ? "dual" : "single");
+  const showCustom = () => { $("#presetPick").value = `custom-${layoutNow()}-${$("#drivers").value}`; };
+  showCustom();
+  $("#presetPick").addEventListener("change", e => {
+    const v = e.target.value;
+    const cm = v.match(/^custom-(single|dual)-([23])$/);
+    if (cm) {            // your own design: the box's layout and the number of horns, the rest as it is
+      const lay = $("[name=layout]", fb); if (lay.value !== cm[1]) { lay.value = cm[1]; lay.dispatchEvent(new Event("input", { bubbles: true })); }
+      const d = $("#drivers"); if (d.value !== cm[2]) { d.value = cm[2]; d.dispatchEvent(new Event("change")); }
+      return; }
+    const p = PRESETS.find(x => x.id === v); if (!p) return showCustom();
+    try {
+      const keep = { drivers: $("#drivers").value, forms: {} };                 // what you had, for Undo
+      DESIGN_FORMS().forEach(f => keep.forms[f.id] = formData(f));
+      localStorage.setItem("undo-design", JSON.stringify(keep));
+      DESIGN_FORMS().forEach(f => localStorage.setItem("form:" + f.id, JSON.stringify(p.forms[f.id] || {})));
+      localStorage.setItem("drivers", p.drivers || "2"); localStorage.setItem("just-preset", p.id);
+    } catch (err) { alertBox("Your browser won't let this page store settings, so the preset can't be loaded."); return; }
+    location.reload();
+  });
+  // after a preset: say what it is, and offer to put your design back
+  try { const id = localStorage.getItem("just-preset"); if (id) { localStorage.removeItem("just-preset");
+    const p = PRESETS.find(x => x.id === id);
+    if (p) { alertBox(`${p.name}. ${p.about}`, true); $("#presetPick").value = p.id;
+      const onEdit = e => { if (e.target.closest && e.target.closest("form")) { showCustom(); document.removeEventListener("input", onEdit, true); } };
+      document.addEventListener("input", onEdit, true);
+      const b = $("#hmsg"), u = document.createElement("a"); u.textContent = "Undo"; b.appendChild(u);
+      u.onclick = () => { try { const k = JSON.parse(localStorage.getItem("undo-design"));
+        for (const [fid, v] of Object.entries(k.forms)) localStorage.setItem("form:" + fid, JSON.stringify(v));
+        localStorage.setItem("drivers", k.drivers); } catch (err) {} location.reload(); }; } } } catch (e) {}
+
+  // live: redraw on the next frame after any change (several changes in one frame redraw once)
+  const onFrame = fn => { let q = false; return () => { if (q) return; q = true; requestAnimationFrame(() => { q = false; fn(); }); }; };
+  const hornNow = onFrame(() => liveHorn(1)), horn2Now = onFrame(() => liveHorn(2)), boxNow = onFrame(liveBox), brNow = onFrame(liveBracket);
+  // 2 or 3 drivers: the Horn 2 tab comes and goes
+  function applyDrivers() {
+    const three = threeWay();
+    $("#navHorn2").hidden = !three; $("#navHorn").textContent = three ? "Horn 1" : "Horn";
+    document.body.classList.toggle("no3", !three);
+    const pp = $("#presetPick"); if (pp && pp.value.startsWith("custom")) pp.value = `custom-${$("[name=layout]", fb).value === "dual" ? "dual" : "single"}-${$("#drivers").value}`; liveBracket(); liveMould(); builtTable(); buildButton();
+    if (!three && $("#navHorn2").classList.contains("on")) $("#navHorn").click();
+    if (three) liveHorn(2); else drawAc(1);
+  }
+  fh.addEventListener("input", () => { showHide(fh); saveForm(fh); hornNow(); });
+  $("#drivers").addEventListener("change", () => { try { localStorage.setItem("drivers", $("#drivers").value); } catch (e) {} applyDrivers(); requestAnimationFrame(buildButton); });
+  // the horns' compression drivers: picking one fills the throat and the bolt pattern (still editable)
+  const hdrv = {};
+  function drvInfo(n) {
+    const F = HF(n), d = hdrv[formData(F).hdriver], el = $(".drvinfo", F);
+    el.innerHTML = d ? `${esc(d.kind || "")}, ${d.range_hz ? d.range_hz.join("–") + " Hz" : ""}, crossover ≥ ${d.crossover_min_hz} Hz` +
+      (d.crossover_min_slope_db_oct ? ` at ≥ ${d.crossover_min_slope_db_oct} dB/oct` : "") + `. Body ⌀${d.body_d_mm} × ${d.depth_mm} mm. <a href="${esc(d.source)}" target="_blank" rel="noopener">source</a>` : "Your own: set the throat and the bolt pattern below.";
+  }
+  function useDriver(n) {
+    const F = HF(n), d = hdrv[formData(F).hdriver];
+    if (d) for (const [k, v] of [["throatD", d.exit_d_mm], ["bolt_circle", d.bolt_circle_mm], ["bolt_n", d.bolt_n], ["bolt_angle", d.bolt_angle_deg], ["bolt_d", d.bolt_hole_mm]]) {
+      const e = F.querySelector(`[name=${k}]`); if (e && v !== undefined) { e.value = v; e._sync && e._sync(); } }
+    drvInfo(n); F.dispatchEvent(new Event("input"));
+  }
+  fh.addEventListener("change", e => { if (e.target.name === "hdriver") useDriver(1); });
+  fh2.addEventListener("change", e => { if (e.target.name === "hdriver") useDriver(2); });
+  fetch(STATIC ? "hdrivers.json" : "/api/hdrivers").then(r => r.json()).then(async list => {
+    for (const n of list) try { hdrv[n] = await (await fetch(STATIC ? `hdrivers/${encodeURIComponent(n)}.json` : `/api/hdriver?name=${encodeURIComponent(n)}`)).json(); } catch (e) {}
+    [1, 2].forEach(n => { const F = HF(n), sel = $("select[name=hdriver]", F);
+      let keep = ""; try { keep = (JSON.parse(localStorage.getItem("form:" + F.id) || "{}").hdriver); } catch (e) {}
+      sel.innerHTML = list.map(k => `<option value="${esc(k)}">${esc(hdrv[k] ? hdrv[k].name : k)}</option>`).join("") + `<option value="">Other (set it yourself)</option>`;
+      sel.value = keep !== undefined && (keep === "" || list.includes(keep)) ? keep : (list.includes("df20-30t") ? "df20-30t" : list[0] || "");
+      drvInfo(n); });
+    liveHorn(1); if (threeWay()) liveHorn(2);
+  });
+  fh2.addEventListener("input", () => { showHide(fh2); saveForm(fh2); horn2Now(); });
+  fb.addEventListener("input", e => {
+    if (e.target.name === "layout") {               // both chambers are sealed; back to one woofer, the box type you had
+      const ty = $("[name=type]", fb);
+      if (e.target.value === "dual") { try { localStorage.setItem("box-type-before-dual", ty.value); } catch (err) {} ty.value = "sealed"; }
+      else { let v = null; try { v = localStorage.getItem("box-type-before-dual"); } catch (err) {} if (v) ty.value = v; } }
+    showHide(fb); saveForm(fb); if (e.target.name === "driver") loadDriver(); else if (e.target.name === "sub_driver") loadSubDriver(); else boxNow(); });
+  [fbr, fbr2].forEach(f => f.addEventListener("input", e => {
+    const o = f === fbr ? fbr2 : fbr, n = e.target.name;
+    if (n === "xswap") { $("[name=xswap]", o).checked = e.target.checked; saveForm(o); }   // one setting for both horns
+    else if (n === "xlock") {   // locking: this horn takes the other's distance; both boxes ticked or not
+      $("[name=xlock]", o).checked = e.target.checked;
+      if (e.target.checked) { const x = $("[name=xpos]", f); x.value = $("[name=xpos]", o).value; x._sync && x._sync(); }
+      saveForm(o);
+    } else if (n === "xpos" && $("[name=xlock]", f).checked) {   // locked: the other horn moves too
+      const x = $("[name=xpos]", o); x.value = e.target.value; x._sync && x._sync(); saveForm(o);
+    }
+    showHide(f); saveForm(f); brNow(); }));
+  const mouldNow = onFrame(liveMould);
+  fmk.addEventListener("input", e => { showHide(fmk); saveForm(fmk);
+    if (/^p_/.test(e.target.name)) { try { liveCost(); } catch (err) {} return; }
+    // a new way of making the horn or the box: build it (and what depends on it) so the parts follow
+    if (["mode", "box_mat"].includes(e.target.name) && !STATIC) setTimeout(buildAll, 0);
+    if (["tube_wall", "cable_d", "box_mat", "b_sheet_t", "b_density"].includes(e.target.name)) boxNow(); else { mouldNow(); brNow(); } });
+  fb.addEventListener("change", e => { if (e.target.name === "driver") loadDriver(); if (e.target.name === "sub_driver") loadSubDriver(); });
+  $("#buildAll").onclick = async () => { const b = $("#buildAll"); b.disabled = true; b.dataset.busy = "1";
+    try { await buildAll(); } finally { delete b.dataset.busy; buildButton(); } };
+  // any change anywhere may change what needs rebuilding
+  [fh, fh2, fb, fbr, fbr2, fmk].forEach(f => f.addEventListener("input", () => requestAnimationFrame(buildButton)));
+  fetch(STATIC ? "drivers.json" : "/api/drivers").then(r => r.json()).then(list => {
+    const sel = $("select[name=driver]", fb); let keep = sel.value; try { keep = keep || JSON.parse(localStorage.getItem("form:f-box") || "{}").driver || ""; } catch (e) {}
+    sel.innerHTML = list.map(d => `<option>${esc(d)}</option>`).join(""); sel.value = list.includes(keep) ? keep : list.includes("dsa215-8") ? "dsa215-8" : list[0];
+    const ss = $("select[name=sub_driver]", fb); let ks = ""; try { ks = JSON.parse(localStorage.getItem("form:f-box") || "{}").sub_driver || ""; } catch (e) {}
+    ss.innerHTML = list.map(d => `<option>${esc(d)}</option>`).join(""); ss.value = list.includes(ks) ? ks : (list.find(x => /dcs305|sub/i.test(x)) || list[0]);
+    loadSubDriver();
+    loadDriver();
+  });
+  liveHorn(1); applyDrivers();
+  if (STATIC) { $("#where").textContent = "ONLINE · DESIGN ONLY"; builtTable(); buildButton(); }
+  else fetch("/api/latest").then(r => r.json()).then(L => {
+    if (L.horn) hornShow(L.horn); if (L.horn2) hornShow(L.horn2, 2); if (L.box) boxShow(L.box); if (L.bracket) bracketShow(L.bracket);
+    builtTable(); showParts(L.horn ? "horn" : L.box ? "box" : "bracket"); buildButton();
+  });
+  // the 3-D view needs its tab visible to size itself
+  $$("nav button").forEach(b => b.addEventListener("click", () => { if (b.dataset.tab === "horn" || b.dataset.tab === "horn2") { const o = $("#o-bracket"), t = $("#o-spk"), h = $("#o-" + b.dataset.tab);
+      [o, t].forEach(e => { e.dataset.tab = b.dataset.tab; e.classList.remove("hidden"); }); h.before(t); h.after(o); } if (b.dataset.tab === "horn") requestAnimationFrame(() => liveHorn(1)); if (b.dataset.tab === "horn2") requestAnimationFrame(() => liveHorn(2)); if (b.dataset.tab === "build") requestAnimationFrame(liveMould); }));
+  try { let t = (location.hash || "").slice(1) || localStorage.getItem("tab"); if (t === "bracket" || (t === "horn2" && !threeWay())) t = "horn";
+    if (t && $(`nav button[data-tab=${t}]`)) $(`nav button[data-tab=${t}]`).click(); } catch (e) {}
+})();
+</script>
+</body>
+</html>

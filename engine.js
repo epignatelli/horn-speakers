@@ -1,0 +1,5898 @@
+
+"use strict";
+var C = 344000, RHO = 1.205e-9; // mm/s ; kg/mm^3 -> keep consistent units where used
+
+/* ================= profile families: all return {wall:[{z,r}], sEnd, terminated, Ttrace} ================= */
+
+function makeTfun(P, m) {
+  if (!P.petf) return function () { return P.T0; };
+  var ref = P.petfRef === "mouth" ? Math.max(0, (P.sEndEst || 0) - P.sOff) : P.sOff;
+  if (P.petfShape === "tanh")
+    return function (s) { return P.T0 + P.Tadd * 0.5 * (1 + Math.tanh(m * P.fmult * (s - ref))); };
+  return function (s) { return P.T0 + P.Tadd * (1 - Math.exp(-m * P.fmult * Math.max(0, s - ref))); };
+}
+
+function jmlcWall(P) {
+  var diagnostics = [], lawCaughtUp = false, entryDominatedLen = 0;
+  var m = 4 * Math.PI * P.fc / C, rt = P.rt, N = 110, ds = C / P.fc / 1000;
+  var Tf = makeTfun(P, m);
+  // entry 88 (Le Cleac'h originals): the NATURAL entry angle -- "only one single
+  // opening angle for a given throat diameter, fc and T" (JMLC). Closed form from
+  // matching the seed cap's own growth to the law's initial slope:
+  // 2*S0/R = S0*m*T with R = rt/sin(th0)  ==>  sin(th0) = rt*m*T/2.
+  // VALIDATED: 27.5518 deg printed in his own axial sheet vs our 27.5518.
+  // entry 88: F mouth shape factor (pi round / 4 square) scales the throat area;
+  // W wall coefficient (2 free-standing / 1 = two room walls) scales the law.
+  var th0;
+  if (P.entryAuto) th0 = Math.asin(Math.max(0, Math.min(0.99, rt * m * (Tf(0) || 1e-6) / 2)));
+  else th0 = (P.entryDeg || 0) * Math.PI / 180;
+  // NOTE (entry 88): his F mouth-shape factor and W wall coefficient are recognized
+  // but NOT wired into the march. F corrupts an axisymmetric march (the law and the
+  // geometric revolve become incommensurate; measured: Fshape=4 stalls at the throat)
+  // -- for non-round sections it is OUR EXISTING superellipse Gamma-normalization,
+  // already shipped. W likely gates his mouth criterion; decode before wiring.
+  var pts = [], i, S0;
+  if (th0 > 0.005) {
+    var R = rt / Math.sin(th0);
+    for (i = 0; i < N; i++) {
+      var ph = th0 * i / (N - 1);
+      pts.push({ z: R * (Math.cos(ph) - Math.cos(th0)), r: R * Math.sin(ph) });
+    }
+    // reverse to axis->edge order with axis first: current order axis(apex, phi=0) -> rim ✓
+    S0 = 2 * Math.PI * rt * rt / (1 + Math.cos(th0));
+  } else {
+    for (i = 0; i < N; i++) pts.push({ z: 0, r: rt * i / (N - 1) });
+    S0 = Math.PI * rt * rt;
+  }
+  var s = 0, terminated = "max-iter", wall = [{ z: 0, r: rt }], Ttrace = [{ s: 0, T: Tf(0) }];
+  var wavefronts = [], wfEvery = 40;
+  function area(poly) { var A = 0, k;
+    for (k = 0; k < poly.length - 1; k++)
+      A += Math.PI * (poly[k].r + poly[k + 1].r) * Math.hypot(poly[k + 1].z - poly[k].z, poly[k + 1].r - poly[k].r);
+    return A; }
+  function resample(poly, n) {
+    var cum = [0], k;
+    for (k = 1; k < poly.length; k++)
+      cum.push(cum[k - 1] + Math.hypot(poly[k].z - poly[k - 1].z, poly[k].r - poly[k - 1].r));
+    var total = cum[cum.length - 1], out = [], j = 0;
+    for (k = 0; k < n; k++) {
+      var t = total * k / (n - 1);
+      while (j < cum.length - 2 && cum[j + 1] < t) j++;
+      var f = (t - cum[j]) / ((cum[j + 1] - cum[j]) || 1e-12);
+      out.push({ z: poly[j].z + f * (poly[j + 1].z - poly[j].z), r: poly[j].r + f * (poly[j + 1].r - poly[j].r) });
+    }
+    out[0] = { z: poly[0].z, r: 0 };
+    return out; }
+  for (var it = 0; it < 12000; it++) {
+    var adv = [];
+    for (i = 0; i < N; i++) {
+      var a = pts[Math.max(0, i - 1)], b = pts[Math.min(N - 1, i + 1)];
+      var uz = b.z - a.z, ur = b.r - a.r, l = Math.hypot(uz, ur) || 1e-12; uz /= l; ur /= l;
+      adv.push({ z: pts[i].z + (i === 0 ? 1 : ur) * ds, r: pts[i].r + (i === 0 ? 0 : -uz) * ds });
+    }
+    adv[0].r = 0; s += ds;
+    var T = Tf(s);
+    var Star = S0 * Math.pow(Math.cosh(m / 2 * s) + T * Math.sinh(m / 2 * s), 2);
+    var dS = Star - area(adv);
+    if (!isFinite(dS)) { terminated = "overflow"; break; }
+    if (dS >= 0) lawCaughtUp = true;
+    if (dS < 0) {
+      // AUDIT #3 rev. 3 (2026-07-13): entry-angle seeds legitimately provide MORE area
+      // than the young law wants -- holding the wavefront (dS = 0) until the law
+      // overtakes IS the entry geometry, not an error (rev. 2 bricked working horns;
+      // real-user report at 0.31%). So: before the law first catches up, clamp and
+      // RECORD the entry-dominated length. AFTER catch-up, a negative dS is a genuine
+      // anomaly with severity tiers:
+      //   rel <= 5e-4    silent clamp (numeric noise)
+      //   <= 1e-2        WARN: clamp, diagnostic, continue
+      //   >  1e-2        FAIL: stop, terminated = "area-overshoot", gate exports
+      if (!lawCaughtUp) { entryDominatedLen = s; dS = 0; }
+      else {
+        var relE = -dS / Math.max(1e-12, Star), absTol = 1e-4 * S0;
+        if (-dS <= absTol || relE <= 5e-4) dS = 0;
+        else if (relE <= 1e-2) {
+          if (diagnostics.length < 20)
+            diagnostics.push({ code: "JMLC_AREA_OVERSHOOT", severity: "warn", station: wall.length,
+                               wavefrontDistance: s, targetArea: Star, advancedArea: area(adv),
+                               absoluteError: -dS, relativeError: relE });
+          dS = 0;
+        } else {
+          diagnostics.push({ code: "JMLC_AREA_OVERSHOOT", severity: "fail", station: wall.length,
+                             wavefrontDistance: s, targetArea: Star, advancedArea: area(adv),
+                             absoluteError: -dS, relativeError: relE });
+          terminated = "area-overshoot";
+          break;
+        }
+      }
+    }
+    var E = adv[N - 1], Pp = adv[N - 2];
+    var tz = E.z - Pp.z, tr = E.r - Pp.r, tl = Math.hypot(tz, tr) || 1e-12; tz /= tl; tr /= tl;
+    var nz = tr, nr = -tz;
+    var fL = function (L) {
+      var sp = Math.min(1, L / ds), cp = Math.sqrt(Math.max(0, 1 - sp * sp));
+      return Math.PI * (2 * E.r + L * (cp * tr - sp * nr)) * L - dS; };
+    var lo = 0, hi = ds * 0.999999;
+    if (fL(hi) < 0) { terminated = "flare-limit"; break; }
+    for (var k2 = 0; k2 < 50; k2++) { var mid = (lo + hi) / 2; if (fL(mid) < 0) lo = mid; else hi = mid; }
+    var L = (lo + hi) / 2, sp2 = Math.min(1, L / ds), cp2 = Math.sqrt(Math.max(0, 1 - sp2 * sp2));
+    var W = { z: E.z + L * (cp2 * tz - sp2 * nz), r: E.r + L * (cp2 * tr - sp2 * nr) };
+    wall.push(W); Ttrace.push({ s: s, T: T });
+    // AUDIT #3: truncation angle from an AVERAGED LOCAL DIRECTION over the last up-to-6
+    // stations (stable, and rollback-safe -- a least-squares r(z) fit assumes r is a
+    // function of z, which fails the moment the wall curls past 90 deg; caught by the
+    // HVDiff rollback regression before shipping).
+    var nf = Math.min(6, wall.length), iA = wall.length - nf;
+    var pAz = (wall[iA].z + wall[Math.min(iA + 1, wall.length - 1)].z) / 2;
+    var pAr = (wall[iA].r + wall[Math.min(iA + 1, wall.length - 1)].r) / 2;
+    var pBz = (wall[wall.length - 1].z + wall[wall.length - 2].z) / 2;
+    var pBr = (wall[wall.length - 1].r + wall[wall.length - 2].r) / 2;
+    var deg = Math.atan2(pBr - pAr, pBz - pAz) * 180 / Math.PI;
+    if (deg < 0) deg += 360;
+    if (wall.length > 8 && deg >= P.trunc) { terminated = "truncation"; break; }
+    pts = resample(adv.concat([W]), N);
+    if (it % wfEvery === 0) {
+      var wf9 = [];
+      for (var q8 = 0; q8 < N; q8 += 8) wf9.push({ z: pts[q8].z, r: pts[q8].r });
+      wf9.push({ z: pts[N - 1].z, r: pts[N - 1].r });
+      wavefronts.push(wf9);
+    }
+  }
+  return { wall: wall, sEnd: s, terminated: terminated, Ttrace: Ttrace, wavefronts: wavefronts, S0: S0, m: m, diagnostics: diagnostics, entryDominatedLen: entryDominatedLen, th0Deg: th0 * 180 / Math.PI, th0Natural: !!P.entryAuto };   /* entry 238: the launch angle, reported */
+}
+
+function swhWall(P) { // Kugelwellen: spherical caps of constant radius r0 = c/(pi*fc) (Kolbrek eq.18; NOT c/2pi -- see regression 1)
+  var m = 4 * Math.PI * P.fc / C, rt = P.rt, R0 = C / (Math.PI * P.fc); // Klangfilm construction radius r0 = c/(pi*fc) (validated vs published SWH400 reference)
+  var Tf = makeTfun(P, m);
+  var h0 = R0 - Math.sqrt(Math.max(0, R0 * R0 - rt * rt));
+  var dx = C / P.fc / 2000, x = 0;
+  var wall = [{ z: 0, r: rt }], Ttrace = [{ s: 0, T: Tf(0) }], terminated = "max-iter";
+  for (var it = 0; it < 40000; it++) {
+    x += dx;
+    var T = Tf(x);
+    var g = Math.cosh(m / 2 * x) + T * Math.sinh(m / 2 * x);
+    var h = h0 * g * g;
+    if (h >= 2 * R0 * 0.999) { terminated = "closed"; break; }
+    var r = Math.sqrt(Math.max(0, h * (2 * R0 - h)));
+    var z = x + h0 - h;
+    var prev = wall[Math.max(0, wall.length - 4)];
+    wall.push({ z: z, r: r }); Ttrace.push({ s: x, T: T });
+    var deg = Math.atan2(r - prev.r, z - prev.z) * 180 / Math.PI;
+    if (deg < 0) deg += 360;
+    if (wall.length > 8 && deg >= P.trunc) { terminated = "truncation"; break; }
+  }
+  return { wall: wall, sEnd: x, terminated: terminated, Ttrace: Ttrace, S0: 2 * Math.PI * R0 * h0, m: m, R0: R0 };
+}
+
+function tractrixWall(P) { // classic tractrix (P.G.A.H. Voigt, 1927); notation follows the sphericalhorns.net exposition (eqs 3-4 there) -- see README.md (provenance)
+  var rt = P.rt, r0 = C / (2 * Math.PI * P.fc);
+  if (rt >= r0 * 0.98) return { wall: [{ z: 0, r: rt }], sEnd: 0, terminated: "throat>=r0", Ttrace: [] };
+  function xOf(y) { return r0 * Math.log((r0 + Math.sqrt(r0 * r0 - y * y)) / y) - Math.sqrt(r0 * r0 - y * y); }
+  var x0 = xOf(rt), wall = [], n = 700, terminated = "mouth";
+  for (var i = 0; i < n; i++) {
+    var y = rt + (r0 * 0.9995 - rt) * i / (n - 1);
+    wall.push({ z: x0 - xOf(y), r: y });
+    if (i > 4) {
+      var a = wall[wall.length - 2], b = wall[wall.length - 1];
+      var deg = Math.atan2(b.r - a.r, b.z - a.z) * 180 / Math.PI;
+      if (deg < 0) deg += 360;
+      if (deg >= P.trunc) { terminated = "truncation"; break; }
+    }
+  }
+  return { wall: wall, sEnd: wall[wall.length - 1].z, terminated: terminated, Ttrace: [], r0: r0 };
+}
+
+function hypexWall(P) { // plane-wavefront hypex (V. Salmon, JASA 1946); PETF from the equations published by Dr. B. Ahlswede, sphericalhorns.net (eqs 1-2 of that presentation) -- see README.md (provenance)
+  var m = 4 * Math.PI * P.fc / C, rt = P.rt, Tf = makeTfun(P, m);
+  var rMouth = C / (2 * Math.PI * P.fc); // km*r = 1 criterion
+  var dx = 0.5, x = 0, wall = [{ z: 0, r: rt }], Ttrace = [{ s: 0, T: Tf(0) }], terminated = "mouth-kr1";
+  for (var it = 0; it < 30000; it++) {
+    x += dx;
+    var T = Tf(x);
+    var r = rt * (Math.cosh(m / 2 * x) + T * Math.sinh(m / 2 * x));
+    var prev = wall[wall.length - 1];
+    wall.push({ z: x, r: r }); Ttrace.push({ s: x, T: T });
+    var deg = Math.atan2(r - prev.r, dx) * 180 / Math.PI;
+    if (P.trunc < 89 && deg >= P.trunc) { terminated = "truncation"; break; }
+    if (r >= rMouth) { terminated = "mouth-kr1"; break; }
+  }
+  return { wall: wall, sEnd: x, terminated: terminated, Ttrace: Ttrace };
+}
+
+function conicalWall(P) {
+  var thDeg = (P.entryDeg === undefined || P.entryDeg === null) ? 15 : P.entryDeg;
+  var rt = P.rt, th = Math.max(2, Math.min(60, thDeg)) * Math.PI / 180;
+  var rMouth = C / (2 * Math.PI * P.fc);
+  var L = (rMouth - rt) / Math.tan(th), wall = [], n = 300;
+  for (var i = 0; i < n; i++) { var z = L * i / (n - 1); wall.push({ z: z, r: rt + z * Math.tan(th) }); }
+  return { wall: wall, sEnd: L, terminated: "mouth-kr1", Ttrace: [] };
+}
+
+function neileWall(P) { // semicubic parabola r = rt + K z^{3/2} (first WN horns: no expansion law)
+  var rt = P.rt, K = Math.max(0.005, P.neileK || 0.06);
+  var wall = [{ z: 0, r: rt }], terminated = "max-z", dz = 0.6;
+  for (var i = 1; i < 5000; i++) {
+    var z = i * dz, r = rt + K * Math.pow(z, 1.5);
+    var prev = wall[wall.length - 1];
+    wall.push({ z: z, r: r });
+    var deg = Math.atan2(r - prev.r, dz) * 180 / Math.PI;
+    if (P.trunc < 89 && deg >= P.trunc) { terminated = "truncation"; break; }
+    if (r >= C / (2 * Math.PI * P.fc)) { terminated = "mouth-kr1"; break; }
+  }
+  return { wall: wall, sEnd: wall[wall.length - 1].z, terminated: terminated, Ttrace: [] };
+}
+
+function osseWall(P) {
+  // OS-SE waveguide (Batik 2020) - exact published formula (5):
+  // r(z) = sqrt(k^2 r0^2 + 2 k r0 z tan(a0) + z^2 tan^2(a)) + r0(1-k) + (sL/q)[1-(1-(qz/L)^n)^(1/n)]
+  // Generalizes Geddes/Freehafer OS with throat angle a0, expansion factor k,
+  // and an infinitely-differentiable superellipse termination (clothoid-equivalent).
+  // entry 235 (kodomo, forum #54: SA8535 ribbon 48.6 x 166 mm with 70 H x 45 V on
+  // OSSE/R-OSSE "develops a long near-parallel section along the tall dimension,
+  // followed by a rather abrupt flare ... like a pedestal"; exprymer #55: "more ATH
+  // options"). ROOT CAUSE, measured: the V plane was the H curve stretched by
+  // "aspect", launched from the area-equivalent round throat (r 25), and the
+  // ribbon morph then had to Z-SHIFT that wall to reach the 83 mm half-height --
+  // r(z) = wall(z + zS(1-e)) squeezes the slope to ~15% of native mid-blend, then
+  // catches up: exactly the pedestal. PER-PLANE CONSTRUCTION now (the ATH form
+  // of the same published formula): each principal plane runs formula (5) with
+  // ITS OWN throat half-aperture (a0 = W/2, b0 = H/2 for a rect throat; rt for a
+  // round one) and ITS OWN coverage half-angle (covH / covV); a0, k, s, n, q are
+  // shared. One common length L, solved so BOTH planes reach their Keele size
+  // for f0 (the larger of the two per-plane lengths -- the dial promises pattern
+  // control to f0, in both planes). The flare therefore starts at the ribbon
+  // aperture immediately, in both planes. The section between the planes is the
+  // app's superellipse loft (rect-ish at the throat easing to the body shape).
+  var covH = P.covH || 90, f0 = P.f0 || 800;
+  var covV = P.covV || covH;
+  var r0H = P.rtH || P.rt, r0V = P.rtV || P.rt;
+  var alH = Math.min(70, Math.max(15, covH / 2)) * Math.PI / 180;
+  var alV = Math.min(70, Math.max(15, covV / 2)) * Math.PI / 180;
+  var a0 = Math.max(0, Math.min(25, P.entryDeg || 0)) * Math.PI / 180;
+  var k = Math.max(0.3, Math.min(4, P.osK || 1));
+  var s = Math.max(0, Math.min(2.5, P.osS === undefined ? 0.7 : P.osS));
+  var nn = Math.max(2, Math.min(12, P.osN || 4)), q = 0.995;   // entry 229: ceiling 8 -> 12 (Hans wants >= 10)
+  var ta0 = Math.tan(a0);
+  // entry 219 (forum: the generic straight graft rippled OS-SE -- 2 slope
+  // reversals, peak 52.8 vs 46.7 clean; the doomed-asymptote catch-up of
+  // entry 184). Batik's formula 5 LAUNCHES at a0 natively, so the driver
+  // entry needs no graft at all: a0 = half the driver exit angle and the
+  // curve leaves z=0 at exactly that slope. entry 221 (Hans, the entry-190
+  // reporter's standard: "the horn contour starts with linear values"): the
+  // 219 build prepended a PHYSICAL straight run -- but the cone is INSIDE
+  // THE DRIVER, exactly as entry 190 settled for the classic OS. v2 removes
+  // the run: geometry is the pure curve from z=0; Driver entry L feeds the
+  // Webster LOADING estimate only (the entry-192 treatment, extended here).
+  function rAt(z, L, r0, ta) {
+    var gos = Math.sqrt(k * k * r0 * r0 + 2 * k * r0 * z * ta0 + z * z * ta * ta) + r0 * (1 - k);
+    var u = Math.min(1, (q * z) / L);
+    return gos + (s * L / q) * (1 - Math.pow(1 - Math.pow(u, nn), 1 / nn));
+  }
+  // solve L so the mouth reaches the Keele size for the plane's coverage
+  function solveL(r0, ta, cov) {
+    var dK = 2.54e7 / (Math.max(30, cov) * f0), lo = r0, hi = 20 * dK, L = 0;
+    for (var it = 0; it < 80; it++) {
+      L = (lo + hi) / 2;
+      if (rAt(L, L, r0, ta) < dK / 2) lo = L; else hi = L;
+    }
+    return L;
+  }
+  var LH = solveL(r0H, Math.tan(alH), covH), LV = solveL(r0V, Math.tan(alV), covV);
+  var asym = Math.abs(covV - covH) > 0.01 || Math.abs(r0V - r0H) > 1e-9;
+  var L = asym ? Math.max(LH, LV) : LH;
+  var wall = [], wallV = [], n2 = 600;
+  for (var i = 0; i < n2; i++) {
+    var z = L * i / (n2 - 1);
+    wall.push({ z: z, r: rAt(z, L, r0H, Math.tan(alH)) });
+    if (asym) wallV.push({ z: z, r: rAt(z, L, r0V, Math.tan(alV)) });
+  }
+  var out = { wall: wall, sEnd: L, terminated: "OSSE (Keele-width mouth)", Ttrace: [],
+              osPlanes: { LH: LH, LV: LV, covH: covH, covV: covV, r0H: r0H, r0V: r0V,
+                          mouthW: 2 * wall[n2 - 1].r, mouthH: 2 * (asym ? wallV[n2 - 1].r : wall[n2 - 1].r) } };
+  out.osPlanes.f0H = 2.54e7 / (Math.max(30, covH) * out.osPlanes.mouthW);   // pattern-control corner ACHIEVED per plane (Keele)
+  out.osPlanes.f0V = 2.54e7 / (Math.max(30, covV) * out.osPlanes.mouthH);
+  if (asym) out.wallV = wallV;
+  return out;
+}
+
+function cdWallRound(P) {
+  // Keele CE horn, axisymmetric: hyp-exp throat joined TANGENT to a cone at the
+  // coverage half-angle (join where the law slope reaches tan(theta)), third
+  // region doubles the included angle over the last third of the conical
+  // widening, terminated at kr mouth area AND Keele width d = 2.54e7/(theta*f0).
+  var m = 4 * Math.PI * P.fc / C, rt = P.rt;
+  var Tf = makeTfun(P, m);
+  var S0 = Math.PI * rt * rt;
+  var covHalf = Math.min(70, Math.max(15, (P.covH || 90) / 2)) * Math.PI / 180;
+  var tanH = Math.tan(covHalf);
+  var Smouth = C * C / (4 * Math.PI * P.fc * P.fc);
+  var f0 = P.f0 || 800;
+  var dKeele = 2.54e7 / (Math.max(30, P.covH || 90) * f0);
+  var dz = 0.6, wall = [{ z: 0, r: rt }], Ttrace = [{ s: 0, T: Tf(0) }];
+  var terminated = "max-iter", z = 0, s = 0, rPrev = rt;
+  var con = false, rC = 0, zC = 0, flare = false, rF = 0, zF = 0, tanF = 0;
+  for (var i = 1; i < 30000; i++) {
+    z = i * dz;
+    var r;
+    if (!con) {
+      var T = Tf(s + dz);
+      var Star = S0 * Math.pow(Math.cosh(m / 2 * (s + dz)) + T * Math.sinh(m / 2 * (s + dz)), 2);
+      r = Math.sqrt(Star / Math.PI);
+      var rJoin = 0.95 * Math.sin(covHalf) * C / (2 * Math.PI * P.fc); // Keele/Kolbrek eq.27: directivity-matched join
+      if (r >= rJoin) { con = true; rC = r; zC = z; }
+    }
+    if (con && !flare && 2 * r >= 2 * rC + (dKeele - 2 * rC) * 2 / 3) {
+      flare = true; rF = r; zF = z - dz;
+      tanF = Math.tan(Math.min(80 * Math.PI / 180, 2 * covHalf));
+    }
+    if (con) r = flare ? rF + (z - zF) * tanF : rC + (z - zC) * tanH;
+    var ds = Math.sqrt(dz * dz + (r - rPrev) * (r - rPrev));
+    s += ds;
+    wall.push({ z: z, r: r }); Ttrace.push({ s: s, T: Tf(s) });
+    if (Math.PI * r * r >= Smouth && 2 * r >= dKeele) { terminated = "mouth+DI"; break; }
+    rPrev = r;
+  }
+  return { wall: wall, sEnd: s, terminated: terminated, Ttrace: Ttrace, S0: S0, m: m };
+}
+function cdWall(P) {
+  // Keele 1975 CD horn, production recipe (preprint p.19 + Fig.16), common-mouth scheduling:
+  // 0.5 in round->rect transition; each plane is a straight wedge at HALF the throat included
+  // angle A = 0.9*B (Keele p.3, confirmed by Fig.19c: ~41 deg/side on the 90 deg product);
+  // the vertical maintains the hyp-exp law until its slope reaches its wedge angle.  BOTH
+  // planes end at ONE mouth plane: the horn length L is set by the plane that needs the most
+  // length to reach its Keele width d = 2.54e7/(theta*f0) via the Fig.16 last-third double-angle
+  // flare; the other plane's flare start is solved so it lands exactly on its own Keele width
+  // at the same L (clamped: if its wedge alone overreaches, it simply runs to the mouth --
+  // width overshoot, i.e. better pattern control, as on the shipped EV horns).  L is extended
+  // if needed so the mouth area also satisfies the kr mouth criterion.
+  // entry 213 (fuzz blind spot): cd is a LAW family -- the vertical runs the
+  // hyp-exp radius law, so an undefined T0 turns L into NaN and the emit loop
+  // (i <= NaN never true) into an EMPTY wall: no NaN for the entry-136 gates
+  // to catch, nothing downstream to measure. Guard the input up front.
+  if (!isFinite(P.T0))
+    throw new Error("cd: non-finite T0 -- the CD vertical runs the hyp-exp law; check the parameters");
+  var m = 4 * Math.PI * P.fc / C, rt = P.rt;
+  var Tf = makeTfun(P, m);
+  var S0 = Math.PI * rt * rt;
+  var AB = 0.9; // Keele: throat included angle A = 0.9 * beamwidth B
+  var covH = P.covH || 90, covV = P.covV || 60;
+  var covHalf = Math.min(70, Math.max(15, covH / 2)) * Math.PI / 180;
+  var covVHalf = Math.min(70, Math.max(10, covV / 2)) * Math.PI / 180;
+  var t1H = Math.tan(AB * covHalf), t1V = Math.tan(AB * covVHalf);
+  var t2H = Math.tan(Math.min(85 * Math.PI / 180, 2 * AB * covHalf));
+  var t2V = Math.tan(Math.min(85 * Math.PI / 180, 2 * AB * covVHalf));
+  var Smouth = C * C / (4 * Math.PI * P.fc * P.fc);
+  var f0 = P.f0 || 800;
+  var dKeele = 2.54e7 / (Math.max(30, covH) * f0);
+  var dKeeleV = P.f0V > 0 ? 2.54e7 / (Math.max(10, covV) * P.f0V)
+    : dKeele * Math.sin(covVHalf) / Math.sin(covHalf); // eq.(1) per plane, or eq.(2) aspect when auto
+  var rhoTgt = Math.max(0.5, P.cornerR === undefined ? rt : P.cornerR);
+  var dz = 0.6, zTr = 12.7;
+  // ---- pass 1: transition, then V follows the hyp-exp RADIUS law until its slope
+  //      reaches the V wedge angle (Keele p.19: "the vertical dimension varies so as to
+  //      maintain the overall hyperbolic-exponential flare in the first part of the horn";
+  //      this reading puts the exp->conical change at 5-11 in on his products, as stated) ----
+  var z = 0, s = 0, i;
+  var aC = rt, zC = zTr;
+  for (i = 1; i * dz < zTr; i++) {          // round->rect transition under the area law
+    z = i * dz;
+    var Tt = Tf(z);
+    var St = S0 * Math.pow(Math.cosh(m / 2 * z) + Tt * Math.sinh(m / 2 * z), 2);
+    aC = Math.sqrt((St + (4 - Math.PI) * rt * rt) / 4);
+    zC = z;
+  }
+  var bTr = aC;                              // V continues from the transition, hypex radius law
+  function bLaw(zq) { var u = Math.max(0, zq - zTr), T2 = Tf(zq);
+    return bTr * (Math.cosh(m / 2 * u) + T2 * Math.sinh(m / 2 * u)); }
+  var vCon = false, bC = bTr, zVC = zTr, bPrev = bTr;
+  for (i = 1; i < 60000; i++) {
+    z = zTr + i * dz;
+    var b = bLaw(z);
+    if ((b - bPrev) / dz >= t1V) { vCon = true; bC = bPrev; zVC = z - dz; break; }
+    bPrev = b;
+    if (z > 40 * dKeele) { vCon = true; bC = bPrev; zVC = z; break; } // safety
+  }
+  // ---- closed-form scheduling to a COMMON mouth plane ----
+  function schedL(zJ, rJ, tgt, t1, t2) { return zJ + Math.max(0, tgt - rJ) / ((2 / 3) * t1 + (1 / 3) * t2); }
+  var LH = schedL(zC, aC, dKeele / 2, t1H, t2H);
+  var LV = schedL(zVC, bC, dKeeleV / 2, t1V, t2V);
+  var L = Math.max(LH, LV);
+  function zFsolve(zJ, rJ, tgt, t1, t2, Lc) {
+    var zF = (tgt - rJ + zJ * t1 - Lc * t2) / (t1 - t2);
+    return Math.min(Lc, Math.max(zJ, zF));
+  }
+  function wallVal(zq, zJ, rJ, t1, t2, zF) {
+    if (zq <= zF) return rJ + (zq - zJ) * t1;
+    return rJ + (zF - zJ) * t1 + (zq - zF) * t2;
+  }
+  function mouthOf(Lc) {
+    var zFH = zFsolve(zC, aC, dKeele / 2, t1H, t2H, Lc);
+    var zFV = zFsolve(zVC, bC, dKeeleV / 2, t1V, t2V, Lc);
+    var aM = wallVal(Lc, zC, aC, t1H, t2H, zFH);
+    var bM = wallVal(Lc, zVC, bC, t1V, t2V, zFV);
+    var rM = Math.min(rhoTgt, 0.98 * Math.min(aM, bM));
+    return { zFH: zFH, zFV: zFV, aM: aM, bM: bM, S: 4 * aM * bM - (4 - Math.PI) * rM * rM };
+  }
+  var terminated = "mouth (Keele targets)";
+  if (mouthOf(L).S < Smouth) { // extend for the kr mouth criterion
+    var lo = L, hi = L;
+    for (var k9 = 0; k9 < 40 && mouthOf(hi).S < Smouth; k9++) hi *= 1.25;
+    for (k9 = 0; k9 < 60; k9++) { var mid9 = (lo + hi) / 2; if (mouthOf(mid9).S < Smouth) lo = mid9; else hi = mid9; }
+    L = (lo + hi) / 2;
+    terminated = "mouth (Keele + kr area)";
+  }
+  var sch = mouthOf(L);
+  // ---- pass 2: emit walls over [0, L] via the closed forms ----
+  var wallH = [], wallV = [], rhoTrk = [], Ttrace = [];
+  s = 0;
+  var aPrev = rt; bPrev = rt;
+  var N = Math.max(3, Math.ceil(L / dz));
+  for (i = 0; i <= N; i++) {
+    z = Math.min(L, i * dz);
+    var a2, b2;
+    if (z < zTr) {
+      var Tt2 = Tf(z);
+      var St3 = S0 * Math.pow(Math.cosh(m / 2 * z) + Tt2 * Math.sinh(m / 2 * z), 2);
+      a2 = Math.sqrt((St3 + (4 - Math.PI) * rt * rt) / 4);
+      b2 = a2;
+    } else {
+      a2 = wallVal(z, zC, aC, t1H, t2H, sch.zFH);
+      b2 = (z <= zVC) ? bLaw(z) : wallVal(z, zVC, bC, t1V, t2V, sch.zFV);
+    }
+    s += (i === 0) ? 0 : Math.sqrt(dz * dz + Math.pow((a2 - aPrev + b2 - bPrev) / 2, 2));
+    var fr2 = Math.min(1, (2 * a2) / dKeele);
+    fr2 = fr2 * fr2 * (3 - 2 * fr2);
+    var rho2 = Math.min(rt + (rhoTgt - rt) * fr2, 0.98 * Math.min(a2, b2));
+    wallH.push({ z: z, r: a2 }); wallV.push({ z: z, r: b2 });
+    rhoTrk.push(rho2); Ttrace.push({ s: s, T: Tf(z) });  // trace the APPLIED T (law runs on axial z, not arc length)
+    aPrev = a2; bPrev = b2;
+    if (z >= L) break;
+  }
+  return { wall: wallH, wallV: wallV, rhoTrk: rhoTrk, sEnd: s, terminated: terminated, Ttrace: Ttrace, S0: S0, m: m,
+           criticalZ: [zTr] };   // AUDIT #5: exact round-to-rect endpoint (12.7)
+}
+
+function araiWall(P) {
+  // "Biradial" family -- the Arai A-290 architecture (TAD TH-4001 / Yuichi Arai / Joseph
+  // Crowe hi-fi lineage), NOT the Keele diffraction-slot patent (keele82Wall stays
+  // engine-side, UI-retired, smoke-guarded). Sectoral H fan + hypex-law vertical with
+  // FLAT-section accounting, mouth sized by LOADING (kr=1 area). No slot, no V wedge,
+  // no Keele width -- coverage narrows gradually by design (the hi-fi tradeoff).
+  // Anchors (araihorn.com A-290, plans public with Arai's consent): 95x40, T=0.7
+  // throughout (matches the TAD TD-4001 exit), fc 290, 2" throat, W656 x H230 x D405.
+  // Fan half-angle = 0.78 * covH/2: SINGLE-POINT calibration -- the A-290's drawn fan is
+  // ~74 deg included for its 95 deg coverage spec (diffraction at the modest mouth widens
+  // coverage past the walls). The law runs on AXIAL distance (plane-wave hypex, as in
+  // Arai's hand-drafted spreadsheet plans -- NOT wall-path length). With kr termination
+  // this reproduces the A-290: W 658 (656, +0.3%), interior H 170 (~170), L 415 (405,
+  // +2.5%). Fins omitted (Crowe's ES biradials are finless); expect softer wavefront
+  // coherence at covH > ~100.
+  var m = 4 * Math.PI * P.fc / C, rt = P.rt;
+  var Tf = makeTfun(P, m);
+  var S0 = Math.PI * rt * rt;
+  var Smouth = C * C / (4 * Math.PI * P.fc * P.fc);
+  var fanHalf = Math.max(12, Math.min(60, 0.78 * (P.covH || 95) / 2)) * Math.PI / 180;
+  var tanF = Math.tan(fanHalf);
+  var rhoTgt = Math.max(0.5, P.cornerR === undefined ? rt : P.cornerR);
+  var dz = 0.6, zTr = 12.7;
+  var wallH = [{ z: 0, r: rt }], wallV = [{ z: 0, r: rt }], rhoTrk = [rt], Ttrace = [{ s: 0, T: Tf(0) }];
+  var terminated = "max-iter", z = 0, s = 0, aPrev = rt, bPrev = rt;
+  var fan = false, aTr = rt, zC = zTr;
+  for (var i = 1; i < 60000; i++) {
+    z = i * dz;
+    var T = Tf(z);                                     // PETF reference on axial z, matching the law
+    var St = S0 * Math.pow(Math.cosh(m / 2 * z) + T * Math.sinh(m / 2 * z), 2);
+    var a, b, rhoT;
+    if (!fan) {
+      // 0.5 in round->rect transition under the area law (square section, corner = rt)
+      a = Math.sqrt((St + (4 - Math.PI) * rt * rt) / 4);
+      b = a; rhoT = rt;
+      if (z >= zTr) { fan = true; aTr = a; zC = z; }
+    } else {
+      a = aTr + (z - zC) * tanF;                       // sectoral fan, straight radial walls
+      var u = Math.min(1, St / Smouth), w2 = u * u * (3 - 2 * u);
+      rhoT = Math.min(rt + (rhoTgt - rt) * w2, 0.98 * Math.min(a, bPrev));
+      b = (St + (4 - Math.PI) * rhoT * rhoT) / (4 * a); // hypex law to the mouth, flat accounting
+      b = Math.max(b, rt * 0.35);
+      if (rhoT > 0.98 * b) {                            // clamp + one re-solve (exact area)
+        rhoT = 0.98 * Math.min(a, b);
+        b = Math.max((St + (4 - Math.PI) * rhoT * rhoT) / (4 * a), rt * 0.35);
+      }
+    }
+    s += Math.sqrt(dz * dz + Math.pow((a - aPrev + b - bPrev) / 2, 2));
+    wallH.push({ z: z, r: a }); wallV.push({ z: z, r: b }); rhoTrk.push(rhoT);
+    Ttrace.push({ s: s, T: T });                            // trace the APPLIED T (law on axial z)
+    if (St >= Smouth) { terminated = "mouth-kr1"; break; }  // LOADING criterion, not Keele width
+    aPrev = a; bPrev = b;
+  }
+  return { wall: wallH, wallV: wallV, rhoTrk: rhoTrk, sEnd: s, terminated: terminated, Ttrace: Ttrace, S0: S0, m: m };
+}
+
+function araiOptWall(P) {
+  // "ARAI OPTIMIZED" -- deep-research synthesis (2026-07-13), built from public
+  // sources (Arai's plans are public with his consent; community findings from the
+  // open A-290 CAD/BEM study and Arai's own design notes):
+  // (a) SIDEWALL = Yuichi's real construction, recovered from his book scans: the side
+  //     is NOT a straight fan but a smooth circular ARC through the throat- and mouth-
+  //     end points, laid out against the straight 95-deg coverage construction line --
+  //     "quite flat before curving out". Implemented as the unique circle through both
+  //     endpoints whose END tangent = covH/2 (coverage line tangent at the mouth). The
+  //     chord of that arc runs at ~0.78*covH/2 -- which EXPLAINS the legacy araiWall
+  //     fan calibration: 0.78 was the mid-length average of Yuichi's arc. The mouth
+  //     width keeps that anchor (chord slope 0.78*covH/2), so the shipped-A-290 W/L/H
+  //     validation carries over unchanged.
+  // (b) L comes straight from the hyp-ex law reaching the kr=1 mouth area (loading-
+  //     sized, Arai's philosophy; PETF-capable via Tf on axial z).
+  // (c) V solved from the area law with rect accounting (as araiWall). The arc sits
+  //     BELOW the old straight fan mid-length, so V widens there -- the sectoral V-neck
+  //     shrinks as a free consequence of the authentic side curve.
+  // (d) FIN LAYOUT (data only; the shell mesh stays finless, Crowe practice): the
+  //     BEM-tested improved arrangement from the public A-290 study -- 6 fins, gaps
+  //     7.5/15/15/15/7.5 deg (outer channels are half-cells against the walls, per
+  //     Kolbrek/Dunker), all radial from ONE origin (Arai: cells identical, symmetric,
+  //     same origin), ending at the base mouth plane; angles scale by covH/95.
+  //     Returned as finLayout {originZ, endZ, angles[]} for stats/CSV/builders.
+  // (e) MOUTH: community priority order is unanimous -- "improve the mouth first;
+  //     round as far as you can, JMLC/R-OSSE style". That lives downstream in the
+  //     exit-angle wrap (use flareR/flareWrap generously); nothing to do here.
+  var m = 4 * Math.PI * P.fc / C, rt = P.rt;
+  var Tf = makeTfun(P, m);
+  var S0 = Math.PI * rt * rt;
+  var Smouth = C * C / (4 * Math.PI * P.fc * P.fc);
+  var covH = Math.max(40, Math.min(140, P.covH || 95));
+  var thE = covH / 2 * Math.PI / 180;                    // arc end tangent = coverage half-angle
+  var thJ = Math.min(1.4, 1.109) * covH / 2 * Math.PI / 180; // wall/mouth-arc junction angle: V2 CAD widest vertex (321,221) sits at 52.7deg on the mouth arc = 1.109*covH/2
+  var s0w = 0.56 * covH / 2 * Math.PI / 180;                  // wall start tangent ("quite flat before curving out"); end tangent emerges ~82deg (the wing curl)
+  // FIVE-CELL RULE (Yuichi's book table, decoded 2026-07-13; reproduces every column ~2%):
+  // the horn is 5 identical hypex wedge cells fanned at covH/5 pitch from a throat array
+  // of radius Rarr = 1.16 * 2rt/covH_rad (his free-space margin; 34.4 vs book 34.5).
+  // Per cell: width b_cell = pitch*(Rarr + x) EXACTLY (19-deg wedges the whole run);
+  // area = hypex with a DRIVER head-start offset x0 = zTr + Rarr (the law runs from the
+  // driver through adapter + array; ratio-fit ~1%); height h = S/b -- the famous 50 mm
+  // constant height through the fin region is EMERGENT (hypex ~ linear b there), and
+  // the per-cell kr=1 area lands on the drawing's R=402 mouth arc (ours 399).
+  var pitch5 = (covH / 5) * Math.PI / 180;
+  var Rarr = 1.126 * 2 * rt / (covH * Math.PI / 180); // book 34.5 at the TRUE 2in throat (50.8; pi*rt^2 = 20.27 cm2 exactly, Crowe dwg 2322-01); 1.16 was calibrated against 49.2
+  var xOff = 25 + Rarr;                              // adapter + array head start
+  var Scell0 = 2 * rt * pitch5 * Rarr;
+  function law5(x) { var T5 = Tf(x); return Math.pow(Math.cosh(m / 2 * x) + T5 * Math.sinh(m / 2 * x), 2); }
+  function hHalf5(x) { if (x <= 0) return rt; return Math.max(rt, Scell0 * law5(x + xOff) / law5(xOff) / (pitch5 * (Rarr + x)) / 2); }
+  var rhoTgt = Math.max(0.5, P.cornerR === undefined ? rt : P.cornerR);
+  var dz = 0.6, zTr = P.adaptL !== undefined ? P.adaptL : 25;   // adapter length: book 25 (default); Crowe No.2322 smooth adapter = 65 (dwg 2322-01). Arai's book table: the
+                            // hyperbolic law itself, 20.27 cm2 at the 2in exit -> ~24.6 at 24 mm;
+                            // our law reproduces it to 0.7%). Was 12.7 (a Keele graft).
+  // pass 1: mouth = the PER-CELL kr arc (the book's R~402; Scell = Smouth/5 -- NOT the
+  // total-law kr, which overshoots the cell mouth and lets V run away) + adapter-end aTr
+  var L = zTr, aTr = rt;
+  for (var i0 = 1; i0 < 60000; i0++) {
+    var z0 = i0 * dz, T0v = Tf(z0);
+    var St0 = S0 * Math.pow(Math.cosh(m / 2 * z0) + T0v * Math.sinh(m / 2 * z0), 2);
+    if (z0 <= zTr) aTr = Math.sqrt((St0 + (4 - Math.PI) * rt * rt) / 4);
+    if (z0 > zTr && Scell0 * law5(z0 - zTr + xOff) / law5(xOff) >= Smouth / 5) { L = z0; break; }
+  }
+  // SIDEWALL v2 (from the V2 CAD exact vertices): a Yuichi arc from the adapter end
+  // P0=(zTr,aTr) to the wall/mouth-arc JUNCTION P1 -- the widest point of the plan --
+  // then CONSTANT width to the apex (the flat side-plate wings, book side view). The
+  // junction sits ON the per-cell kr mouth arc at thJ; start tangent s0w gives the
+  // flat-then-curling character (end tangent emerges ~82 deg = the wing curl).
+  var z0fan = zTr - Rarr, Rm5 = Rarr + (L - zTr);
+  var Zj = z0fan + Rm5 * Math.cos(thJ), Xw = Rm5 * Math.sin(thJ);
+  var dzc = Zj - zTr, dxc = Xw - aTr;
+  var nwz = -Math.sin(s0w), nwx = Math.cos(s0w);
+  var dotw = dzc * nwz + dxc * nwx;
+  var Rarc = dotw > 1e-9 ? (dzc * dzc + dxc * dxc) / (2 * dotw) : 0;
+  var Cz = zTr + Rarc * nwz, Cx = aTr + Rarc * nwx;   // center on the normal at P0
+  function aArc(zq) {
+    if (zq >= Zj) return Xw;                            // side-plate wings: constant to the apex
+    if (Rarc <= 0) return aTr + (zq - zTr) * (dxc / Math.max(1e-9, dzc));
+    var sn = Math.max(-1, Math.min(1, (zq - Cz) / Rarc));
+    return Cx - Rarc * Math.cos(Math.asin(sn));
+  }
+  var phi0 = s0w;
+  var W2 = Xw;                                          // widest half-width (the shipped-width anchor)
+  // fin layout: improved public arrangement, radial from the coverage-line origin
+  var zA = zTr - Rarr;                               // fan/fin common origin: the throat ARRAY
+  var finScale = covH / 95;
+  var finAngles = [-30, -22.5, -7.5, 7.5, 22.5, 30].map(function (g) { return g * finScale; });
+  // Fin span (both layouts, per the book + the study): blades run from the throat array
+  // (R0 = Rarr, leading edges at the throat plane) to the end of the flat-V region --
+  // fins end EXACTLY where the vertical starts opening (his fin length 192 vs our
+  // emergent flat span; self-scaling with fc). arai4 fins sit ON the cell boundaries.
+  var xFlat5 = 0; for (var xq5 = 5; xq5 < 2000; xq5 += 1) if (hHalf5(xq5 + 1) - hHalf5(xq5) > 0.15) { xFlat5 = xq5; break; }
+  var finAngles4 = [-3, -1, 1, 3].map(function (g) { return g * covH / 10; });
+  var finR0 = Rarr, finR1 = Rarr + xFlat5;
+  // per-fin ACTUAL blade spans through the throat-blend mapping (audit #9: endZ = L was a lie)
+  function bladeZ(Rq, thq) {
+    var tB9 = Math.min(1, (Rq - Rarr) / (0.9 * Rarr)); tB9 = tB9 * tB9 * (3 - 2 * tB9);
+    var Zf9 = (zTr - Rarr) + Rq * Math.cos(thq), Zp9 = zTr + (Rq - Rarr);
+    return Zp9 + (Zf9 - Zp9) * tB9;
+  }
+  function bladesOf(angles) {
+    return angles.map(function (ad) {
+      var thr = ad * Math.PI / 180;
+      return { angleDeg: ad, radialStart: finR0, radialEnd: finR1,
+               startZ: bladeZ(finR0, thr), endZ: bladeZ(finR1, thr) };
+    });
+  }
+  // pass 2: march the walls
+  var wallH = [{ z: 0, r: rt }], wallV = [{ z: 0, r: rt }], rhoTrk = [rt], Ttrace = [{ s: 0, T: Tf(0) }];
+  var terminated = "max-iter", z = 0, s = 0, aPrev = rt, bPrev = rt;
+  for (var i = 1; i < 60000; i++) {
+    z = i * dz;
+    var T = Tf(z);
+    var St = S0 * Math.pow(Math.cosh(m / 2 * z) + T * Math.sinh(m / 2 * z), 2);
+    var a, b, rhoT;
+    if (z < zTr) {
+      a = Math.sqrt((St + (4 - Math.PI) * rt * rt) / 4);           // round->square, no pinch (Arai)
+      b = a; rhoT = rt;
+    } else {
+      a = Math.max(aTr, aArc(z));
+      b = hHalf5(z - zTr);                            // V from the five-cell rule (book table)
+      var u = Math.min(1, St / Smouth), w2 = u * u * (3 - 2 * u);
+      rhoT = Math.min(rt + (rhoTgt - rt) * w2, 0.98 * Math.min(a, b));
+    }
+    s += Math.sqrt(dz * dz + Math.pow((a - aPrev + b - bPrev) / 2, 2));
+    wallH.push({ z: z, r: a }); wallV.push({ z: z, r: b }); rhoTrk.push(rhoT);
+    Ttrace.push({ s: s, T: (z <= zTr ? T : Tf(z - zTr + xOff)) }); // APPLIED T: adapter on z, body on the cell-law argument (z + Rarr)
+    if (z >= L) { terminated = "mouth-kr1"; break; }   // per-cell kr arc (book R~402)
+    aPrev = a; bPrev = b;
+  }
+  // entry 220 (Marwan: raising fc "gets messed up"): when the kr=1 mouth is
+  // already satisfied at the adapter's end, pass 1 breaks immediately, the fan
+  // freezes near zero length and the rim machinery inflates a degenerate mouth
+  // (measured 1.7 m "radius" at fc 10k). The construction needs the fan to at
+  // least span its own array offset -- below Rarr the sectoral architecture
+  // does not exist. Flagged, never silently exported (exportGate).
+  if (L - zTr < Rarr) terminated = "fan-degenerate";
+  return { wall: wallH, wallV: wallV, rhoTrk: rhoTrk, sEnd: s, terminated: terminated, Ttrace: Ttrace, S0: S0, m: m,
+           fan: { z0: zTr - Rarr, Rarr: Rarr, Rm: Rarr + (L - zTr), covHrad: covH * Math.PI / 180, zTr: zTr, rt: rt,
+                  hHalf: hHalf5, law: law5 },
+           criticalZ: [zTr, Zj],   // AUDIT #5: adapter end + wall/mouth-arc junction   // fan coordinates for the arc-mouth loft (V2 CAD: mouth IS the arc)
+           finLayout: { originZ: zA, endZ: L, angles: finAngles, mode: "opt6", R0: finR0, R1: finR1, blades: bladesOf(finAngles) },
+           finLayoutArai4: { originZ: zA, endZ: L, angles: finAngles4, mode: "arai4", R0: finR0, R1: finR1, blades: bladesOf(finAngles4) },
+           arc: { R: Rarc, startDeg: phi0 * 180 / Math.PI,
+                  junctionDeg: Math.asin(Math.max(-1, Math.min(1, Math.sin(phi0) + (Zj - zTr) / Math.max(1e-9, Rarc)))) * 180 / Math.PI,
+                  junctionZ: Zj, wingHalfWidth: Xw,
+                  intendedCovDeg: covH } };  // audit #7: report tangents FROM the geometry; covH/2 is the coverage input, not the arc end angle
+}
+
+function keele82Wall(P) {
+  // US 4,308,932 (Keele/JBL, 1982): each sidewall pair follows the power series
+  //   y = a + b*x + c*x^n,   a = G/2,  b = tan(A/2),  c = (W/2 - b*L - a)/L^n
+  // with A = 0.9*B (throat included angle = 90% of beamwidth), mouth width
+  // W = K/(A*F), K = 25,000 m*deg*Hz, straight-wall width W' = W/1.5 and
+  // L = (W'/2 - a)/tan(A/2).  The narrow-coverage pair governs the length; the
+  // wide pair converges to a slot ("gap") joined to the throat by a connecting
+  // section whose AREA grows exponentially throat -> gap (patent claim 11).
+  // Slot half-width calibrated to the patent example (gap 18 mm / throat 48.8 mm).
+  var G = 2 * P.rt, K82 = 2.5e7;
+  var Bh = Math.min(150, Math.max(20, P.covH || 90));
+  var Bv = Math.min(120, Math.max(10, P.covV || 40));
+  var Fh = P.f0 || 800;
+  var Wh = K82 / (0.9 * Bh * Fh);
+  // Patent exemplary embodiment (full table, fetched 2026-07-13): SQUARE mouth -- W_v = W_h
+  // (780x780 for A 80x36) -- when no independent vertical intercept is given. The old
+  // eq.(4) auto-f0V was a 1975-paper graft: it shrinks W_v (1736 -> 780 in the example is
+  // NOT what the patent does) and drags the gap back onto the throat. Rectangular "other
+  // embodiments" size each dimension by its own low-frequency limit via manual f0V.
+  var Wv = P.f0V > 0 ? K82 / (0.9 * Bv * P.f0V) : Wh;
+  function planeGeom(B, W) {
+    var A = 0.9 * B, half = (A / 2) * Math.PI / 180;
+    // n calibrated through the example's own points -- (B=40, n=4.0), (B~=88.9, n=5.5);
+    // the old fit misread the table's INCLUDED angles (36/80) as beamwidths. Claim 14: 2..8.
+    return { B: B, A: A, tb: Math.tan(half), W: W, Wp: W / 1.5,
+             n: Math.min(8, Math.max(2, 4 + (B - 40) * 1.5 / 48.9)) };
+  }
+  var gh = planeGeom(Bh, Wh), gv = planeGeom(Bv, Wv);
+  // The WIDE-coverage pair converges to the diffraction slot ("Because the flare angle for
+  // the horizontal sidewalls is greater... a gap is formed at the back of the horizontal
+  // sidewalls"); the narrow pair runs from the throat and sets the horn length.
+  var slot = Bh >= Bv ? gh : gv, gov = Bh >= Bv ? gv : gh;
+  var gHalf = Math.max(1.5, 0.185 * G);                  // example: 18.0 gap / 48.8 throat (ours 18.06)
+  var Ls = Math.max(5, (slot.Wp / 2 - gHalf) / slot.tb); // gap->mouth: (260-9)/tan40 = 299.1 = the table's value EXACTLY
+  var xgMin = Math.max(G / 2, (G / 2 - gHalf) / Math.tan(35 * Math.PI / 180));
+  // narrow pair's straight-wall relation from the THROAT sets L (example: 726 vs the
+  // table's 815, -11% -- the patent's ##EQU1## D-term is not machine-readable in any
+  // accessible source; flag if pressed). Gap position xg = L - Ls lands the connector at
+  // patent proportions (example: 427 vs 516, i.e. a LONG gentle connecting section --
+  // never the near-throat pinch the old xg clamp produced).
+  var Lgov = Math.max(10, (gov.Wp / 2 - G / 2) / gov.tb);
+  var L = Math.max(Lgov, Ls + xgMin);
+  var xg = L - Ls;
+  var cg = (gov.W / 2 - gov.tb * L - G / 2) / Math.pow(L, gov.n);
+  function yGov(x) { return G / 2 + gov.tb * x + cg * Math.pow(x, gov.n); }
+  var cs = (slot.W / 2 - slot.tb * Ls - gHalf) / Math.pow(Ls, slot.n);
+  var rhoTgt = Math.max(0.5, P.cornerR === undefined ? P.rt : P.cornerR);
+  var S0 = Math.PI * P.rt * P.rt;
+  // connecting-section area rate: the connector must START as the exact round throat
+  // (rho = ys = G/2 at x=0) and LAND exactly on the slot section at xg.  No S0 floor:
+  // when the slot pinches below the throat area the connector area gently CONTRACTS --
+  // that constriction IS the diffraction slot (the old floor forced growth and left a
+  // ~5 mm wall step at the gap; it also once shipped a rounded-RECT throat).
+  function rhoSched82(x2) { var u9 = x2 / L, w9 = u9 * u9 * (3 - 2 * u9); return P.rt + (rhoTgt - P.rt) * w9; }
+  var rho_g = Math.min(rhoSched82(xg), 0.98 * gHalf);
+  var Sgap = Math.max(0.05 * S0, 4 * yGov(xg) * gHalf - (4 - Math.PI) * rho_g * rho_g);
+  var q82 = Math.log(Sgap / S0) / Math.max(1e-6, xg);
+  var wallG = [], wallS = [], rhoTrk = [], N = 420, s = 0, zPrev = 0, gPrev = G / 2, sPrev = G / 2;
+  for (var i = 0; i < N; i++) {
+    var x = L * i / (N - 1);
+    var yg = yGov(x), ys;
+    var u = i / (N - 1), w2 = u * u * (3 - 2 * u);
+    var rho = P.rt + (rhoTgt - P.rt) * w2;
+    if (x <= xg) {
+      var uc = xg > 1e-9 ? x / xg : 1, wc = uc * uc * (3 - 2 * uc);
+      rho = G / 2 + (rho_g - G / 2) * wc;             // round throat -> slot corner radius
+      ys = Math.max(gHalf, (S0 * Math.exp(q82 * x) + (4 - Math.PI) * rho * rho) / (4 * yg));
+      ys = Math.min(ys, G / 2 + 0.02 * x);            // monotone-safe: no bulge before the slot
+      rho = Math.min(rho, Math.min(yg, ys));          // at x=0 this is rho = ys = G/2 exactly (round)
+    } else {
+      var xp = x - xg;
+      ys = gHalf + slot.tb * xp + cs * Math.pow(xp, slot.n);
+      rho = Math.min(rho, 0.98 * Math.min(yg, ys));
+    }
+    s += Math.sqrt((x - zPrev) * (x - zPrev) + Math.pow(((yg - gPrev) + (ys - sPrev)) / 2, 2));
+    wallG.push({ z: x, r: yg }); wallS.push({ z: x, r: ys }); rhoTrk.push(rho);
+    zPrev = x; gPrev = yg; sPrev = ys;
+  }
+  var wallH = gov === gh ? wallG : wallS, wallV = gov === gh ? wallS : wallG;
+  return { wall: wallH, wallV: wallV, rhoTrk: rhoTrk, sEnd: s, terminated: "keele82-mouth",
+           Ttrace: [], S0: S0, xGap: xg, gapW: 2 * gHalf, q: q82,
+           WH: (gov === gh ? gov : slot).W, WV: (gov === gh ? slot : gov).W };
+}
+
+function planeProfilesWN(horn, nPts, flareRh, flareRv, flareExit, rho, shape2, rhoTarget) {
+  // rhoTarget (entry 228, optional -- ONLY the osc per-axis caller passes it):
+  // user-dialed mouth corner radius for rrect sections, paced by the entry-204
+  // relative ramp from the local fully-round corner (min of the per-axis radii,
+  // = exact circle at the round throat) toward the target. Callers that omit it
+  // (wn/cd/biradial) keep the historic WN convention rho = const -- their
+  // geometry is BIT-IDENTICAL (baseline-verified).
+  var Hp = dec(horn.wall, nPts), Vp = dec(horn.wallV, nPts);
+  var rhoArr = horn.rhoTrk ? dec(horn.rhoTrk, nPts) : null;
+  // AUDIT #5: insert EXACT critical stations into all three parallel arrays together
+  // (splicing only H/V would break the rho index alignment)
+  if (horn.criticalZ && horn.criticalZ.length) {
+    for (var c5 = 0; c5 < horn.criticalZ.length; c5++) {
+      var zc5 = horn.criticalZ[c5];
+      if (!isFinite(zc5) || zc5 <= Hp[0].z || zc5 >= Hp[Hp.length - 1].z) continue;
+      var hit5 = false;
+      for (var q5 = 0; q5 < Hp.length; q5++) if (Math.abs(Hp[q5].z - zc5) < 1e-6) { hit5 = true; break; }
+      if (hit5) continue;
+      for (var q6 = 1; q6 < Hp.length; q6++) if (Hp[q6].z > zc5) {
+        var f5 = (zc5 - Hp[q6 - 1].z) / (Hp[q6].z - Hp[q6 - 1].z || 1e-12);
+        Hp.splice(q6, 0, { z: zc5, r: Hp[q6 - 1].r + f5 * (Hp[q6].r - Hp[q6 - 1].r) });
+        Vp.splice(q6, 0, { z: zc5, r: Vp[q6 - 1].r + f5 * (Vp[q6].r - Vp[q6 - 1].r) });
+        if (rhoArr) rhoArr.splice(q6, 0, typeof rhoArr[q6 - 1] === "number" ? rhoArr[q6 - 1] + f5 * (rhoArr[q6] - rhoArr[q6 - 1]) : rhoArr[q6 - 1]);
+        break;
+      }
+    }
+  }
+  var ra = rhoArr ? rhoArr.slice() : [];
+  if (!rhoArr && shape2 === "rrect" && typeof rhoTarget === "number" && isFinite(rhoTarget)) {
+    // entry-204 pacing (same law as planeProfiles): small corner targets finish
+    // the rho ramp by u = 0.35 (round-to-sharp in the first third, then sharp
+    // edges); large targets keep the full smoothstep. Start value per station is
+    // the LOCAL fully-round corner min(a,b) so the throat stays an exact circle.
+    var cumR = [0];
+    for (var cri = 1; cri < Hp.length; cri++)
+      cumR.push(cumR[cri - 1] + Math.hypot(Hp[cri].z - Hp[cri - 1].z, Hp[cri].r - Hp[cri - 1].r));
+    var totR = cumR[cumR.length - 1] || 1;
+    var tgtR = Math.max(0, rhoTarget);
+    var sharpR = Math.max(0, Math.min(1, 1 - tgtR / 40));
+    var uTR = 1 + (0.35 - 1) * sharpR;
+    for (var k3 = 0; k3 < Hp.length; k3++) {
+      var uR = Math.min(1, (cumR[k3] / totR) / uTR), wRR = uR * uR * (3 - 2 * uR);
+      var rnd3 = Math.min(Hp[k3].r, Vp[k3].r);
+      ra.push(Math.min(0.999 * rnd3, rnd3 + (tgtR - rnd3) * wRR));
+    }
+  } else if (!rhoArr) for (var k2 = 0; k2 < Hp.length; k2++) ra.push(rho);
+  var FS = 14;
+  var seNArr2 = null;
+  if (shape2 && shape2.indexOf("sellipse") === 0) {
+    var nM2 = parseFloat(shape2.split(":")[1]) || 2.5;
+    var cum2 = [0];
+    for (var c2i = 1; c2i < Hp.length; c2i++)
+      cum2.push(cum2[c2i - 1] + Math.hypot(Hp[c2i].z - Hp[c2i - 1].z, Hp[c2i].r - Hp[c2i - 1].r));
+    var tot2 = cum2[cum2.length - 1] || 1;
+    seNArr2 = [];
+    for (c2i = 0; c2i < Hp.length; c2i++) {
+      var u2 = cum2[c2i] / tot2, w2 = u2 * u2 * (3 - 2 * u2);
+      seNArr2.push(2 + (nM2 - 2) * w2);
+    }
+  }
+  if (horn.areaLawPiAB && shape2 && shape2 !== "ellipse") {
+    // section shapes other than the ellipse change the station area for the same axes;
+    // rescale axes (and corner radius) per station so area stays pi*a*b -- the published
+    // correction: "find another set of shorter main axes while preserving the stretch factor".
+    for (var q9 = 0; q9 < Hp.length; q9++) {
+      var a9 = Hp[q9].r, b9 = Vp[q9].r, r9 = ra ? ra[Math.min(q9, ra.length - 1)] : rho;
+      var A9 = sectionArea(seNArr2 ? "sellipse:" + seNArr2[q9] : shape2, a9, b9, r9);
+      if (A9 > 1e-9) {
+        var k9 = Math.sqrt(Math.PI * a9 * b9 / A9);
+        Hp[q9] = { z: Hp[q9].z, r: a9 * k9 };
+        Vp[q9] = { z: Vp[q9].z, r: b9 * k9 };
+        if (ra && q9 < ra.length) ra[q9] = r9 * k9;
+      }
+    }
+  }
+  var swH = flareSweepFor(Hp, flareExit);
+  var swV = flareSweepFor(Vp, flareExit);
+  var fh = flareArc(Hp, flareRh, swH, FS);
+  var fv = flareArc(Vp, flareRv, swV, FS);
+  var nf = Math.max(fh.length, fv.length);
+  while (fh.length < nf) fh.push(fh.length ? fh[fh.length - 1] : Hp[Hp.length - 1]);
+  while (fv.length < nf) fv.push(fv.length ? fv[fv.length - 1] : Vp[Vp.length - 1]);
+  while (ra.length < Hp.length + fh.length) ra.push(ra[ra.length - 1]);
+  if (seNArr2) while (seNArr2.length < Hp.length + fh.length) seNArr2.push(seNArr2[seNArr2.length - 1]);
+  return { H: Hp.concat(fh), V: Vp.concat(fv), baseStations: Hp.length, shape: shape2 || "rrect", rho: rho, rhoArr: ra,
+           seNArr: seNArr2,
+           flareToPlane: true, flareExit: (flareExit || 90) * Math.PI / 180, flareR: flareRh };
+}
+
+
+// ============ WILLIAM NEILE-INSPIRED BIRADIAL ============
+// Equal-path biradial construction: calibrated reference templates interpolated by
+// dimensionless throat ratio, numerically solved equal-length horizontal trajectory
+// family, round-throat corner quadrants. Named for William Neile (1657), the first
+// rectification of the semicubical parabola. Finless is the reference form.
+function wnInterp(xs, ys, x) {
+  if (x <= xs[0]) return ys[0];
+  if (x >= xs[xs.length - 1]) return ys[ys.length - 1];
+  var lo = 0, hi = xs.length - 1;
+  while (hi - lo > 1) { var mid = (lo + hi) >> 1; if (xs[mid] <= x) lo = mid; else hi = mid; }
+  var f = (x - xs[lo]) / Math.max(1e-15, xs[hi] - xs[lo]);
+  return ys[lo] + (ys[hi] - ys[lo]) * f;
+}
+function wnRRArea(a, b, r) { r = Math.max(0, Math.min(r, a, b)); return 4 * a * b - (4 - Math.PI) * r * r; }
+function wnYMax(x, a, b, r) {
+  r = Math.max(1e-12, Math.min(r, a, b));
+  var ax = Math.abs(x);
+  if (ax <= a - r) return b;
+  var dx = ax - (a - r);
+  return b - r + Math.sqrt(Math.max(0, r * r - dx * dx));
+}
+function wnProfile(P) {
+  // FULLY PARAMETRIC v2 (2026-07-13, user report: "no templates -- dynamic throat and
+  // loading"). Fourteen dimensionless coefficients (mu-linear laws, calibrated once
+  // against two verified reference geometries; those references now live ONLY in the
+  // test suite). Model per plane = loading law + C1 cubic-Hermite terminal flare to
+  // exact dimensionless mouth laws:
+  //   H: a(z) = rt + tan(th0)*z + K*z^1.5   (cone + TRUE Neile semicubical term)
+  //   V: hypex construction-wavefront area law S0[cosh(ms/2)+T sinh(ms/2)]^2 -- the
+  //      loading is computed from the REQUESTED fc and T, not scaled from a picture.
+  // u = s/L (equal-path coordinate); uL/uC are the real loading/control zone ends.
+  var MU0 = 0.0310116;
+  function law(c0, c1, mu9) { return c0 + c1 * (mu9 - MU0); }
+  var n = P.stations || 160, i;
+  var lambda = 344000 / P.fc, mu = 2 * P.rt / lambda;
+  var extrap = mu < MU0 - 1e-7 || mu > 0.0443023256 + 1e-7;
+  // entry 234: the mu-linear zm law crosses ZERO at mu ~ 0.215 (negative mouth depth
+  // -> NaN rings). Engine-level floor so no caller can get a non-finite family;
+  // the app clamps the throat dial at the same 0.20 (validateInputs, synced + told).
+  var muClamped = mu > 0.2;
+  if (muClamped) mu = 0.2;
+  var th0 = law(0.066385, -0.7663, mu);
+  var Kl  = law(0.851509, 16.5414, mu);
+  var thm = law(1.336354, 2.8880, mu);
+  var phm = law(0.638790, -1.8380, mu);   // quintic-V refit (v3)
+  var zm  = law(0.320494, -1.7388, mu) * lambda;
+  var am  = law(0.262344, 2.5099, mu) * lambda;
+  var bm  = law(0.117294, 0.5575, mu) * lambda;
+  var K = Kl / Math.sqrt(lambda), t0t = Math.tan(th0);
+  var uL = P.wnUL == null ? 0.50 : P.wnUL, uC = P.wnUC == null ? 0.68 : P.wnUC;
+  if (uC <= uL) uC = uL + 0.08;
+  function herm(x0, x1, y0, y1, m0, m1, x) {
+    var h = x1 - x0, tt = (x - x0) / h, t2 = tt * tt, t3 = t2 * tt;
+    return y0 * (2 * t3 - 3 * t2 + 1) + m0 * h * (t3 - 2 * t2 + tt) + y1 * (-2 * t3 + 3 * t2) + m1 * h * (t3 - t2);
+  }
+  // two-pass: flare split at s/L = uC (L depends on the flare, converges immediately)
+  var NF9 = 800, zF = uC * zm, aOf, L = 0, sFine, zFine, aFine;
+  var mkNatural9 = function (zFq) {
+    var aFq = P.rt + t0t * zFq + K * Math.pow(zFq, 1.5);
+    var sFq = t0t + 1.5 * K * Math.sqrt(Math.max(1e-9, zFq));
+    return function (z9) {
+      if (z9 <= zFq) return P.rt + t0t * z9 + K * Math.pow(Math.max(0, z9), 1.5);
+      return herm(zFq, zm, aFq, am, sFq, Math.tan(thm), z9);
+    };
+  };
+  // entry 156 (user report: "lets try to recreate his constant H character"): optional
+  // H COVERAGE LOCK -- a third, CONICAL phase between the Neile loading zone and
+  // the terminal mouth flare. The Neile law runs until its slope reaches
+  // tan(covH/2), then the wall goes STRAIGHT at that angle (the textbook
+  // constant-directivity mechanism -- a conical asymptote, cf. Geddes OS), then
+  // the unchanged Hermite terminal flare to the family's exact dimensionless
+  // mouth laws. wnCovH = 0 bypasses everything (bit-identical natural law).
+  // The V wall adapts automatically: the hypex area law solves b from the
+  // held a, and the equal-path family consumes the new outer -- OUR OWN
+  // construction extended, nothing imported.
+  var covHEff9 = 0;
+  var thCD9 = P.wnCovH > 0 ? (P.wnCovH / 2) * Math.PI / 180 : 0;
+  var tCD9 = Math.tan(thCD9);
+  for (var pass = 0; pass < 2; pass++) {
+    if (thCD9 > 0 && tCD9 > t0t) {
+      // entry 157 (user report: "the H-coverage doesnt go all the way to the end...
+      // the loading zone feels a bit weird how it changes"): the first
+      // construction had a C1 kink at the Neile->cone junction (curvature
+      // snapped to zero) and a cubic-Hermite S-wiggle at the mouth. Rebuilt:
+      // (a) SLOPE-SPACE SMOOTH-MIN -- s(z) = softmin(neile'(z), tan(covH/2))
+      //     integrated on the fine grid: curvature-continuous everywhere, the
+      //     loading eases into the cone with no corner;
+      // (b) TANGENT CIRCULAR FILLET to the mouth -- the unique circle through
+      //     (zm, am) with the mouth tangent thm, tangent to the cone line:
+      //     monotone by construction (no wiggle) and the straight wall runs
+      //     as close to the mouth as a smooth join permits.
+      // achievability clamp: the Neile must actually reach the lock slope with
+      // room for the smoothing + fillet -- otherwise the cone never forms and
+      // the fillet junction kinks (caught at lock 110 / fc 300). The effective
+      // lock is capped at the slope the loading law attains by 0.55 zm.
+      var tMax9 = t0t + 1.5 * K * Math.sqrt(0.66 * zm);
+      if (tCD9 > tMax9) tCD9 = tMax9;
+      covHEff9 = 2 * Math.atan(tCD9) * 180 / Math.PI;   // entry 163: honest UI for the achievability clamp
+      // entry 159c: locks also have a MINIMUM -- a shallow horn with a tall
+      // mouth (fc 600: zm 126, am 233) cannot host a 45-deg cone at all (the
+      // fillet tangency lands at negative z). buildLocked(t) returns null when
+      // infeasible; the requested lock is tried first, then bisected UP to the
+      // smallest feasible angle. Symmetric with the tMax clamp above.
+      var buildLocked9 = function (tCD9) {
+      var zC9 = Math.min(0.7 * zm, Math.pow((tCD9 - t0t) / (1.5 * K), 2));
+      // entry 159: the smoothing width is sized in Z-SPAN, not slope-span --
+      // for deep-zC locks the Neile slope changes slowly, so a fixed slope
+      // width stretched the transition across ~30% of the horn and the fillet
+      // tangency landed INSIDE it (6.6-deg step at the arc junction, fc250/
+      // fc500 lock 60). Target: transition completes within ~8% of depth.
+      var rate9 = 0.75 * K / Math.sqrt(Math.max(1e-6, zC9));
+      var wSm9 = Math.max(1e-6, Math.min(0.10 * (tCD9 - t0t), 0.012 * zm * rate9));
+      var NG9 = 1200, gz9 = [], ga9 = [], acc9 = P.rt, prevS9 = Math.min(t0t, tCD9);
+      var cInt9 = 0, prevD9 = prevS9 - tCD9;   // entry 159: EXACT cone-line intercept
+      gz9.push(0); ga9.push(acc9);
+      for (var gi9 = 1; gi9 <= NG9; gi9++) {
+        var zg9 = zm * gi9 / NG9;
+        var nS9 = t0t + 1.5 * K * Math.sqrt(zg9);
+        var lo9 = Math.min(nS9, tCD9), hi9 = Math.max(nS9, tCD9);
+        var sm9 = lo9 - wSm9 * Math.log(1 + Math.exp(-(hi9 - lo9) / wSm9));
+        acc9 += 0.5 * (prevS9 + sm9) * (zm / NG9);
+        cInt9 += 0.5 * (prevD9 + (sm9 - tCD9)) * (zm / NG9);
+        prevS9 = sm9; prevD9 = sm9 - tCD9;
+        gz9.push(zg9); ga9.push(acc9);
+      }
+      // the cone-line intercept, measured just past the smoothing (entry 159:
+      // was max(0.35 zm, ...) -- for LOW locks the fillet tangency legitimately
+      // lands early (a shallow cone must leave via a big arc to reach the steep
+      // mouth) and the old guard zB > iL rejected it, engaging the Hermite
+      // fallback whose curvature spike read as a 13-deg corner at 0.82 zm)
+      // entry 159: the intercept is EXACT -- c0 = rt + integral of
+      // (smin(neile', tCD) - tCD) dz, which converges once the smoothing
+      // completes and needs NO measuring-point heuristic (two prior heuristics
+      // -- 1.6 zC and slope-rate convergence -- each left a lock band where
+      // the fillet tangency landed on the measuring point and the fallback
+      // engaged with its visible corner).
+      var c09 = P.rt + cInt9;
+      // fillet: R = dist(M above line) / (sec(thc) - cos(thm - thc))*cos(thc)... closed form:
+      var secC9 = Math.sqrt(1 + tCD9 * tCD9);
+      var num9 = am - tCD9 * zm - c09;
+      var den9 = secC9 - Math.cos(thm) - tCD9 * Math.sin(thm);
+      var ok9 = num9 > 0.005 * am && den9 > 1e-9;
+      var R9 = ok9 ? num9 / den9 : 0;
+      var cz9 = zm - R9 * Math.sin(thm), ca9 = am + R9 * Math.cos(thm);
+      var thc9 = Math.atan(tCD9);
+      var zB9 = cz9 + R9 * Math.sin(thc9);
+      if (!ok9 || zB9 <= zC9 + 0.06 * zm || zB9 >= zm - 1e-9 || R9 > 50 * zm) return null;
+      return (function (gzq, gaq, zBq, czq, caq, Rq) {
+        return function (z9) {
+          if (z9 >= zBq) {
+            var dz9 = z9 - czq, s29 = Rq * Rq - dz9 * dz9;
+            return caq - Math.sqrt(Math.max(0, s29));
+          }
+          var fi9 = Math.max(0, Math.min(gzq.length - 2, Math.floor(z9 / zm * NG9)));
+          var ft9 = (z9 - gzq[fi9]) / (gzq[fi9 + 1] - gzq[fi9] || 1e-12);
+          return gaq[fi9] + ft9 * (gaq[fi9 + 1] - gaq[fi9]);
+        };
+      })(gz9, ga9, zB9, cz9, ca9, R9);
+      };   // end buildLocked9
+      aOf = buildLocked9(tCD9);
+      if (!aOf) {
+        // bisect UP to the smallest feasible lock; the chord to the mouth is a
+        // guaranteed-feasible ceiling in practice
+        var loT9 = tCD9, hiT9 = Math.max(tCD9 * 1.05, 1.4 * (am - P.rt) / zm), okHi9 = buildLocked9(hiT9);
+        for (var bs9 = 0; bs9 < 24 && okHi9; bs9++) {
+          var midT9 = 0.5 * (loT9 + hiT9);
+          var try9 = buildLocked9(midT9);
+          if (try9) { hiT9 = midT9; okHi9 = try9; } else loT9 = midT9;
+        }
+        aOf = okHi9 || null;
+      }
+      if (!aOf) {
+        // entry 159d: NO lock is geometrically feasible (mouth-dominated horn:
+        // even the steepest reachable cone lies below the chord to the mouth,
+        // e.g. wn at fc 600) -- the honest wall is the NATURAL law, not a
+        // corner-prone forced blend. The chart shows what the horn does.
+        aOf = mkNatural9(zF);
+      }
+    } else {
+      aOf = mkNatural9(zF);
+    }
+    zFine = []; aFine = []; sFine = [0];
+    for (i = 0; i <= NF9; i++) { var z9 = zm * i / NF9; zFine.push(z9); aFine.push(aOf(z9)); }
+    for (i = 1; i <= NF9; i++) sFine.push(sFine[i - 1] + Math.hypot(zFine[i] - zFine[i - 1], aFine[i] - aFine[i - 1]));
+    L = sFine[NF9];
+    // refine the split: z where s = uC*L
+    var sT = uC * L;
+    for (i = 1; i <= NF9; i++) if (sFine[i] >= sT) { zF = zFine[i - 1] + (zFine[i] - zFine[i - 1]) * (sT - sFine[i - 1]) / (sFine[i] - sFine[i - 1] || 1e-12); break; }
+  }
+  // stations uniform in s (u = s/L)
+  var u = [], sArr = [], z = [], a = [];
+  for (i = 0; i < n; i++) {
+    var uS = i / (n - 1), sT2 = uS * L, lo = 0, hi = NF9;
+    while (hi - lo > 1) { var mid = (lo + hi) >> 1; if (sFine[mid] <= sT2) lo = mid; else hi = mid; }
+    var f9 = (sT2 - sFine[lo]) / (sFine[hi] - sFine[lo] || 1e-12);
+    var zi = zFine[lo] + (zFine[hi] - zFine[lo]) * f9;
+    u.push(uS); sArr.push(sT2); z.push(zi); a.push(aOf(zi));
+  }
+  // vertical: hypex loading -> smoothstep(uL..uC) -> Hermite terminal to exact bm
+  var T = P.T0 == null ? 0.8 : P.T0, m9 = 4 * Math.PI * P.fc / 344000, S0 = Math.PI * P.rt * P.rt;
+  var bh = [], rcP = [];
+  var NFv = P.wnFins || 0, tFv = P.wnFinT || 1.0;
+  for (i = 0; i < n; i++) {
+    var g9 = Math.cosh(m9 * sArr[i] / 2) + T * Math.sinh(m9 * sArr[i] / 2);
+    var Ah = S0 * g9 * g9;
+    var rc0 = Math.min(P.rt, a[i]);
+    var bH = Math.max((Ah + (4 - Math.PI) * rc0 * rc0) / Math.max(4 * a[i], 1e-12), rc0);
+    // FIN-BLOCKAGE COMPENSATION (adopted from the prototype review, 2026-07-13): the
+    // hypex law targets the OPEN area, so the fins' blocked area is added back before
+    // solving b -- the loading stays honest with fins installed. Blockage ~ NF*t*2b
+    // (fins near mid-width where yMax ~ b); one fixed-point pass suffices.
+    for (var fp = 0; fp < 2; fp++) {
+      var blocked = NFv > 0 ? NFv * tFv * 2 * bH : 0;
+      var rc1 = Math.min(rc0, bH);
+      bH = Math.max((Ah + blocked + (4 - Math.PI) * rc1 * rc1) / Math.max(4 * a[i], 1e-12), rc1);
+    }
+    bh.push(bH); rcP.push(Math.min(rc0, bH));
+  }
+  // VERTICAL v3 (2026-07-13, math-directive audit): the old uL..uC blend evaluated the
+  // terminal Hermite BACKWARD outside its domain -- a cubic extrapolation that dived
+  // to b = -20233 mm at 55mm/900Hz/T1.2 with a wide control window (directive claim
+  // 14.1, confirmed). Now ONE C2 quintic Hermite spans uL -> mouth: position, slope,
+  // AND curvature matched to the hypex law at uL; ends at (bm, tan(phm), 0). No
+  // extrapolation is possible and the reference fit IMPROVED (V RMS 1.12%/0.74% vs
+  // 1.69%/2.92%).
+  var iL2 = Math.round(uL * (n - 1));
+  var sL2 = sArr[iL2], bL2 = bh[iL2];
+  var i3 = Math.max(0, iL2 - 3), i6 = Math.max(0, iL2 - 6);
+  var mV = (bh[iL2] - bh[i3]) / (sArr[iL2] - sArr[i3] || 1e-12);
+  var cV = (bh[iL2] - 2 * bh[i3] + bh[i6]) / Math.pow(sArr[iL2] - sArr[i3] || 1e-12, 2);
+  function quintV(x) {
+    var h9 = L - sL2, tt = Math.max(0, (x - sL2) / h9);
+    var t2 = tt * tt, t3 = t2 * tt, t4 = t3 * tt, t5 = t4 * tt;
+    var H0 = 1 - 10 * t3 + 15 * t4 - 6 * t5, H1 = tt - 6 * t3 + 8 * t4 - 3 * t5;
+    var H2 = 0.5 * t2 - 1.5 * t3 + 1.5 * t4 - 0.5 * t5, H3 = 0.5 * t3 - t4 + 0.5 * t5;
+    var H4 = -4 * t3 + 7 * t4 - 3 * t5, H5 = 10 * t3 - 15 * t4 + 6 * t5;
+    return bL2 * H0 + mV * h9 * H1 + cV * h9 * h9 * H2 + 0 * h9 * h9 * H3 + Math.tan(phm) * h9 * H4 + bm * H5;
+  }
+  var b = [], rc = [], tgtArea = [], actArea = [];
+  for (i = 0; i < n; i++) b.push(u[i] <= uL ? bh[i] : quintV(sArr[i]));
+  // entry 161 (the V-plane gap vs the reference polars: consistently ~20 deg
+  // too narrow): OPTIONAL V COVERAGE LOCK, the entry-156/159 architecture on
+  // the vertical wall. The hypex LOADING zone (u <= uL) is untouched --
+  // loading is the V law's purpose there; beyond it the slope is smooth-min
+  // capped at tan(covV/2) and a tangent circular fillet lands on the exact
+  // family mouth (bm, phm). Feasibility floor: the lock cannot be narrower
+  // than the loading-end slope (C1 at the handoff); infeasible locks bisect
+  // up; a mouth-dominated geometry falls back to the natural quintic.
+  var bRelOut9 = 0, sRelOut9 = 0;
+  if (P.wnCovV > 0) {
+    // ABSCISSA: the V wall lives in s (the straight center path -- wallV.z is
+    // prof.s), NOT the outer-H z trajectory; the first draft integrated over
+    // zOuter and silently no-op'd (chord misjudged, every fillet infeasible).
+    var zEnd9 = sArr[n - 1], zLv = sL2, bLv = bL2, mVz = mV;
+    var tvReq = Math.tan((P.wnCovV / 2) * Math.PI / 180);
+    function bNat9(sq) { return sq <= sL2 ? bL2 + mV * (sq - sL2) : quintV(sq); }
+    var buildLockedV9 = function (tv9) {
+      var widen9 = widenMode9;   // entry 162: mode decided by the dial semantics
+      if (!widen9 && tv9 >= Math.tan(phm) * 0.95) return null;
+      var NGv = 800, gzV = [], gbV = [], accV = bLv, prevSV = Math.min(mVz, tv9), cIntV = 0, prevDV = prevSV - tv9;
+      var wV = Math.max(1e-6, Math.min(0.10 * Math.abs(tv9 - mVz) + 1e-4, 0.012 * (zEnd9 - zLv) * 0.5));
+      gzV.push(zLv); gbV.push(accV);
+      for (var gv = 1; gv <= NGv; gv++) {
+        var zq9 = zLv + (zEnd9 - zLv) * gv / NGv;
+        var h9v = Math.max(1e-4, (zEnd9 - zLv) / NGv);
+        var nSv = (bNat9(Math.min(zEnd9, zq9 + h9v / 2)) - bNat9(Math.max(zLv, zq9 - h9v / 2))) / h9v;
+        var loV = Math.min(nSv, tv9), hiV = Math.max(nSv, tv9);
+        var smV = widen9
+          ? hiV + wV * Math.log(1 + Math.exp(-(hiV - loV) / wV))   // smooth-MAX: open faster
+          : loV - wV * Math.log(1 + Math.exp(-(hiV - loV) / wV));  // smooth-MIN: cap
+
+        accV += 0.5 * (prevSV + smV) * ((zEnd9 - zLv) / NGv);
+        cIntV += 0.5 * (prevDV + (smV - tv9)) * ((zEnd9 - zLv) / NGv);
+        prevSV = smV; prevDV = smV - tv9;
+        gzV.push(zq9); gbV.push(accV);
+      }
+      function gbAt9(zq) {
+        var fiV = Math.max(0, Math.min(NGv - 1, Math.floor((zq - zLv) / (zEnd9 - zLv) * NGv)));
+        var ftV = (zq - gzV[fiV]) / (gzV[fiV + 1] - gzV[fiV] || 1e-12);
+        return gbV[fiV] + ftV * (gbV[fiV + 1] - gbV[fiV]);
+      }
+      if (widen9) {
+        // entry 166 (user report, circling the junction bulge: "maybe the loading
+        // zone to non should be more of an approximated combined curve than a
+        // sudden jump"): v4's settle was a discrete segment at the uL
+        // boundary -- its compressed slope-drop read as a BULGE. v5: NO
+        // boundary. One combined slope law over the whole outer region:
+        // s(z) = softmin( loadingLaw'(z), slotGrowth(z) ), blend beginning
+        // INSIDE the loading zone with a WIDE smoothing width -- the rising
+        // loading eases into the low channel as one gentle arc, and the
+        // channel + release emerge from the blend. The growth amplitude A is
+        // BISECTED so the mouth position lands exactly. End tangent stays
+        // free (entry 165). Dial: covV 40..100 -> k 1.5..6.
+        var tRel9 = Math.max(0, Math.min(1, (P.wnCovV - 40) / 60));
+        var k9 = 1.5 + 4.5 * tRel9;
+        var zS9 = zLv * 0.72;                       // blend starts inside the loading
+        var span9 = zEnd9 - zS9;
+        // natural loading continuation: interp bh over sArr (defined at all stations)
+        function bhAt9(zq) {
+          var lo9 = 0, hi9 = n - 1;
+          while (hi9 - lo9 > 1) { var md9 = (lo9 + hi9) >> 1; if (sArr[md9] <= zq) lo9 = md9; else hi9 = md9; }
+          var f9 = (zq - sArr[lo9]) / (sArr[hi9] - sArr[lo9] || 1e-12);
+          return bh[lo9] + f9 * (bh[hi9] - bh[lo9]);
+        }
+        var b0S9 = bhAt9(zS9);
+        var NGs9 = 900;
+        function buildA9(A9) {
+          var acc9 = b0S9, prevS9 = null, gz9 = [zS9], gb9 = [acc9];
+          for (var gi9 = 1; gi9 <= NGs9; gi9++) {
+            var zq9 = zS9 + span9 * gi9 / NGs9;
+            var h9 = span9 / NGs9;
+            var sN9 = (bhAt9(Math.min(zEnd9, zq9 + h9)) - bhAt9(zq9 - h9)) / (2 * h9);
+            var v9 = (zq9 - zS9) / span9;
+            var sG9 = A9 * (Math.exp(k9 * v9) - 1);
+            // ONE-SIDED blend (a softmin caps the curve at the loading law's own
+            // integral -- the mouth was unreachable): start at the loading's
+            // slope EXACTLY (C1 splice, no bulge) and relax into the growth law
+            var sC9 = sG9 + (sN9 - sG9) * Math.exp(-v9 / 0.18);
+            if (prevS9 === null) prevS9 = sC9;
+            acc9 += 0.5 * (prevS9 + sC9) * h9;
+            prevS9 = sC9;
+            gz9.push(zq9); gb9.push(acc9);
+          }
+          return { end: acc9, gz: gz9, gb: gb9 };
+        }
+        // bisect A for the exact mouth (end is monotone in A)
+        var loA9 = 1e-5, hiA9 = 4 * (bm - b0S9) / span9, curA9 = null;
+        if (P.__vDebug) P.__vDebug.probe = { b0: b0S9, hiEnd: buildA9(hiA9).end, bm: bm };
+        if (buildA9(hiA9).end < bm) hiA9 *= 8;
+        for (var ba9 = 0; ba9 < 40; ba9++) {
+          var mdA9 = 0.5 * (loA9 + hiA9);
+          curA9 = buildA9(mdA9);
+          if (curA9.end < bm) loA9 = mdA9; else hiA9 = mdA9;
+        }
+        curA9 = buildA9(0.5 * (loA9 + hiA9));
+        if (!isFinite(curA9.end) || Math.abs(curA9.end - bm) > 0.002 * bm) { if (P.__vDebug) P.__vDebug.why = 'bisect-miss end=' + curA9.end.toFixed(2); return null; }
+        var gzF9 = curA9.gz, gbF9 = curA9.gb;
+        gbF9[gbF9.length - 1] = bm;   // land exactly (bisection residual < 0.2%)
+        var fSlot9 = function (zq) {
+          var fi9 = Math.max(0, Math.min(NGs9 - 1, Math.floor((zq - zS9) / span9 * NGs9)));
+          var ft9 = (zq - gzF9[fi9]) / (gzF9[fi9 + 1] - gzF9[fi9] || 1e-12);
+          return gbF9[fi9] + ft9 * (gbF9[fi9 + 1] - gbF9[fi9]);
+        };
+        // effective release for the stats: 25% of the rise from the channel floor
+        var bMin9 = 1e9;
+        for (var qq9 = 0; qq9 < gbF9.length; qq9++) bMin9 = Math.min(bMin9, gbF9[qq9]);
+        var sRel9 = zS9;
+        for (var rq9 = 0; rq9 < gbF9.length; rq9++) if (gbF9[rq9] >= bMin9 + 0.25 * (bm - bMin9)) { sRel9 = gzF9[rq9]; break; }
+        if (P.__vDebug) P.__vDebug.slot = { k: k9, sR: sRel9, zS: zS9 };
+        var gS9 = function (zq) { return zq <= zS9 ? bhAt9(zq) : fSlot9(zq); };
+        gS9.bRel = fSlot9(sRel9); gS9.sRel = sRel9; gS9.zS = zS9;
+        return gS9;
+      }
+      // NARROWING: convex tangent fillet (the entry-159 construction)
+      var c0V = bLv + cIntV - tv9 * zLv;
+      var thcV = Math.atan(tv9), secV = Math.sqrt(1 + tv9 * tv9);
+      var denV = secV - Math.cos(phm) - tv9 * Math.sin(phm);
+      var numV = bm - tv9 * zEnd9 - c0V;
+      if (!(numV > 0.005 * bm && denV > 1e-9)) return null;
+      var RV = numV / denV;
+      var czV = zEnd9 - RV * Math.sin(phm), caV = bm + RV * Math.cos(phm);
+      var zBV = czV + RV * Math.sin(thcV);
+      if (zBV <= zLv + 0.08 * (zEnd9 - zLv) || zBV >= zEnd9 - 1e-9 || RV > 50 * zEnd9) return null;
+      return function (zq) {
+        if (zq >= zBV) { var dzq = zq - czV; return caV - Math.sqrt(Math.max(0, RV * RV - dzq * dzq)); }
+        return gbAt9(zq);
+      };
+    };
+    var chordV0 = (bm - bLv) / Math.max(1e-6, zEnd9 - zLv);
+    // DIAL SEMANTICS (entry 162): V pattern is APERTURE-ruled (it falls ~1/f,
+    // like the reference 110/66/50 -- a flat V plateau was never the physics).
+    // wnCovV = the target -6 dB V beamwidth AT 2 kHz via the Keele relation:
+    // d_eff = 25.4e6 / (2000 * covV); the slot holds b at d_eff/2 and releases
+    // late. Requests NARROWER than the natural mouth's own 2 kHz width fall
+    // through to the wall-angle cap (the entry-159/161 convex fillet).
+    var natW2k9 = 25.4e6 / (2000 * Math.max(1, 2 * bm));
+    var widenMode9 = P.wnCovV > natW2k9 * 1.05;
+    var tvUse = widenMode9 ? tvReq : Math.max(tvReq, mVz * 1.02);   // entry 164: widen mode consumes P.wnCovV directly (release-point mapping)
+    var bLock9 = buildLockedV9(tvUse);
+    if (!bLock9) {
+      if (tvUse > chordV0 && !widenMode9) {
+        // WIDENING but the concave fillet doesn't fit (tangency beyond the
+        // mouth when the cone angle nears the shallow mouth tangent): the
+        // feasible zone is BELOW the request -- bisect DOWN for the LARGEST
+        // feasible angle in (chord, requested).
+        var loW = chordV0 * 1.02, hiW = tvUse, bestW = buildLockedV9(loW);
+        for (var bsW = 0; bsW < 24 && bestW; bsW++) {
+          var mdW = 0.5 * (loW + hiW);
+          var tryW = buildLockedV9(mdW);
+          if (tryW) { loW = mdW; bestW = tryW; } else hiW = mdW;
+        }
+        bLock9 = bestW || null;
+      } else {
+        var loTv = tvUse, hiTv = Math.max(tvUse * 1.05, 1.4 * chordV0), okTv = buildLockedV9(hiTv);
+        for (var bsV = 0; bsV < 24 && okTv; bsV++) {
+          var mdTv = 0.5 * (loTv + hiTv);
+          var tryV = buildLockedV9(mdTv);
+          if (tryV) { hiTv = mdTv; okTv = tryV; } else loTv = mdTv;
+        }
+        bLock9 = okTv || null;
+      }
+    }
+    if (bLock9) {
+      var zRw9 = widenMode9 && bLock9.zS ? bLock9.zS : zLv;   // entry 166: the combined curve begins inside the loading zone
+      for (i = 0; i < n; i++) if (sArr[i] > zRw9) b[i] = widenMode9 ? bLock9(sArr[i]) : Math.max(b[i - 1] || b[i], bLock9(sArr[i]));
+      if (bLock9.bRel) bRelOut9 = bLock9.bRel;
+      if (bLock9.sRel) sRelOut9 = bLock9.sRel;
+    }
+    P.__vDebug && (P.__vDebug.out = { engaged: !!bLock9, tvReq: tvReq, tvUse: tvUse, mVz: mVz, zLv: zLv, bLv: bLv, zEnd: zEnd9, bm: bm, phm: phm });
+  }
+  for (i = 0; i < n; i++) {
+    rc.push(Math.min(P.rt, a[i], b[i]));
+    var g2 = Math.cosh(m9 * sArr[i] / 2) + T * Math.sinh(m9 * sArr[i] / 2);
+    var AhT = S0 * g2 * g2, envA = wnRRArea(a[i], b[i], rc[i]);
+    var w9 = Math.max(0, Math.min(1, (u[i] - uL) / (uC - uL)));
+    w9 = w9 * w9 * w9 * (10 - 15 * w9 + 6 * w9 * w9);       // quintic B(t) for the TARGET blend (reporting)
+    tgtArea.push((1 - w9) * AhT + w9 * envA);
+    actArea.push(envA);
+  }
+  // zone-join residuals (directive 9): measure, never assume
+  var jr9 = { dB: Math.abs(bh[iL2] - quintV(sL2)),
+              dBp: Math.abs(mV - (quintV(sL2 + 0.5) - quintV(sL2 - 0 + 0)) / 0.5) };
+  // curved-wavefront MOUTH area for reporting (directive 7, scoped): the flat formula
+  // is fine in the loading zone (0.7-3% there) but understates the mouth by ~13%.
+  var mouthAreaCurved = null;
+  return { u: u, s: sArr, zOuter: z, a: a, b: b, rc: rc, tgtArea: tgtArea, actArea: actArea, bRel: bRelOut9, sRel: sRelOut9, covHEff: covHEff9,
+           lambda: lambda, mu: mu, w: (mu - MU0) / (0.0443023256 - MU0), extrapolation: extrap, muClamped: muClamped, L: L, joinResiduals: jr9 };
+}
+function wnPathLen(sArr, zO, xO, q, c) {
+  var len = 0, z0 = sArr[0] + c * (zO[0] - sArr[0]), x0 = q * xO[0];
+  for (var i = 1; i < sArr.length; i++) {
+    var z1 = sArr[i] + c * (zO[i] - sArr[i]), x1 = q * xO[i];
+    len += Math.hypot(z1 - z0, x1 - x0); z0 = z1; x0 = x1;
+  }
+  return len;
+}
+function wnBisect(f, lo, hi) {
+  var flo = f(lo);
+  for (var it = 0; it < 70; it++) {
+    var mid = (lo + hi) / 2, fm = f(mid);
+    if (flo * fm <= 0) hi = mid; else { lo = mid; flo = fm; }
+  }
+  return (lo + hi) / 2;
+}
+function wnSolveC(sArr, zO, xO, q, L, cPrev) {
+  // EQUAL-PATH ROOT TRACKING (2026-07-14, entry 77): wnPathLen is NON-MONOTONIC in c
+  // (a length minimum sits between two roots). The old sign-bisection on the fixed
+  // bracket [-1.5, 2.5] latched an ARBITRARY root: at mu = rt*fc/c above ~0.03 it
+  // ALTERNATED between the physical branch and the FOLDED branch (equal length reached
+  // by overshooting z backward) across adjacent q samples -- ring fold-back to z=-53mm
+  // on the 2in/600Hz anchor, 240mm mesh edges, lambda/6 fMax collapse to ~200 Hz, and
+  // corrupted fin trajectories. The fold is a GENUINE root, so the equal-path residual
+  // check could never catch it. The physical family is the branch CONTINUOUS from
+  // c(|q|=1) = 1, monotone to c(0) = 0: track it by continuation -- pick the root
+  // nearest the previous |q|'s c. Callers must pass q in DESCENDING |q| order.
+  if (q < 1e-12) return 0;
+  if (Math.abs(q - 1) < 1e-12) return 1;
+  if (cPrev === undefined) cPrev = 1;
+  function f(c) { return wnPathLen(sArr, zO, xO, q, c) - L; }
+  var fp = f(cPrev);
+  if (Math.abs(fp) < 1e-9) return cPrev;
+  // fast path: expanding local bracket around cPrev; when both sides bracket a root,
+  // take the nearer one (cPrev can sit between the two branches)
+  for (var w = 0.02; w <= 0.75; w *= 1.9) {
+    var lo1 = cPrev - w, hi1 = cPrev + w, flo1 = f(lo1), fhi1 = f(hi1);
+    var rL = (flo1 * fp <= 0) ? wnBisect(f, lo1, cPrev) : null;
+    var rR = (fp * fhi1 <= 0) ? wnBisect(f, cPrev, hi1) : null;
+    if (rL !== null && rR !== null) return (Math.abs(rL - cPrev) <= Math.abs(rR - cPrev)) ? rL : rR;
+    if (rL !== null) return rL;
+    if (rR !== null) return rR;
+  }
+  // global scan on [-1.5, 2.5]: bisect every sign-change bracket, keep the root nearest
+  // cPrev; if NO root exists (length target unreachable), fall back to min-|error| c.
+  var NS = 320, prev = f(-1.5), best = null, bestD = Infinity, bestE = Math.abs(prev), bestC = -1.5;
+  for (var k = 1; k <= NS; k++) {
+    var c = -1.5 + 4.0 * k / NS, fc = f(c);
+    if (prev * fc <= 0) {
+      var r = wnBisect(f, -1.5 + 4.0 * (k - 1) / NS, c);
+      var d = Math.abs(r - cPrev);
+      if (d < bestD) { bestD = d; best = r; }
+    }
+    if (Math.abs(fc) < bestE) { bestE = Math.abs(fc); bestC = c; }
+    prev = fc;
+  }
+  return best !== null ? best : bestC;
+}
+function wnFamily(prof, nQ) {
+  var sArr = prof.s, zO = prof.zOuter, xO = prof.a;
+  // target = the OUTER polyline length AT THE FAMILY RESOLUTION (chord-shortening made
+  // |q|=1 report a fake 3e-3 error against the fine-grid L; equal-path means equal to
+  // EACH OTHER, so the target is the discrete outer itself)
+  var L = 0;
+  for (var i9 = 1; i9 < sArr.length; i9++) L += Math.hypot(zO[i9] - zO[i9 - 1], xO[i9] - xO[i9 - 1]);
+  var qV = [], Zq = [], Xq = [], errs = [], j, i;
+  // Chebyshev-clustered q grid: Z(x) steepens toward |x| -> a where a uniform grid is
+  // coarsest -- linear interpolation there faceted the side/corner vertices (dihedral
+  // hotspots at j=3-6 across rings 76-113). Cosine spacing puts sub-0.1mm samples at
+  // the edges; the solver is unchanged (any q grid is a valid equal-path family).
+  for (j = 0; j < nQ; j++) qV.push(-Math.cos(Math.PI * j / (nQ - 1)));
+  // continuation order: |q| DESCENDING from the outer wall (c=1) toward the axis (c=0),
+  // one cPrev chain -- path length depends on |q| only, so +/-q pairs share the root.
+  var ordJ = qV.map(function (_, jj) { return jj; }).sort(function (a2, b2) { return Math.abs(qV[b2]) - Math.abs(qV[a2]); });
+  var cByJ = new Array(nQ), cPrev = 1;
+  for (var jo = 0; jo < nQ; jo++) {
+    var j9 = ordJ[jo], q9 = Math.abs(qV[j9]);
+    cByJ[j9] = wnSolveC(sArr, zO, xO, q9, L, cPrev);
+    cPrev = cByJ[j9];
+  }
+  for (j = 0; j < nQ; j++) {
+    var qs = qV[j], q = Math.abs(qs), sg = qs < 0 ? -1 : 1;
+    if (q < 1e-12) {
+      Zq.push(sArr.slice()); Xq.push(sArr.map(function () { return 0; })); errs.push(0); continue;
+    }
+    var c = cByJ[j];
+    var zr = [], xr = [];
+    for (i = 0; i < sArr.length; i++) { zr.push(sArr[i] + c * (zO[i] - sArr[i])); xr.push(sg * q * xO[i]); }
+    var cum = [0];
+    for (i = 1; i < zr.length; i++) cum.push(cum[i - 1] + Math.hypot(zr[i] - zr[i - 1], xr[i] - xr[i - 1]));
+    var tot = cum[cum.length - 1], zN = [], xN = [];
+    for (i = 0; i < sArr.length; i++) {
+      var tgt = sArr[i] / L * tot;
+      zN.push(wnInterp(cum, zr, tgt)); xN.push(wnInterp(cum, xr, tgt));
+    }
+    Zq.push(zN); Xq.push(xN); errs.push(tot - L);
+  }
+  // station-major transpose
+  var Zs = [], Xs = [];
+  for (i = 0; i < sArr.length; i++) {
+    Zs.push([]); Xs.push([]);
+    for (j = 0; j < nQ; j++) { Zs[i].push(Zq[j][i]); Xs[i].push(Xq[j][i]); }
+  }
+  return { Z: Zs, X: Xs, q: qV, pathErrors: errs };
+}
+function wnWall(P) {
+  var prof = wnProfile(P);
+  var fam = wnFamily(prof, P.familySamples || 181);
+  var wall = [], wallV = [], rhoTrk = [], Ttrace = [], i;
+  for (i = 0; i < prof.s.length; i++) {
+    wall.push({ z: prof.zOuter[i], r: prof.a[i] });         // H: outer trajectory
+    wallV.push({ z: prof.s[i], r: prof.b[i] });             // V: center trajectory is straight (z = s)
+    rhoTrk.push(prof.rc[i]);
+    Ttrace.push({ s: prof.s[i], T: P.T0 || 0.8 });
+  }
+  var maxErr = 0;
+  for (i = 0; i < fam.pathErrors.length; i++) maxErr = Math.max(maxErr, Math.abs(fam.pathErrors[i]));
+  // curved-wavefront mouth area: integral 2*yMax(x)*sqrt(1+Z'(x)^2) dx at the last station
+  (function () {
+    var iM = prof.s.length - 1, a9 = prof.a[iM], b9 = prof.b[iM], rc9 = prof.rc[iM];
+    var X9 = fam.X[iM], Z9 = fam.Z[iM], N9 = 240, Sc = 0;
+    for (var k9 = 0; k9 < N9; k9++) {
+      var x9 = -a9 + 2 * a9 * (k9 + 0.5) / N9, dx9 = 2 * a9 / N9;
+      var ym = wnYMax(x9, a9, b9, rc9), Zp = 0;
+      for (var j9 = 1; j9 < X9.length; j9++) if (X9[j9] >= x9) { Zp = (Z9[j9] - Z9[j9 - 1]) / (X9[j9] - X9[j9 - 1] || 1e-12); break; }
+      Sc += 2 * ym * Math.sqrt(1 + Zp * Zp) * dx9;
+    }
+    prof.mouthAreaCurved = Sc;
+  })();
+  return { wall: wall, wallV: wallV, rhoTrk: rhoTrk, sEnd: prof.L, terminated: "wn-reference-mouth",
+           Ttrace: Ttrace, S0: Math.PI * P.rt * P.rt, m: 4 * Math.PI * P.fc / 344000,
+           criticalZ: [], wn: { prof: prof, fam: fam, maxPathErr: maxErr, NF: P.wnFins || 0 },
+           horizontalWallArcLength: prof.L, axialDepth: prof.zOuter[prof.zOuter.length - 1],
+           finalAxialZ: prof.zOuter[prof.zOuter.length - 1] };
+}
+function surfaceFrameLip(pos, M0, segs, flareR, wrapDeg, FS, flareRV) {
+  // entry 186: PER-PLANE ROLL RADII. The V pattern diffracts from the TOP and
+  // BOTTOM rim edges, the H pattern from the SIDES -- so a deep side roll with
+  // a shallow top/bottom roll contains H while leaving the V edges
+  // acoustically near-bare at low frequency (the WN300ALO-style combination:
+  // wide 1 kHz V with wall-controlled 2 kHz). Per azimuth: r(phi) =
+  // flareR cos^2 phi + flareRV sin^2 phi from the rim point's own normalized
+  // lateral position. flareRV omitted or equal -> exactly the old behavior.
+  // entry 179 (factored from buildWNRings, entries 167 + 170): the SURFACE-FRAME
+  // LIP -- per-azimuth independent rollback. Frames from the true local surface
+  // (T x rim-tangent, ONE global sign), spiral launch (radial flare, no knee).
+  // On a rectangular mouth this IS "independent roll for each side": top/bottom
+  // roll about horizontal axes, sides about vertical axes, corners blend
+  // automatically because the frames interpolate continuously along the rim.
+  {
+    // tangent-continuous lip with SMOOTHED frames (the proven biradial pattern):
+    // rotate from the true 3-D meridian tangent toward the outward section normal.
+    var wrap = Math.min(225, 90 + wrapDeg) * Math.PI / 180;
+    var bMr = (M0 - 1) * segs, bPr = (M0 - 2) * segs;
+    var Traw = [], Nraw = [], Pms = [];
+    for (var j2 = 0; j2 < segs; j2++) {
+      var kM = (bMr + j2) * 3, kP = (bPr + j2) * 3;
+      Pms.push([pos[kM], pos[kM + 1], pos[kM + 2]]);
+      var Tm = [pos[kM] - pos[kP], pos[kM + 1] - pos[kP + 1], pos[kM + 2] - pos[kP + 2]];
+      var Tl = Math.hypot(Tm[0], Tm[1], Tm[2]) || 1e-9;
+      Traw.push([Tm[0] / Tl, Tm[1] / Tl, Tm[2] / Tl]);
+      // entry 167: the lip normal from the TRUE LOCAL SURFACE -- N = T x R
+      // where R is the 3-D rim tangent (carrying the rim's ~150 mm axial
+      // swing). The old N was purely LATERAL ([0, nx, ny]) against heavily
+      // tilted meridians, and smoothing those inconsistent frames sheared the
+      // roll near the rect corners (100-mm azimuthal neighbor steps deep in
+      // the wrap -- the entry-160/164 diagnosis).
+      var jp = (j2 + segs - 1) % segs, jn = (j2 + 1) % segs;
+      var kJP = (bMr + jp) * 3, kJN = (bMr + jn) * 3;
+      var Rx9 = pos[kJN] - pos[kJP], Ry9 = pos[kJN + 1] - pos[kJP + 1], Rz9 = pos[kJN + 2] - pos[kJP + 2];
+      var Rl9 = Math.hypot(Rx9, Ry9, Rz9) || 1e-9;
+      Rx9 /= Rl9; Ry9 /= Rl9; Rz9 /= Rl9;
+      var Tj9 = Traw[j2];
+      var Nx9 = Tj9[1] * Rz9 - Tj9[2] * Ry9,
+          Ny9 = Tj9[2] * Rx9 - Tj9[0] * Rz9,
+          Nz9 = Tj9[0] * Ry9 - Tj9[1] * Rx9;
+      // NO per-azimuth sign flip: T x R is globally consistent on the smooth
+      // rim (per-j outwardness tests flip noisily near the corners where N
+      // legitimately tilts axial -- the 155-mm neighbor jumps). One global
+      // sign decision after the loop.
+      var Nl0 = Math.hypot(Nx9, Ny9, Nz9) || 1e-9;
+      Nraw.push([Nx9 / Nl0, Ny9 / Nl0, Nz9 / Nl0]);
+    }
+    var sgn9 = 0;
+    for (var js9 = 0; js9 < segs; js9++) {
+      var kPCs = ((M0 - 1) * segs + js9) * 3;
+      var pCs = { x: pos[kPCs + 1], y: pos[kPCs + 2] };
+      sgn9 += Nraw[js9][1] * pCs.x + Nraw[js9][2] * pCs.y;
+    }
+    if (sgn9 < 0) for (var jf9 = 0; jf9 < segs; jf9++) { Nraw[jf9][0] = -Nraw[jf9][0]; Nraw[jf9][1] = -Nraw[jf9][1]; Nraw[jf9][2] = -Nraw[jf9][2]; }
+    function smV(arr, j9) {
+      var v = [0, 0, 0];
+      for (var w9 = -2; w9 <= 2; w9++) { var sc = arr[(j9 + w9 + segs) % segs]; v[0] += sc[0]; v[1] += sc[1]; v[2] += sc[2]; }
+      var L9 = Math.hypot(v[0], v[1], v[2]) || 1e-9;
+      return [v[0] / L9, v[1] / L9, v[2] / L9];
+    }
+    for (var j3 = 0; j3 < segs; j3++) {
+      var rj9 = flareR, turnScale9 = 1;
+      if (flareRV !== undefined && flareRV !== null && Math.abs(flareRV - flareR) > 1e-9) {
+        // entry 187: PER-PLANE WRAP TAPER (the radius-blend v1 was geometrically
+        // doomed: any small radius turning the full wrap FOLDS back with an air
+        // gap thinner than any affordable element -- the flareRV-8 run leaked at
+        // -2.6 dB rear and the verdict system then invalidated the flareRV-20
+        // revision too, ratio 0.94). The fold comes from the TURN, not the
+        // radius: taper the WRAP at the top/bottom edges instead. Radius stays
+        // flareR everywhere (the validated 0.46 regime); the top's turn shrinks
+        // to (flareRV / flareR) of the full wrap -- a <= 90-degree turn never
+        // doubles back, so there is NO fold and NO thin gap at any density,
+        // while a ~30-degree relief is acoustically near-bare at 1 kHz.
+        var kRim9x = ((M0 - 1) * segs) * 3;
+        var mxX9 = 0, mxY9 = 0;
+        for (var q9x = 0; q9x < segs; q9x++) { mxX9 = Math.max(mxX9, Math.abs(pos[kRim9x + q9x * 3 + 1])); mxY9 = Math.max(mxY9, Math.abs(pos[kRim9x + q9x * 3 + 2])); }
+        var kThis9 = ((M0 - 1) * segs + j3) * 3;
+        var nx9 = Math.abs(pos[kThis9 + 1]) / Math.max(1e-9, mxX9), ny9 = Math.abs(pos[kThis9 + 2]) / Math.max(1e-9, mxY9);
+        var p9r = 4;
+        var wV9 = Math.pow(ny9, p9r) / Math.max(1e-12, Math.pow(nx9, p9r) + Math.pow(ny9, p9r));
+        var frac9 = Math.max(0.12, Math.min(1, flareRV / Math.max(1e-9, flareR)));
+        turnScale9 = (1 - wV9) + wV9 * frac9;
+      }
+      var Pm = Pms[j3], Tm2 = smV(Traw, j3), N4 = smV(Nraw, j3);
+      var dNT = N4[0] * Tm2[0] + N4[1] * Tm2[1] + N4[2] * Tm2[2];
+      N4 = [N4[0] - dNT * Tm2[0], N4[1] - dNT * Tm2[1], N4[2] - dNT * Tm2[2]];
+      var Nl = Math.hypot(N4[0], N4[1], N4[2]) || 1e-9;
+      N4 = [N4[0] / Nl, N4[1] / Nl, N4[2] / Nl];
+      // entry 170 (improvement suggested by Dr. B. Ahlswede -- the rollover
+      // should launch without a curvature knee):
+      // the old constant-radius roll launched tangent-continuous but with a
+      // CURVATURE STEP (wall curvature -> 1/flareR instantly). The lip is now
+      // a SPIRAL LAUNCH: curvature eases linearly from ~0 to 1/flareR over
+      // the first 30% of the wrap, then constant -- integrated as a polyline
+      // in the (T, N) plane, endpoint parameterization preserved.
+      var ease9 = 0.30, NSp9 = 4 * FS;
+      var ang9 = 0, u9 = 0, v9 = 0, dph9;
+      var lipU9 = [0], lipV9 = [0], lipA9 = [0];
+      for (var sp9 = 1; sp9 <= NSp9; sp9++) {
+        var fr9 = sp9 / NSp9;
+        var kap9 = (fr9 < ease9 ? fr9 / ease9 : 1) / rj9;
+        // arc-length step chosen so the TOTAL turn reaches `wrap`:
+        // total turn = integral kappa ds; with the ease, ds_total = wrap*flareR/(1-ease/2)
+        var dsTot9 = wrap * turnScale9 * rj9 / (1 - ease9 / 2);
+        var ds9 = dsTot9 / NSp9;
+        u9 += Math.cos(ang9) * ds9;
+        v9 += Math.sin(ang9) * ds9;
+        ang9 += kap9 * ds9;
+        lipU9.push(u9); lipV9.push(v9); lipA9.push(ang9);
+      }
+      for (var q = 1; q <= FS; q++) {
+        // sample the spiral at equal ARC fractions (uniform lip row spacing --
+        // equal-turn bunched rows at deep curls and wrecked graded aspects)
+        var si9 = Math.max(1, Math.min(NSp9, Math.round(q * NSp9 / FS)));
+        var uu9 = lipU9[si9], vv9 = lipV9[si9];
+        var f29 = 0;
+        var kk = ((M0 + q - 1) * segs + j3) * 3;
+        pos[kk] = Pm[0] + uu9 * Tm2[0] + vv9 * N4[0];
+        pos[kk + 1] = Pm[1] + uu9 * Tm2[1] + vv9 * N4[1];
+        pos[kk + 2] = Pm[2] + uu9 * Tm2[2] + vv9 * N4[2];
+      }
+    }
+  }
+}
+
+function buildWNRings(horn, segs, flareR, wrapDeg, flareRV) {
+  // True curved 3-D station rings for the WN family: rounded-rect perimeter per
+  // station (corner-pinned per-edge allocation, mouth proportions -- the same
+  // feature-aligned scheme that ended the biradial bump saga), axial position per
+  // vertex from the equal-path family: z = Z_i(x). Curved horizontal wavefront, flat
+  // vertical construction wavefront.
+  var prof = horn.wn.prof, fam = horn.wn.fam;
+  var M0 = prof.s.length;
+  var aM = prof.a[M0 - 1], bM = prof.b[M0 - 1];
+  var per = 2 * aM + 2 * bM;
+  var nT = Math.max(8, Math.round(segs * aM / per / 2) * 2);   // per top/bottom edge
+  var nS = Math.max(4, (segs - 2 * nT) / 2 | 0);
+  while (2 * nS + 2 * nT < segs) nT++;
+  nT = (segs - 2 * nS) / 2 | 0;                                 // exact fit
+  function ringPt(a, b, rc, j) {
+    rc = Math.max(0.3, Math.min(rc, 0.999 * Math.min(a, b)));
+    var qa = rc * Math.PI / 4;
+    var Ls = 2 * (b - rc) + 2 * qa, Lt = 2 * (a - rc) + 2 * qa;
+    var seg2, loc, cnt, LL;
+    if (j < nS) { seg2 = 0; loc = j; cnt = nS; LL = Ls; }
+    else if (j < nS + nT) { seg2 = 1; loc = j - nS; cnt = nT; LL = Lt; }
+    else if (j < 2 * nS + nT) { seg2 = 2; loc = j - nS - nT; cnt = nS; LL = Ls; }
+    else { seg2 = 3; loc = j - 2 * nS - nT; cnt = nT; LL = Lt; }
+    var d = (loc / cnt) * LL, str;
+    function corner(cx0, cy0, a0deg, frac) { var a0 = (a0deg + 45 * frac) * Math.PI / 180; return { x: cx0 + rc * Math.cos(a0), y: cy0 + rc * Math.sin(a0) }; }
+    if (seg2 === 0) { str = 2 * (b - rc);
+      if (d < qa) return corner(a - rc, -b + rc, -45, d / qa);
+      if (d < qa + str) return { x: a, y: -b + rc + (d - qa) };
+      return corner(a - rc, b - rc, 0, (d - qa - str) / qa); }
+    if (seg2 === 1) { str = 2 * (a - rc);
+      if (d < qa) return corner(a - rc, b - rc, 45, d / qa);
+      if (d < qa + str) return { x: a - rc - (d - qa), y: b };
+      return corner(-a + rc, b - rc, 90, (d - qa - str) / qa); }
+    if (seg2 === 2) { str = 2 * (b - rc);
+      if (d < qa) return corner(-a + rc, b - rc, 135, d / qa);
+      if (d < qa + str) return { x: -a, y: b - rc - (d - qa) };
+      return corner(-a + rc, -b + rc, 180, (d - qa - str) / qa); }
+    str = 2 * (a - rc);
+    if (d < qa) return corner(-a + rc, -b + rc, 225, d / qa);
+    if (d < qa + str) return { x: -a + rc + (d - qa), y: -b };
+    return corner(a - rc, -b + rc, 270, (d - qa - str) / qa);
+  }
+  var FS = (flareR > 0.5) ? 10 : 0;
+  var M = M0 + FS;
+  var pos = new Float32Array(M * segs * 3);
+  for (var i = 0; i < M0; i++) {
+    for (var j = 0; j < segs; j++) {
+      var pt = ringPt(prof.a[i], prof.b[i], prof.rc[i], j);
+      var zj = wnInterp(fam.X[i], fam.Z[i], pt.x);
+      var k = (i * segs + j) * 3;
+      pos[k] = zj; pos[k + 1] = pt.x; pos[k + 2] = pt.y;
+    }
+  }
+  if (FS > 0) surfaceFrameLip(pos, M0, segs, flareR, wrapDeg, FS, flareRV);
+  return { rings: pos, M: M, segs: segs };
+}
+function wnFinMesh(horn, finT, clear, u0, u1) {
+  // Watertight curved fin solids on the equal-path trajectories, spanning u0..u1
+  // (fins do NOT run to the mouth lip by default). Finless is the reference form.
+  var prof = horn.wn.prof, fam = horn.wn.fam, NF = horn.wn.NF || 0;
+  if (!NF) return null;
+  if (u0 === undefined) u0 = 0.03;
+  if (u1 === undefined) u1 = 0.70;
+  var meshes = [], M0 = prof.s.length;
+  var i0 = Math.max(0, Math.round(u0 * (M0 - 1))), i1 = Math.min(M0 - 1, Math.round(u1 * (M0 - 1)));
+  if (i1 - i0 < 3) i1 = Math.min(M0 - 1, i0 + 3);
+  for (var kf = 1; kf <= NF; kf++) {
+    var qt = -1 + 2 * kf / (NF + 1), jq = 0, best = Infinity;
+    for (var jj = 0; jj < fam.q.length; jj++) { var e = Math.abs(fam.q[jj] - qt); if (e < best) { best = e; jq = jj; } }
+    var V = [], F = [];
+    for (var i = i0; i <= i1; i++) {
+      var x = fam.X[i][jq], z = fam.Z[i][jq];
+      var iN = Math.min(M0 - 1, i + 1), iP = Math.max(0, i - 1);
+      var dx = fam.X[iN][jq] - fam.X[iP][jq], dz = fam.Z[iN][jq] - fam.Z[iP][jq];
+      var dl = Math.hypot(dx, dz) || 1e-9;
+      var nx = dz / dl, nz = -dx / dl;                        // x-z normal
+      var yM = Math.max(0.5, wnYMax(x, prof.a[i], prof.b[i], prof.rc[i]) - clear);
+      var tt9 = (i - i0) / Math.max(1, i1 - i0);
+      var tp9 = Math.min(1, tt9 / 0.06) ; tp9 = tp9 * tp9 * tp9 * (tp9 * (tp9 * 6 - 15) + 10);
+      var tp8 = Math.min(1, (1 - tt9) / 0.06); tp8 = tp8 * tp8 * tp8 * (tp8 * (tp8 * 6 - 15) + 10);
+      var h = Math.max(0.15, finT / 2 * Math.min(tp9, tp8));   // smootherstep end taper (prototype review)
+      V.push([z - h * nz, x - h * nx, -yM], [z + h * nz, x + h * nx, -yM],
+             [z + h * nz, x + h * nx, yM], [z - h * nz, x - h * nx, yM]);
+    }
+    var NSF = i1 - i0 + 1;
+    for (var i2 = 0; i2 < NSF - 1; i2++) {
+      var b0 = i2 * 4, b1 = (i2 + 1) * 4;
+      for (var e2 = 0; e2 < 4; e2++) {
+        var a1 = b0 + e2, a2 = b0 + (e2 + 1) % 4, c1 = b1 + e2, c2 = b1 + (e2 + 1) % 4;
+        F.push([a1, c1, c2], [a1, c2, a2]);
+      }
+    }
+    F.push([0, 1, 2], [0, 2, 3]);                             // leading cap
+    var bL = (NSF - 1) * 4;
+    F.push([bL, bL + 2, bL + 1], [bL, bL + 3, bL + 2]);       // mouth cap
+    var pos = new Float32Array(V.length * 3), idx = new Uint32Array(F.length * 3);
+    for (var v = 0; v < V.length; v++) { pos[v * 3] = V[v][0]; pos[v * 3 + 1] = V[v][1]; pos[v * 3 + 2] = V[v][2]; }
+    for (var f = 0; f < F.length; f++) { idx[f * 3] = F[f][0]; idx[f * 3 + 1] = F[f][1]; idx[f * 3 + 2] = F[f][2]; }
+    meshes.push({ pos: pos, idx: idx });
+  }
+  return meshes;
+}
+function osWall(P) {
+  // Geddes oblate-spheroidal waveguide (JAES 1989): r(z) = sqrt(rt^2 + (z tan(theta))^2),
+  // theta = coverage half-angle; H sized to the Keele width for the design coverage.
+  // PER-AXIS COVERAGE (2026-07-13, the user): the elliptical Geddes waveguide is the
+  // SAME law per plane with its own half-angle -- covV drives an independent V wall
+  // over the same axial span (the accepted elliptical-OS engineering form). Round when
+  // covV = covH.
+  var covH = P.covH || 90, f0 = P.f0 || 800;
+  var covV = P.covV || covH;
+  var rt = P.rt, th = Math.min(70, Math.max(15, covH / 2)) * Math.PI / 180;
+  var rtH = P.rtH || rt, rtV = P.rtV || rt;   // entry 235: per-plane throat half-apertures (rect throat), same law per plane
+  var thV = Math.min(70, Math.max(15, covV / 2)) * Math.PI / 180;
+  var tth = Math.tan(th), tthV = Math.tan(thV);
+  var dKeele = 2.54e7 / (Math.max(30, covH) * f0);
+  var wall = [], wallV = [], n = 700;
+  var zEnd = Math.sqrt(Math.max(1, (dKeele / 2) * (dKeele / 2) - rtH * rtH)) / tth;
+  for (var i = 0; i < n; i++) {
+    var z = zEnd * i / (n - 1);
+    wall.push({ z: z, r: Math.sqrt(rtH * rtH + z * z * tth * tth) });
+    wallV.push({ z: z, r: Math.sqrt(rtV * rtV + z * z * tthV * tthV) });
+  }
+  var out = { wall: wall, sEnd: zEnd, terminated: "keele-width", Ttrace: [] };
+  if (Math.abs(covV - covH) > 0.01 || Math.abs(rtV - rtH) > 1e-9) out.wallV = wallV;
+  return out;
+}
+
+function rosseCurve(r0, R, aDeg, a0, k, rr, bb, mm, qq, n) {
+  // entry 235: the published R-OSSE parametric curve for ONE plane (factored out
+  // of rosseWall so the H and V planes can each run it with their own r0, R, a).
+  var c1 = (k * r0) * (k * r0);
+  var c2 = 2 * k * r0 * Math.tan(a0);
+  var c3 = Math.pow(Math.tan(aDeg * Math.PI / 180), 2);
+  var disc = c2 * c2 - 4 * c3 * (c1 - Math.pow(R + r0 * (k - 1), 2));
+  if (disc <= 0 || R <= r0) return null;
+  var L = (Math.sqrt(disc) - c2) / (2 * c3);
+  var A1 = Math.sqrt(rr * rr + mm * mm);
+  var A2 = Math.sqrt(rr * rr + (1 - mm) * (1 - mm));
+  var wall = [], xMax = 0;
+  for (var i = 0; i < n; i++) {
+    var t = i / (n - 1);
+    var x = L * (A1 - Math.sqrt(rr * rr + (t - mm) * (t - mm))) - bb * L * (A1 - A2) * t * t;
+    var y = (1 - Math.pow(t, qq)) * (Math.sqrt(c1 + c2 * L * t + c3 * L * L * t * t) - r0 * (k - 1))
+          + Math.pow(t, qq) * (R + L * (1 - Math.sqrt(1 + c3 * (t - 1) * (t - 1))));
+    wall.push({ z: x, r: y });
+    if (x > xMax) xMax = x;
+  }
+  return { wall: wall, L: L, xMax: xMax };
+}
+function rosseWall(P) {
+  // R-OSSE (Marcel Batik, at-horns.eu, Dec 2022) - exact published parametric formula.
+  // Complete free-standing waveguide incl. rollback termination, BEM-validated by the author.
+  var r0 = P.rt;
+  // a0 = 0 and b = 0 are VALID per the published formula (the paper analyzes a0 = 0 explicitly),
+  // so use ===undefined defaults, not || (falsy-zero once made the UI show 0 while building 7.5).
+  var R = P.rosR || 130, aDeg = P.rosA || 39, a0 = (P.rosA0 === undefined ? 7.5 : P.rosA0) * Math.PI / 180;
+  var k = P.rosK !== undefined ? P.rosK : 1.8, rr = P.rosRr !== undefined ? P.rosRr : 0.3, bb = P.rosB === undefined ? 0.3 : P.rosB, mm = P.rosM !== undefined ? P.rosM : 0.8, qq = P.rosQ !== undefined ? P.rosQ : 3.7; // AUDIT #14:
+  // entry 221 (Hans, after 219: "the horn contour starts with linear
+  // values"): the 219 prepend is REMOVED -- the driver's cone stays in the
+  // driver (the entry-190 standard the classic OS already follows). The
+  // R-OSSE is the pure published curve from z=0, launching at the a0 dial;
+  // note for anyone measuring it: the GEOMETRIC launch slope is
+  // tan(a0)*sqrt(rr^2+m^2)/m, not tan(a0) -- the x-parameterization is not
+  // unit-speed (dx/dt|0 = L*m/A1, dy/dt|0 = L*tan(a0)); measured 0.1506
+  // first-chord vs 0.1406 raw tan on the ST260 defaults.
+  // entry 235 (kodomo #54 / exprymer #55, the ATH form): PER-PLANE R-OSSE. The
+  // H plane runs the published curve with (r0H, R, a); the V plane with
+  // (r0V, R_V, a_V) -- a0, k, r, b, m, q shared. r0H/r0V come from a rect
+  // throat (W/2, H/2) or both equal rt. a_V = 0 means "same as H"; R_V = 0
+  // means SOLVED so the V plane's rollback reaches the SAME mouth depth as H
+  // (bisection on x_max, monotone in R) -- both curves stay the pure published
+  // formula and the mouth rim is planar. An explicit R_V keeps the curve pure
+  // too, and the rim is then non-planar by (x_max,V - x_max,H), reported.
+  // The two planes are paired by the parameter t (500 stations each); the
+  // ring builder blends z between planes with its cos^2 law.
+  var n = 500;
+  var r0H = P.rtH || r0, r0V = P.rtV || r0;
+  var aV = P.rosAV > 0 ? P.rosAV : aDeg;
+  var asym = Math.abs(aV - aDeg) > 1e-9 || Math.abs(r0V - r0H) > 1e-9 || (P.rosRV > 0 && Math.abs(P.rosRV - R) > 1e-9);
+  var cH = rosseCurve(r0H, R, aDeg, a0, k, rr, bb, mm, qq, n);
+  if (!cH) return { wall: [{ z: 0, r: r0H }], sEnd: 0, terminated: "invalid-params", Ttrace: [] };
+  var out = { wall: cH.wall, sEnd: cH.wall[n - 1].z, terminated: "t=1 (self-terminated)", Ttrace: [], rosL: cH.L };
+  if (asym) {
+    var RV = P.rosRV > 0 ? P.rosRV : 0, solvedRV = false, cV = null;
+    if (!(RV > 0)) {   // solve R_V for equal mouth depth
+      var lo = r0V + 0.5, hi = Math.max(4 * R, r0V + 1);
+      for (var it = 0; it < 60; it++) {
+        RV = 0.5 * (lo + hi);
+        var cT = rosseCurve(r0V, RV, aV, a0, k, rr, bb, mm, qq, 120);
+        if (!cT || cT.xMax < cH.xMax) lo = RV; else hi = RV;
+      }
+      RV = 0.5 * (lo + hi); solvedRV = true;
+    }
+    cV = rosseCurve(r0V, RV, aV, a0, k, rr, bb, mm, qq, n);
+    if (!cV) return { wall: [{ z: 0, r: r0H }], sEnd: 0, terminated: "invalid-params (V plane)", Ttrace: [] };
+    out.wallV = cV.wall;
+    out.rosPlanes = { R: R, RV: RV, solvedRV: solvedRV, a: aDeg, aV: aV, r0H: r0H, r0V: r0V,
+                      depthH: cH.xMax, depthV: cV.xMax, rimDz: cV.xMax - cH.xMax,
+                      mouthW: 2 * cH.wall[n - 1].r, mouthH: 2 * cV.wall[n - 1].r };
+  }
+  return out;
+}
+
+
+/* ===== Ellipsoidal wavefronts + normalized stereographic projection (published 2019 method) ===== */
+function gammaLn(x) { // Lanczos
+  var g = 7, c = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+  if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - gammaLn(1 - x);
+  x -= 1;
+  var a = c[0], t = x + g + 0.5;
+  for (var i = 1; i < g + 2; i++) a += c[i] / (x + i);
+  return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+}
+function superellipseAreaFactor(n) { // area = 4ab * G(1+1/n)^2 / G(1+2/n)
+  return 4 * Math.exp(2 * gammaLn(1 + 1 / n) - gammaLn(1 + 2 / n));
+}
+function ellipsoidCapArea(ra, rb, rc, h, nTh, nPh) {
+  // eq (21): numerically integrate the triaxial ellipsoid cap above the cut plane
+  var thMax = Math.acos(Math.max(-1, Math.min(1, (rc - h) / rc)));
+  nTh = nTh || 20; nPh = nPh || 40;
+  var dth = thMax / nTh, dph = 2 * Math.PI / nPh, S = 0;
+  for (var i = 0; i < nTh; i++) {
+    var th = (i + 0.5) * dth, st = Math.sin(th), ct = Math.cos(th);
+    for (var j = 0; j < nPh; j++) {
+      var ph = (j + 0.5) * dph, cp = Math.cos(ph), sp = Math.sin(ph);
+      S += Math.abs(st) * Math.sqrt(rc * rc * st * st * (rb * rb * cp * cp + ra * ra * sp * sp) + ra * ra * rb * rb * ct * ct) * dph * dth;
+    }
+  }
+  return S;
+}
+function buildEWF(P, fsInp) {
+  // Elliptical SWH via ellipsoidal wavefronts (published 2019 method):
+  // the construction sphere (radius r0) is stretched to a triaxial ellipsoid with
+  // equatorial semi-axes ra = r0*fs', rb = r0/fs' and polar rc = r0.  Per station,
+  // hold rb, Newton on ra so the ellipsoid CAP area equals the spherical cap area
+  // 2*pi*r0*h.  The horn wall is the cap RIM: a = ra*sin(thMax), b = rb*sin(thMax).
+  var horn = computeFamily(Object.assign({}, P, { family: "swh" }));
+  var w = horn.wall, r0 = C / (Math.PI * P.fc);
+  var apex = 0;
+  for (var q = 1; q < w.length; q++) if (w[q].z > w[apex].z) apex = q;
+  var zApex = w[apex].z;
+  var wallH = [], wallV = [];
+  for (var i = 0; i <= apex; i++) {
+    var y = Math.min(w[i].r, r0 * 0.999), z = w[i].z;
+    var u = Math.min(1, zApex > 0 ? z / zApex : 0);
+    var fs = 1 + (fsInp - 1) * Math.sin(u * Math.PI / 2);   // sin transition (18a)
+    if (fs <= 1.0001) { wallH.push({ z: z, r: y }); wallV.push({ z: z, r: y }); continue; }
+    var h = r0 - Math.sqrt(Math.max(0, r0 * r0 - y * y));
+    var Ssph = 2 * Math.PI * r0 * h;
+    var sinTh = y / r0;
+    var rb = r0 / fs, ra = r0 * fs;                          // ellipsoid axes; rb held fixed
+    for (var it = 0; it < 10; it++) {
+      var F = ellipsoidCapArea(ra, rb, r0, h) - Ssph;
+      if (Math.abs(F) < Ssph * 5e-4) break;
+      var s = Math.max(0.5, ra * 0.005);
+      var dF = (ellipsoidCapArea(ra + s / 2, rb, r0, h) - ellipsoidCapArea(ra - s / 2, rb, r0, h)) / s;
+      if (!isFinite(dF) || Math.abs(dF) < 1e-12) break;
+      ra = Math.max(rb, ra - F / dF);
+    }
+    wallH.push({ z: z, r: ra * sinTh });
+    wallV.push({ z: z, r: rb * sinTh });
+  }
+  var rt = P.rt, rhoT = [];
+  for (var k2 = 0; k2 < wallH.length; k2++) rhoT.push(rt);
+  return { wall: wallH, wallV: wallV, rhoTrk: rhoT, sEnd: zApex, terminated: horn.terminated + " (EWF)", Ttrace: horn.Ttrace, areaLawPiAB: true };
+}
+function spTransform(rp) {
+  // Normalized stereographic projection (published eqs 12-28), as a pure point map.
+  // AUDIT #11 (2026-07-13): the old zRef parameter was passed but NEVER used -- the
+  // implemented (and visually validated) form is the per-station normalized map: each
+  // cross-section projects on the sphere through its own round reference ring (yRound
+  // per point). Parameter removed; documentation corrected.
+  return function (x, y, z, yRound) {
+    var b = Math.sqrt(Math.max(0, rp * rp - yRound * yRound));
+    var Cz = z + (rp - b) - rp;              // eq (14) with h = rp - b
+    var Sz = Cz - rp;                         // eq (15)
+    var lxy = Math.sqrt(x * x + y * y);
+    if (lxy < 1e-9) return { x: x, y: y, z: z };
+    var de = 2 * Math.atan(lxy / (b + rp));  // eq (21)
+    var ye = Math.sin(de) * rp, ze = Math.cos(de) * rp;
+    var lxyz = Math.sqrt(lxy * lxy + (b + rp) * (b + rp));
+    var lp = Math.sqrt(ye * ye + (ze + rp) * (ze + rp));
+    var f = lp / lxyz;                        // eq (25)
+    return { x: x * f, y: y * f, z: Sz + rp + ze }; // eqs (26)-(28)
+  };
+}
+
+function buildHVDiff(PH, PV, cornerR) {
+  // HVDiff: per-plane PETF laws, implemented from Dr. B. Ahlswede\u2019s May 2021 publication on sphericalhorns.net (BEM-quantified there) -- see README.md (provenance).
+  // blended on the SAME physical axis: at each z, half-width a(z) from the H run,
+  // half-height b(z) from the V run. Horn ends where the shorter plane's body ends.
+  // Rollbacks dropped (per drba 2025: ~equivalent to a small roundover) -- use the
+  // flare controls for mouth treatment.
+  var hH = computeFamily(PH), hV = computeFamily(PV);
+  function body(w) {                          // monotone-z horn body via argmax(z)
+    var idx = 0;
+    for (var q2 = 1; q2 < w.length; q2++) if (w[q2].z > w[idx].z) idx = q2;
+    return w.slice(0, idx + 1);
+  }
+  var wH = body(hH.wall), wV = body(hV.wall);
+  var zEnd = Math.min(wH[wH.length - 1].z, wV[wV.length - 1].z);
+  function rAt(w, z) {
+    var j = 0;
+    while (j < w.length - 2 && w[j + 1].z < z) j++;
+    var p1 = w[j], p2 = w[Math.min(j + 1, w.length - 1)];
+    var f = (p2.z - p1.z) > 1e-9 ? (z - p1.z) / (p2.z - p1.z) : 0;
+    return p1.r + (p2.r - p1.r) * Math.max(0, Math.min(1, f));
+  }
+  var rt = PH.rt, rhoTgt = Math.max(rt, cornerR || rt);
+  var wall = [], wallV = [], rhoTrk = [], N = 400;
+  for (var i = 0; i < N; i++) {
+    var z = zEnd * i / (N - 1);
+    var ra2 = rAt(wH, z), rb2 = rAt(wV, z);
+    wall.push({ z: z, r: ra2 });
+    wallV.push({ z: z, r: rb2 });
+    var u = i / (N - 1), w2 = u * u * (3 - 2 * u);
+    rhoTrk.push(Math.min(rt + (rhoTgt - rt) * w2, 0.98 * Math.min(ra2, rb2))); // corner R can never exceed the section half-sizes
+  }
+  return { wall: wall, wallV: wallV, rhoTrk: rhoTrk, sEnd: zEnd, terminated: "HVDiff (min-plane body)", Ttrace: hH.Ttrace, areaLawPiAB: true };
+}
+
+function buildHVDiffAz(PH, PV, nAz) {
+  // Wide-format HVDiff: construction rules inferred from the published No.1/No.2 profile plots (sphericalhorns.net) -- see README.md (provenance). Every azimuth phi gets its OWN complete PETF horn, with the
+  // PETF parameters blended between the horizontal (phi=0) and vertical (phi=90) recipes by
+  // cos^2 weighting. The loft TERMINATES when the FASTEST azimuth completes its horn
+  // (mouth + rollback); every slower azimuth is truncated at that same absolute arc length,
+  // mid-growth, with NO rollback of its own -- this is what the published No.1/No.2 profile
+  // plots show (fast plane: full rolled-back mouth; slow plane: cut while still rising) and
+  // it is what makes the mouth OBLONG (wide-format) instead of round. Running every azimuth
+  // to its own full JMLC mouth produced a near-round mouth with narrow slow-plane "tongues"
+  // ending in cusps (regression 17). The fast plane's rollback IS kept (it is the mouth
+  // treatment -- see the published mk1/mk3 shapes) and fades smoothly into the truncated
+  // azimuths.
+  nAz = nAz || 13;
+  var az = [];
+  for (var k = 0; k < nAz; k++) {
+    var phi = (Math.PI / 2) * k / (nAz - 1);
+    var w = Math.cos(phi) * Math.cos(phi);
+    var Pk = Object.assign({}, PH, {
+      Tadd: PH.Tadd * w + PV.Tadd * (1 - w),
+      fmult: PH.fmult * w + PV.fmult * (1 - w)
+    });
+    var hk = computeFamily(Pk);
+    var wall = hk.wall, cum = [0];
+    if (wall.length < 2) wall = [wall[0] || { z: 0, r: Pk.rt }, { z: 1e-3, r: Pk.rt }]; // degenerate-wall guard (ported code assumed >=2 pts)
+    for (var i = 1; i < wall.length; i++)
+      cum.push(cum[i - 1] + Math.hypot(wall[i].z - wall[i - 1].z, wall[i].r - wall[i - 1].r));
+    az.push({ phi: phi, wall: wall, cum: cum, total: cum[cum.length - 1] || 1 });
+  }
+  var sCut = Infinity;
+  for (var k2 = 0; k2 < nAz; k2++) if (az[k2].total < sCut) sCut = az[k2].total;
+  function at(prof2, u) {
+    // ABSOLUTE arc-length correspondence (construction-step / iso-phase analogue):
+    // s = u*sCut along every azimuth. sCut = the fastest azimuth's completion length, so
+    // no azimuth ever clamps -- slower ones are simply truncated mid-growth (see header).
+    var t = Math.min(u * sCut, prof2.total), j = 0, cum = prof2.cum, wall = prof2.wall;
+    while (j < cum.length - 2 && cum[j + 1] < t) j++;
+    var f = (t - cum[j]) / ((cum[j + 1] - cum[j]) || 1e-12);
+    f = Math.max(0, Math.min(1, f));
+    return { z: wall[j].z + f * (wall[j + 1].z - wall[j].z), r: wall[j].r + f * (wall[j + 1].r - wall[j].r) };
+  }
+  var M = 200, H = [], V = [];
+  for (var q = 0; q < M; q++) { var u = q / (M - 1); H.push(at(az[0], u)); V.push(at(az[nAz - 1], u)); }
+  return { azProfiles: az, azAt: at, sMax: sCut, wall: az[0].wall, wallV: az[nAz - 1].wall,
+           H: H, V: V, baseStations: 200, shape: "ellipse", rho: 0, rhoArr: null,
+           sEnd: sCut, terminated: "HVDiff az-loft (fast plane completes, slow planes truncated)", Ttrace: [] };
+}
+
+// JMLC QUASI-ELLIPTICAL (entry 88; Le Cleac'h "Calcul de pavillon JMLC quasi
+// elliptique", mai 2007). Axisymmetric jmlc march (natural entry angle by default,
+// his own 27.55deg closed form), then an AREA-PRESERVING elliptical morph: per
+// station a = r*sqrt(e), b = r/sqrt(e) (pi*a*b = pi*r^2 -- the loading law is
+// untouched), with ellipticity e ramping 1 -> aplat by a GAUSSIAN CDF along the
+// wavefront coordinate. The Gaussian parameterization is HIS (WE_elliptique sheet:
+// moyenne 1500 / ecart-type 900 on a 1704.9 mm march -> defaults 0.88/0.53 of
+// sEnd). Area preservation is our reading of "quasi"; validate against his
+// contours_decoupes sheet as the calcul_3D decode deepens. His "decoupe" (n,
+// puissance) mouth-cut law is NOT yet implemented (his own default in 2 of 3
+// sheets is n=0 = no cut).
+function jmlcEllWall(P) {
+  var base = jmlcWall(Object.assign({}, P, { entryAuto: P.entryAuto !== false && !(P.entryDeg > 0) }));
+  var apl = (P.aplat && P.aplat >= 1) ? P.aplat : 4;
+  var muF = P.ellMu !== undefined ? P.ellMu : 0.88;
+  var sgF = P.ellSigma !== undefined ? P.ellSigma : 0.53;
+  var sE = base.sEnd || 1, mu = muF * sE, sg = Math.max(1e-6, sgF * sE);
+  function cdf(x) {
+    var t = x / Math.SQRT2, sn = t < 0 ? -1 : 1, a = Math.abs(t);
+    var y = 1 - Math.pow(1 + a * (0.278393 + a * (0.230389 + a * (0.000972 + a * 0.078108))), -4);
+    return 0.5 * (1 + sn * y);
+  }
+  var H = [], V = [];
+  // normalized ramp: the raw CDF leaves ~5% ellipticity at the throat (a round
+  // driver demands e(0) = 1 exactly) and undershoots the mouth; g rescales the
+  // CDF over [0, sEnd] so e(0) = 1 and e(sEnd) = aplat precisely.
+  var c0 = cdf((0 - mu) / sg), c1 = cdf((sE - mu) / sg), dc = Math.max(1e-9, c1 - c0);
+  for (var i = 0; i < base.wall.length; i++) {
+    var s9 = (base.Ttrace && base.Ttrace[i]) ? base.Ttrace[i].s : sE * i / Math.max(1, base.wall.length - 1);
+    var g9 = Math.max(0, Math.min(1, (cdf((s9 - mu) / sg) - c0) / dc));
+    var e9 = 1 + (apl - 1) * g9;
+    var sq = Math.sqrt(e9);
+    H.push({ z: base.wall[i].z, r: base.wall[i].r * sq });
+    V.push({ z: base.wall[i].z, r: base.wall[i].r / sq });
+  }
+  return Object.assign({}, base, { wall: H, wallV: V, ellApl: apl, ellMuMM: mu, ellSigmaMM: sg });
+}
+// IWATA (entry 92 REWRITE, user report: "You got Iwata completely wrong"). Decoded
+// from Le Cleac'h's own Iwata_JMLC calcul_3D sheet (4005 stations x 19 azimuths):
+// (1) sections are TRUE ELLIPSES x = a*cos(t), y = b*sin(t) (parameter match to
+// 0.3 deg); (2) wall z varies PER AZIMUTH, z(t) = zH*cos^2(t) + zV*sin^2(t)
+// (+-1.5 mm vs his points); (3) the ellipticity e = a/b rises to ~2.5 at ~55%
+// of the march then INVERTS to ~0.71 -- the H and V walls roll INDEPENDENTLY
+// (H at z ~354, V at z ~578 on his 320 Hz / 1in example), which no static
+// morph, freeze, or two-parameter law reproduces. So the family carries his
+// surface as a DIMENSIONLESS SHAPE TABLE (65 stations x [aN, bN, zHN, zVN],
+// normalized by his V-roll radius 346.54), scaled through OUR validated jmlc
+// march at the user's (fc, rt, T): scale = rMax_user/rMax(320, 12.7, 0.7071).
+// EXACT at his design point; principled fc/rt/T scaling elsewhere (mu-shape
+// drift documented). The DECOUPE is what it always was in his sheets: a CUT of
+// the march, per azimuth: uCut(t) = 1 - n*|sin t|^p (p = 11 -> a cliff that
+// removes the deep V-roll overgrowth; his sheet stores the UNCUT march and
+// cuts at readout -- verified: uncut 567 x 693 x 578, cut 567 x 371 x 534).
+var IWATA_GRID = [[[0.0,0.03665,0.0],[0.00319,0.03651,0.0],[0.00636,0.03609,0.0],[0.00949,0.0354,0.0],[0.01253,0.03444,0.0],[0.01549,0.03321,0.0],[0.01832,0.03174,0.0],[0.02102,0.03002,0.0],[0.02356,0.02807,0.0],[0.02591,0.02591,0.0],[0.02807,0.02356,0.0],[0.03002,0.02102,0.0],[0.03174,0.01832,0.0],[0.03321,0.01549,0.0],[0.03444,0.01253,0.0],[0.0354,0.00949,0.0],[0.03609,0.00636,0.0],[0.03651,0.00319,0.0],[0.03665,0.0,0.0]],[[0.0,0.03699,0.01262],[0.00328,0.03684,0.01262],[0.00654,0.03642,0.01262],[0.00975,0.03572,0.01262],[0.01288,0.03475,0.01262],[0.01592,0.03352,0.01262],[0.01883,0.03203,0.01262],[0.0216,0.0303,0.01261],[0.02421,0.02833,0.01261],[0.02663,0.02615,0.01261],[0.02885,0.02377,0.0126],[0.03085,0.02121,0.0126],[0.03262,0.01849,0.0126],[0.03413,0.01563,0.01259],[0.03539,0.01265,0.01259],[0.03638,0.00957,0.01259],[0.03709,0.00642,0.01259],[0.03752,0.00322,0.01259],[0.03766,0.0,0.01259]],[[0.0,0.03734,0.02524],[0.00337,0.0372,0.02524],[0.00672,0.03678,0.02524],[0.01002,0.03607,0.02524],[0.01324,0.03509,0.02524],[0.01636,0.03384,0.02524],[0.01936,0.03234,0.02523],[0.0222,0.03059,0.02523],[0.02488,0.02861,0.02522],[0.02737,0.02641,0.02521],[0.02965,0.024,0.02521],[0.03171,0.02142,0.0252],[0.03352,0.01867,0.02519],[0.03508,0.01578,0.02519],[0.03638,0.01277,0.02518],[0.03739,0.00966,0.02518],[0.03812,0.00648,0.02517],[0.03856,0.00325,0.02517],[0.03871,0.0,0.02517]],[[0.0,0.03774,0.03844],[0.00347,0.0376,0.03844],[0.00692,0.03717,0.03844],[0.01031,0.03645,0.03843],[0.01363,0.03546,0.03843],[0.01684,0.0342,0.03842],[0.01992,0.03268,0.03842],[0.02286,0.03091,0.03841],[0.02561,0.02891,0.0384],[0.02818,0.02669,0.03839],[0.03052,0.02426,0.03838],[0.03264,0.02165,0.03837],[0.03451,0.01887,0.03836],[0.03611,0.01595,0.03835],[0.03744,0.01291,0.03834],[0.03849,0.00977,0.03833],[0.03924,0.00655,0.03833],[0.03969,0.00329,0.03832],[0.03984,0.0,0.03832]],[[0.0,0.03814,0.05106],[0.00357,0.038,0.05106],[0.00711,0.03756,0.05105],[0.0106,0.03684,0.05105],[0.01401,0.03584,0.05105],[0.01731,0.03457,0.05104],[0.02048,0.03303,0.05103],[0.0235,0.03124,0.05102],[0.02633,0.02922,0.05101],[0.02897,0.02697,0.051],[0.03138,0.02452,0.05098],[0.03356,0.02188,0.05097],[0.03548,0.01907,0.05095],[0.03713,0.01612,0.05094],[0.03849,0.01304,0.05092],[0.03957,0.00987,0.05091],[0.04034,0.00662,0.0509],[0.04081,0.00332,0.0509],[0.04096,0.0,0.0509]],[[0.0,0.03856,0.06368],[0.00367,0.03842,0.06368],[0.00732,0.03798,0.06367],[0.0109,0.03725,0.06367],[0.01441,0.03624,0.06366],[0.0178,0.03495,0.06365],[0.02106,0.0334,0.06364],[0.02416,0.03159,0.06363],[0.02708,0.02954,0.06361],[0.02979,0.02727,0.0636],[0.03227,0.02479,0.06358],[0.03451,0.02212,0.06356],[0.03648,0.01928,0.06354],[0.03818,0.0163,0.06352],[0.03958,0.01319,0.0635],[0.04069,0.00998,0.06349],[0.04148,0.0067,0.06348],[0.04196,0.00336,0.06347],[0.04212,0.0,0.06347]],[[0.0,0.039,0.0763],[0.00378,0.03886,0.07629],[0.00752,0.03841,0.07629],[0.01121,0.03767,0.07629],[0.01482,0.03665,0.07628],[0.01831,0.03535,0.07627],[0.02166,0.03378,0.07625],[0.02485,0.03195,0.07624],[0.02785,0.02988,0.07622],[0.03064,0.02758,0.07619],[0.03319,0.02507,0.07617],[0.03549,0.02237,0.07615],[0.03752,0.0195,0.07612],[0.03926,0.01648,0.0761],[0.04071,0.01334,0.07608],[0.04184,0.01009,0.07606],[0.04266,0.00677,0.07605],[0.04315,0.0034,0.07604],[0.04332,0.0,0.07604]],[[0.0,0.03949,0.08949],[0.00389,0.03934,0.08949],[0.00775,0.03889,0.08948],[0.01155,0.03814,0.08947],[0.01526,0.03711,0.08946],[0.01886,0.03579,0.08945],[0.02231,0.0342,0.08943],[0.02559,0.03235,0.08941],[0.02868,0.03025,0.08939],[0.03155,0.02792,0.08936],[0.03418,0.02538,0.08934],[0.03655,0.02265,0.08931],[0.03864,0.01974,0.08928],[0.04043,0.01669,0.08925],[0.04192,0.0135,0.08923],[0.04309,0.01022,0.0892],[0.04393,0.00686,0.08919],[0.04444,0.00344,0.08918],[0.04461,0.0,0.08918]],[[0.0,0.03997,0.1021],[0.004,0.03982,0.1021],[0.00797,0.03937,0.1021],[0.01188,0.03861,0.10209],[0.0157,0.03756,0.10208],[0.0194,0.03623,0.10206],[0.02295,0.03462,0.10204],[0.02633,0.03274,0.10202],[0.0295,0.03062,0.10199],[0.03245,0.02826,0.10196],[0.03516,0.02569,0.10192],[0.0376,0.02292,0.10189],[0.03975,0.01998,0.10186],[0.04159,0.01689,0.10182],[0.04312,0.01367,0.10179],[0.04433,0.01034,0.10177],[0.04519,0.00694,0.10175],[0.04572,0.00348,0.10174],[0.04589,0.0,0.10174]],[[0.0,0.04048,0.11472],[0.00412,0.04032,0.11472],[0.0082,0.03986,0.11471],[0.01222,0.0391,0.1147],[0.01615,0.03804,0.11469],[0.01996,0.03668,0.11467],[0.02361,0.03505,0.11465],[0.02709,0.03316,0.11462],[0.03035,0.03101,0.11459],[0.03339,0.02862,0.11455],[0.03617,0.02602,0.11451],[0.03868,0.02321,0.11447],[0.04089,0.02024,0.11443],[0.04279,0.0171,0.11439],[0.04437,0.01384,0.11436],[0.0456,0.01047,0.11433],[0.04649,0.00703,0.11431],[0.04703,0.00353,0.1143],[0.04721,0.0,0.11429]],[[0.0,0.041,0.12734],[0.00423,0.04085,0.12733],[0.00844,0.04038,0.12733],[0.01258,0.03961,0.12732],[0.01662,0.03853,0.1273],[0.02053,0.03716,0.12728],[0.02429,0.03551,0.12725],[0.02787,0.03359,0.12722],[0.03123,0.03141,0.12718],[0.03435,0.02899,0.12714],[0.03722,0.02635,0.12709],[0.0398,0.02351,0.12705],[0.04207,0.0205,0.127],[0.04403,0.01732,0.12696],[0.04565,0.01402,0.12692],[0.04692,0.01061,0.12689],[0.04784,0.00712,0.12687],[0.04839,0.00357,0.12685],[0.04857,0.0,0.12685]],[[0.0,0.04158,0.14052],[0.00436,0.04142,0.14052],[0.00869,0.04094,0.14051],[0.01296,0.04016,0.1405],[0.01712,0.03907,0.14048],[0.02116,0.03768,0.14046],[0.02503,0.036,0.14042],[0.02871,0.03405,0.14039],[0.03218,0.03185,0.14034],[0.0354,0.0294,0.1403],[0.03835,0.02672,0.14024],[0.041,0.02384,0.14019],[0.04335,0.02078,0.14014],[0.04536,0.01757,0.14009],[0.04703,0.01422,0.14005],[0.04834,0.01076,0.14001],[0.04929,0.00722,0.13999],[0.04985,0.00362,0.13997],[0.05005,0.0,0.13997]],[[0.0,0.04215,0.15314],[0.00449,0.04198,0.15313],[0.00895,0.0415,0.15313],[0.01333,0.04071,0.15311],[0.01762,0.0396,0.15309],[0.02177,0.0382,0.15306],[0.02576,0.0365,0.15302],[0.02955,0.03452,0.15298],[0.03311,0.03228,0.15293],[0.03643,0.0298,0.15288],[0.03946,0.02709,0.15282],[0.0422,0.02417,0.15276],[0.04461,0.02107,0.1527],[0.04668,0.01781,0.15265],[0.0484,0.01441,0.1526],[0.04975,0.0109,0.15256],[0.05072,0.00732,0.15253],[0.0513,0.00367,0.15251],[0.0515,0.0,0.15251]],[[0.0,0.04274,0.16575],[0.00462,0.04257,0.16575],[0.00921,0.04209,0.16574],[0.01372,0.04128,0.16572],[0.01814,0.04016,0.16569],[0.02241,0.03873,0.16566],[0.02651,0.03701,0.16562],[0.03041,0.035,0.16557],[0.03408,0.03273,0.16552],[0.03749,0.03021,0.16546],[0.04061,0.02746,0.16539],[0.04343,0.02451,0.16533],[0.04591,0.02136,0.16526],[0.04804,0.01805,0.1652],[0.04981,0.01461,0.16515],[0.0512,0.01106,0.16511],[0.0522,0.00742,0.16507],[0.0528,0.00372,0.16505],[0.053,0.0,0.16504]],[[0.0,0.04335,0.17836],[0.00476,0.04318,0.17836],[0.00948,0.04269,0.17835],[0.01413,0.04187,0.17833],[0.01867,0.04073,0.1783],[0.02307,0.03928,0.17826],[0.02729,0.03754,0.17822],[0.0313,0.0355,0.17816],[0.03508,0.0332,0.1781],[0.03859,0.03065,0.17803],[0.0418,0.02786,0.17796],[0.0447,0.02486,0.17789],[0.04725,0.02167,0.17782],[0.04945,0.01831,0.17775],[0.05127,0.01482,0.17769],[0.0527,0.01121,0.17764],[0.05372,0.00752,0.17761],[0.05434,0.00378,0.17758],[0.05455,0.0,0.17758]],[[0.0,0.04401,0.19155],[0.0049,0.04384,0.19154],[0.00977,0.04334,0.19153],[0.01456,0.04251,0.19151],[0.01924,0.04135,0.19148],[0.02377,0.03988,0.19143],[0.02813,0.03811,0.19138],[0.03227,0.03605,0.19132],[0.03616,0.03371,0.19125],[0.03977,0.03111,0.19118],[0.04309,0.02828,0.1911],[0.04607,0.02523,0.19102],[0.0487,0.022,0.19094],[0.05097,0.01859,0.19086],[0.05284,0.01504,0.1908],[0.05431,0.01138,0.19074],[0.05537,0.00764,0.1907],[0.05601,0.00383,0.19068],[0.05623,0.0,0.19067]],[[0.0,0.04467,0.20415],[0.00505,0.0445,0.20415],[0.01006,0.04399,0.20414],[0.01499,0.04314,0.20411],[0.01981,0.04197,0.20408],[0.02448,0.04048,0.20403],[0.02896,0.03868,0.20397],[0.03322,0.03658,0.20391],[0.03722,0.03421,0.20383],[0.04094,0.03158,0.20375],[0.04435,0.0287,0.20366],[0.04743,0.02561,0.20357],[0.05014,0.02232,0.20348],[0.05246,0.01887,0.2034],[0.05439,0.01527,0.20333],[0.05591,0.01155,0.20327],[0.057,0.00775,0.20322],[0.05766,0.00389,0.2032],[0.05788,0.0,0.20319]],[[0.0,0.04534,0.21676],[0.0052,0.04517,0.21676],[0.01035,0.04465,0.21674],[0.01543,0.0438,0.21671],[0.02039,0.04261,0.21668],[0.0252,0.04109,0.21662],[0.02981,0.03926,0.21656],[0.0342,0.03714,0.21649],[0.03832,0.03473,0.2164],[0.04215,0.03205,0.21631],[0.04566,0.02914,0.21621],[0.04882,0.026,0.21612],[0.05161,0.02266,0.21602],[0.05401,0.01915,0.21593],[0.056,0.0155,0.21585],[0.05756,0.01173,0.21579],[0.05868,0.00787,0.21574],[0.05936,0.00395,0.21571],[0.05958,0.0,0.2157]],[[0.0,0.04604,0.22937],[0.00535,0.04587,0.22936],[0.01066,0.04534,0.22935],[0.01589,0.04447,0.22932],[0.021,0.04326,0.22927],[0.02594,0.04173,0.22922],[0.03069,0.03987,0.22915],[0.03521,0.03771,0.22906],[0.03945,0.03526,0.22897],[0.0434,0.03255,0.22887],[0.04701,0.02959,0.22876],[0.05027,0.0264,0.22866],[0.05314,0.02301,0.22855],[0.05561,0.01945,0.22846],[0.05765,0.01574,0.22837],[0.05926,0.01191,0.2283],[0.06041,0.00799,0.22824],[0.06111,0.00401,0.22821],[0.06134,0.0,0.2282]],[[0.0,0.0468,0.24255],[0.00552,0.04662,0.24254],[0.01099,0.04609,0.24252],[0.01638,0.0452,0.24249],[0.02165,0.04398,0.24244],[0.02675,0.04241,0.24238],[0.03164,0.04052,0.2423],[0.0363,0.03833,0.24221],[0.04068,0.03584,0.24211],[0.04474,0.03308,0.242],[0.04847,0.03007,0.24188],[0.05182,0.02683,0.24176],[0.05479,0.02339,0.24165],[0.05733,0.01977,0.24154],[0.05944,0.016,0.24145],[0.06109,0.0121,0.24137],[0.06228,0.00812,0.24131],[0.063,0.00408,0.24128],[0.06324,0.0,0.24126]],[[0.0,0.04755,0.25515],[0.00568,0.04737,0.25515],[0.01132,0.04682,0.25512],[0.01687,0.04592,0.25509],[0.02229,0.04468,0.25503],[0.02754,0.04309,0.25497],[0.03258,0.04117,0.25488],[0.03738,0.03894,0.25478],[0.04188,0.03641,0.25467],[0.04607,0.03361,0.25455],[0.04991,0.03055,0.25442],[0.05336,0.02726,0.25429],[0.05641,0.02376,0.25417],[0.05903,0.02008,0.25405],[0.0612,0.01625,0.25395],[0.0629,0.0123,0.25387],[0.06413,0.00825,0.2538],[0.06487,0.00414,0.25376],[0.06512,0.0,0.25375]],[[0.0,0.04832,0.26776],[0.00585,0.04813,0.26775],[0.01165,0.04758,0.26772],[0.01737,0.04667,0.26768],[0.02295,0.0454,0.26763],[0.02836,0.04378,0.26755],[0.03355,0.04184,0.26746],[0.03849,0.03957,0.26735],[0.04313,0.037,0.26722],[0.04744,0.03415,0.26709],[0.05139,0.03104,0.26695],[0.05495,0.0277,0.26681],[0.05809,0.02414,0.26668],[0.06078,0.0204,0.26655],[0.06302,0.01651,0.26644],[0.06477,0.01249,0.26635],[0.06604,0.00838,0.26628],[0.0668,0.00421,0.26624],[0.06705,0.0,0.26623]],[[0.0,0.04911,0.28036],[0.00602,0.04892,0.28035],[0.012,0.04836,0.28032],[0.01789,0.04743,0.28028],[0.02364,0.04614,0.28021],[0.02921,0.0445,0.28013],[0.03455,0.04252,0.28003],[0.03964,0.04022,0.27991],[0.04442,0.03761,0.27978],[0.04885,0.03471,0.27963],[0.05292,0.03155,0.27948],[0.05658,0.02815,0.27933],[0.05982,0.02454,0.27918],[0.06259,0.02074,0.27905],[0.06489,0.01678,0.27893],[0.0667,0.0127,0.27883],[0.068,0.00852,0.27876],[0.06878,0.00428,0.27871],[0.06905,0.0,0.2787]],[[0.0,0.04996,0.29353],[0.00621,0.04977,0.29352],[0.01238,0.0492,0.29349],[0.01845,0.04826,0.29344],[0.02438,0.04695,0.29337],[0.03012,0.04528,0.29328],[0.03563,0.04326,0.29317],[0.04087,0.04092,0.29304],[0.0458,0.03826,0.29289],[0.05038,0.03531,0.29274],[0.05457,0.0321,0.29257],[0.05835,0.02864,0.29241],[0.06168,0.02496,0.29225],[0.06454,0.0211,0.2921],[0.06692,0.01707,0.29197],[0.06878,0.01292,0.29186],[0.07012,0.00867,0.29179],[0.07093,0.00435,0.29174],[0.0712,0.0,0.29172]],[[0.0,0.0508,0.30613],[0.0064,0.05061,0.30612],[0.01275,0.05003,0.30609],[0.019,0.04907,0.30603],[0.02511,0.04774,0.30596],[0.03102,0.04604,0.30586],[0.0367,0.04399,0.30574],[0.0421,0.0416,0.30559],[0.04717,0.0389,0.30543],[0.05188,0.03591,0.30526],[0.0562,0.03264,0.30509],[0.06009,0.02912,0.30491],[0.06352,0.02538,0.30474],[0.06647,0.02145,0.30458],[0.06891,0.01736,0.30444],[0.07083,0.01313,0.30432],[0.07221,0.00881,0.30424],[0.07304,0.00442,0.30418],[0.07332,0.0,0.30417]],[[0.0,0.05167,0.31873],[0.00659,0.05147,0.31871],[0.01313,0.05088,0.31868],[0.01957,0.04991,0.31862],[0.02586,0.04855,0.31854],[0.03195,0.04682,0.31843],[0.0378,0.04474,0.3183],[0.04335,0.04231,0.31814],[0.04858,0.03956,0.31797],[0.05344,0.03652,0.31779],[0.05788,0.03319,0.31759],[0.06189,0.02961,0.3174],[0.06542,0.02581,0.31722],[0.06846,0.02181,0.31704],[0.07097,0.01765,0.31689],[0.07294,0.01336,0.31677],[0.07437,0.00896,0.31668],[0.07522,0.0045,0.31662],[0.07551,0.0,0.3166]],[[0.0,0.05256,0.33132],[0.00679,0.05236,0.33131],[0.01352,0.05176,0.33127],[0.02016,0.05077,0.33121],[0.02663,0.04939,0.33112],[0.03291,0.04763,0.331],[0.03893,0.04551,0.33085],[0.04465,0.04304,0.33069],[0.05004,0.04025,0.3305],[0.05504,0.03714,0.3303],[0.05961,0.03376,0.33009],[0.06374,0.03012,0.32988],[0.06738,0.02625,0.32969],[0.0705,0.02219,0.3295],[0.07309,0.01795,0.32934],[0.07512,0.01359,0.32921],[0.07659,0.00911,0.32911],[0.07747,0.00457,0.32905],[0.07776,0.0,0.32902]],[[0.0,0.05352,0.34449],[0.007,0.05332,0.34447],[0.01395,0.0527,0.34443],[0.02079,0.05169,0.34436],[0.02747,0.05029,0.34426],[0.03394,0.0485,0.34413],[0.04015,0.04634,0.34398],[0.04605,0.04382,0.3438],[0.0516,0.04098,0.34359],[0.05676,0.03782,0.34338],[0.06148,0.03437,0.34315],[0.06574,0.03067,0.34293],[0.06949,0.02673,0.34271],[0.07271,0.02259,0.34251],[0.07538,0.01828,0.34234],[0.07747,0.01383,0.34219],[0.07898,0.00928,0.34209],[0.07989,0.00466,0.34202],[0.0802,0.0,0.342]],[[0.0,0.05446,0.35708],[0.00721,0.05425,0.35706],[0.01437,0.05363,0.35702],[0.02141,0.0526,0.35694],[0.02829,0.05117,0.35683],[0.03496,0.04935,0.35669],[0.04136,0.04715,0.35652],[0.04744,0.04459,0.35633],[0.05315,0.0417,0.35611],[0.05846,0.03848,0.35588],[0.06333,0.03498,0.35563],[0.06771,0.03121,0.35539],[0.07157,0.0272,0.35516],[0.07489,0.02299,0.35495],[0.07764,0.0186,0.35476],[0.07979,0.01407,0.3546],[0.08135,0.00944,0.35449],[0.08228,0.00474,0.35442],[0.0826,0.0,0.3544]],[[0.0,0.05543,0.36967],[0.00743,0.05522,0.36965],[0.0148,0.05459,0.3696],[0.02206,0.05354,0.36952],[0.02914,0.05208,0.3694],[0.03601,0.05023,0.36925],[0.0426,0.04799,0.36907],[0.04886,0.04539,0.36886],[0.05475,0.04244,0.36862],[0.06022,0.03917,0.36837],[0.06523,0.0356,0.36811],[0.06974,0.03176,0.36785],[0.07371,0.02768,0.3676],[0.07713,0.02339,0.36737],[0.07996,0.01893,0.36717],[0.08218,0.01432,0.367],[0.08378,0.00961,0.36688],[0.08475,0.00482,0.3668],[0.08507,0.0,0.36678]],[[0.0,0.05643,0.38225],[0.00765,0.05621,0.38224],[0.01524,0.05557,0.38218],[0.02272,0.0545,0.38209],[0.03002,0.05301,0.38197],[0.03709,0.05113,0.3818],[0.04388,0.04885,0.38161],[0.05033,0.0462,0.38138],[0.05639,0.0432,0.38112],[0.06203,0.03987,0.38085],[0.06718,0.03623,0.38057],[0.07183,0.03233,0.38029],[0.07592,0.02817,0.38002],[0.07944,0.02381,0.37978],[0.08236,0.01927,0.37956],[0.08465,0.01458,0.37938],[0.08629,0.00978,0.37925],[0.08729,0.00491,0.37917],[0.08762,0.0,0.37914]],[[0.0,0.05749,0.39541],[0.00789,0.05727,0.39539],[0.01572,0.05662,0.39533],[0.02343,0.05553,0.39524],[0.03097,0.05402,0.3951],[0.03826,0.05209,0.39492],[0.04526,0.04977,0.39471],[0.05191,0.04707,0.39446],[0.05817,0.04401,0.39418],[0.06398,0.04062,0.39389],[0.06929,0.03692,0.39359],[0.07408,0.03294,0.39329],[0.07831,0.02871,0.393],[0.08194,0.02426,0.39273],[0.08494,0.01963,0.3925],[0.0873,0.01485,0.39231],[0.089,0.00996,0.39217],[0.09002,0.005,0.39208],[0.09037,0.0,0.39205]],[[0.0,0.05854,0.40799],[0.00813,0.05832,0.40797],[0.0162,0.05765,0.40791],[0.02414,0.05654,0.4078],[0.0319,0.055,0.40766],[0.03941,0.05304,0.40746],[0.04662,0.05068,0.40723],[0.05347,0.04793,0.40697],[0.05992,0.04481,0.40667],[0.0659,0.04136,0.40635],[0.07138,0.03759,0.40603],[0.07631,0.03353,0.40571],[0.08066,0.02923,0.4054],[0.08439,0.0247,0.40511],[0.08749,0.01999,0.40487],[0.08992,0.01512,0.40466],[0.09167,0.01014,0.40451],[0.09272,0.00509,0.40442],[0.09307,0.0,0.40439]],[[0.0,0.05962,0.42057],[0.00837,0.0594,0.42055],[0.01669,0.05871,0.42048],[0.02487,0.05759,0.42037],[0.03286,0.05602,0.42021],[0.0406,0.05402,0.42],[0.04803,0.05161,0.41975],[0.05508,0.04881,0.41946],[0.06172,0.04564,0.41915],[0.06788,0.04212,0.41881],[0.07352,0.03828,0.41846],[0.0786,0.03415,0.41811],[0.08308,0.02976,0.41778],[0.08693,0.02515,0.41748],[0.09011,0.02035,0.41721],[0.09262,0.0154,0.417],[0.09442,0.01033,0.41683],[0.0955,0.00518,0.41673],[0.09586,0.0,0.4167]],[[0.0,0.06073,0.43315],[0.00863,0.0605,0.43313],[0.01719,0.0598,0.43305],[0.02562,0.05865,0.43293],[0.03385,0.05706,0.43276],[0.04182,0.05502,0.43254],[0.04947,0.05257,0.43227],[0.05674,0.04971,0.43196],[0.06357,0.04648,0.43161],[0.06992,0.0429,0.43125],[0.07573,0.03899,0.43088],[0.08096,0.03478,0.43051],[0.08558,0.03031,0.43015],[0.08954,0.02561,0.42983],[0.09282,0.02073,0.42954],[0.09539,0.01568,0.42931],[0.09725,0.01052,0.42914],[0.09837,0.00528,0.42903],[0.09874,0.0,0.429]],[[0.0,0.06192,0.4463],[0.0089,0.06168,0.44627],[0.01773,0.06097,0.44619],[0.02643,0.0598,0.44606],[0.03492,0.05817,0.44587],[0.04314,0.0561,0.44563],[0.05103,0.05359,0.44534],[0.05853,0.05068,0.44501],[0.06558,0.04739,0.44464],[0.07212,0.04373,0.44425],[0.07811,0.03974,0.44384],[0.08351,0.03546,0.44345],[0.08826,0.0309,0.44307],[0.09235,0.02611,0.44272],[0.09573,0.02113,0.44241],[0.09839,0.01599,0.44216],[0.1003,0.01072,0.44198],[0.10145,0.00538,0.44187],[0.10184,0.0,0.44183]],[[0.0,0.06308,0.45887],[0.00917,0.06284,0.45884],[0.01827,0.06212,0.45876],[0.02722,0.06093,0.45861],[0.03597,0.05927,0.45841],[0.04444,0.05715,0.45815],[0.05257,0.0546,0.45784],[0.06029,0.05164,0.45748],[0.06755,0.04828,0.45708],[0.07429,0.04455,0.45666],[0.08046,0.04049,0.45623],[0.08602,0.03612,0.45581],[0.09091,0.03148,0.4554],[0.09512,0.0266,0.45503],[0.0986,0.02152,0.4547],[0.10134,0.01628,0.45444],[0.10331,0.01092,0.45424],[0.10449,0.00548,0.45412],[0.10489,0.0,0.45408]],[[0.0,0.06428,0.47144],[0.00944,0.06404,0.47141],[0.01882,0.0633,0.47132],[0.02804,0.06208,0.47116],[0.03705,0.06039,0.47095],[0.04578,0.05823,0.47067],[0.05415,0.05564,0.47033],[0.06211,0.05261,0.46994],[0.06958,0.04919,0.46952],[0.07652,0.04539,0.46907],[0.08288,0.04125,0.46861],[0.0886,0.0368,0.46815],[0.09364,0.03207,0.46772],[0.09797,0.0271,0.46732],[0.10156,0.02193,0.46698],[0.10438,0.01659,0.46669],[0.1064,0.01113,0.46648],[0.10762,0.00559,0.46635],[0.10803,0.0,0.46631]],[[0.0,0.06551,0.48401],[0.00973,0.06526,0.48397],[0.01938,0.06451,0.48387],[0.02889,0.06327,0.48371],[0.03817,0.06154,0.48347],[0.04716,0.05934,0.48317],[0.05578,0.0567,0.48281],[0.06398,0.05361,0.4824],[0.07168,0.05012,0.48194],[0.07883,0.04625,0.48146],[0.08537,0.04203,0.48097],[0.09126,0.0375,0.48048],[0.09645,0.03268,0.48002],[0.10091,0.02761,0.47959],[0.10461,0.02234,0.47922],[0.10751,0.0169,0.47892],[0.10959,0.01134,0.4787],[0.11085,0.00569,0.47856],[0.11127,0.0,0.47851]],[[0.0,0.06682,0.49714],[0.01004,0.06657,0.49711],[0.02,0.0658,0.497],[0.0298,0.06454,0.49682],[0.03938,0.06278,0.49657],[0.04865,0.06054,0.49624],[0.05754,0.05783,0.49585],[0.06599,0.05469,0.49541],[0.07393,0.05113,0.49492],[0.08131,0.04718,0.4944],[0.08805,0.04287,0.49387],[0.09413,0.03824,0.49335],[0.09948,0.03333,0.49286],[0.10408,0.02816,0.4924],[0.10789,0.02279,0.492],[0.11088,0.01724,0.49168],[0.11303,0.01156,0.49144],[0.11432,0.0058,0.49129],[0.11476,0.0,0.49124]],[[0.0,0.06812,0.5097],[0.01034,0.06786,0.50966],[0.0206,0.06708,0.50955],[0.0307,0.06578,0.50936],[0.04056,0.06399,0.50908],[0.05011,0.0617,0.50874],[0.05927,0.05895,0.50832],[0.06798,0.05574,0.50784],[0.07616,0.05211,0.50732],[0.08375,0.04809,0.50676],[0.0907,0.0437,0.5062],[0.09695,0.03898,0.50564],[0.10247,0.03397,0.50511],[0.1072,0.0287,0.50463],[0.11112,0.02322,0.5042],[0.1142,0.01757,0.50386],[0.11641,0.01179,0.5036],[0.11775,0.00591,0.50345],[0.11819,0.0,0.50339]],[[0.0,0.06944,0.52226],[0.01065,0.06917,0.52222],[0.02122,0.06838,0.52209],[0.03163,0.06706,0.52189],[0.04179,0.06523,0.52159],[0.05162,0.0629,0.52122],[0.06106,0.06009,0.52077],[0.07002,0.05682,0.52026],[0.07845,0.05312,0.5197],[0.08627,0.04901,0.51911],[0.09342,0.04454,0.51851],[0.09986,0.03973,0.51791],[0.10554,0.03462,0.51735],[0.11041,0.02925,0.51683],[0.11445,0.02367,0.51638],[0.11762,0.01791,0.51601],[0.1199,0.01201,0.51574],[0.12127,0.00603,0.51557],[0.12173,0.0,0.51552]],[[0.0,0.0708,0.53481],[0.01097,0.07053,0.53477],[0.02186,0.06972,0.53463],[0.03258,0.06837,0.53441],[0.04305,0.0665,0.5341],[0.05318,0.06413,0.5337],[0.0629,0.06126,0.53322],[0.07213,0.05793,0.53267],[0.08081,0.05415,0.53207],[0.08886,0.04997,0.53144],[0.09623,0.0454,0.53079],[0.10286,0.0405,0.53016],[0.1087,0.03529,0.52956],[0.11372,0.02982,0.52901],[0.11787,0.02413,0.52853],[0.12114,0.01825,0.52813],[0.12348,0.01224,0.52784],[0.1249,0.00614,0.52767],[0.12537,0.0,0.52761]],[[0.0,0.07225,0.54793],[0.01132,0.07198,0.54788],[0.02255,0.07115,0.54774],[0.03361,0.06978,0.5475],[0.0444,0.06787,0.54716],[0.05485,0.06544,0.54673],[0.06488,0.06252,0.54622],[0.0744,0.05911,0.54563],[0.08335,0.05526,0.54499],[0.09165,0.05099,0.54431],[0.09925,0.04633,0.54362],[0.10608,0.04132,0.54294],[0.11211,0.03601,0.54229],[0.11728,0.03043,0.54171],[0.12156,0.02461,0.54119],[0.12492,0.01862,0.54077],[0.12734,0.01249,0.54047],[0.1288,0.00627,0.54028],[0.12929,0.0,0.54021]],[[0.0,0.07368,0.56048],[0.01166,0.0734,0.56043],[0.02323,0.07255,0.56027],[0.03462,0.07115,0.56001],[0.04574,0.06921,0.55965],[0.0565,0.06673,0.55919],[0.06683,0.06375,0.55864],[0.07664,0.06027,0.55801],[0.08585,0.05634,0.55732],[0.0944,0.05199,0.5566],[0.10222,0.04724,0.55586],[0.10926,0.04213,0.55514],[0.11546,0.03671,0.55445],[0.12079,0.03102,0.55382],[0.1252,0.02509,0.55328],[0.12866,0.01898,0.55283],[0.13115,0.01273,0.5525],[0.13264,0.00639,0.5523],[0.13315,0.0,0.55223]],[[0.0,0.07514,0.57302],[0.01201,0.07485,0.57296],[0.02393,0.07399,0.5728],[0.03566,0.07256,0.57252],[0.04712,0.07058,0.57214],[0.0582,0.06805,0.57164],[0.06884,0.06501,0.57105],[0.07894,0.06146,0.57038],[0.08843,0.05746,0.56964],[0.09723,0.05301,0.56887],[0.10528,0.04817,0.56809],[0.11253,0.04296,0.56731],[0.11892,0.03743,0.56658],[0.1244,0.03163,0.56591],[0.12894,0.02559,0.56533],[0.1325,0.01936,0.56486],[0.13506,0.01298,0.56451],[0.1366,0.00652,0.56429],[0.13712,0.0,0.56422]],[[0.0,0.07664,0.58555],[0.01237,0.07635,0.5855],[0.02465,0.07547,0.58532],[0.03674,0.07401,0.58502],[0.04854,0.07198,0.58461],[0.05996,0.06941,0.58408],[0.07091,0.0663,0.58345],[0.08131,0.06268,0.58273],[0.09108,0.05859,0.58195],[0.10014,0.05406,0.58112],[0.10844,0.04912,0.58028],[0.1159,0.04381,0.57946],[0.12247,0.03817,0.57868],[0.12811,0.03225,0.57797],[0.13278,0.02609,0.57735],[0.13645,0.01974,0.57684],[0.13908,0.01324,0.57647],[0.14067,0.00664,0.57624],[0.1412,0.0,0.57617]],[[0.0,0.07818,0.59809],[0.01275,0.07788,0.59802],[0.02539,0.07698,0.59784],[0.03784,0.07549,0.59752],[0.05,0.07342,0.59707],[0.06176,0.07079,0.59651],[0.07304,0.06762,0.59583],[0.08375,0.06393,0.59507],[0.09381,0.05976,0.59423],[0.10314,0.05513,0.59335],[0.11168,0.05009,0.59245],[0.11936,0.04467,0.59158],[0.12613,0.03892,0.59075],[0.13194,0.03289,0.58999],[0.13674,0.0266,0.58933],[0.14051,0.02012,0.58879],[0.14323,0.0135,0.5884],[0.14486,0.00677,0.58815],[0.14541,0.0,0.58807]],[[0.0,0.07982,0.61118],[0.01315,0.07952,0.61112],[0.02619,0.0786,0.61091],[0.03903,0.07708,0.61057],[0.05157,0.07497,0.6101],[0.0637,0.07228,0.60949],[0.07533,0.06904,0.60877],[0.08638,0.06527,0.60794],[0.09675,0.06101,0.60705],[0.10637,0.05628,0.60611],[0.11518,0.05113,0.60515],[0.12309,0.0456,0.60421],[0.13007,0.03973,0.60333],[0.13605,0.03357,0.60252],[0.141,0.02715,0.60182],[0.14489,0.02054,0.60124],[0.14768,0.01378,0.60082],[0.14937,0.00691,0.60056],[0.14993,0.0,0.60047]],[[0.0,0.08143,0.62371],[0.01354,0.08112,0.62364],[0.02698,0.08019,0.62342],[0.04021,0.07863,0.62305],[0.05312,0.07648,0.62254],[0.06561,0.07373,0.62189],[0.07759,0.07043,0.62112],[0.08897,0.06658,0.62024],[0.09965,0.06223,0.61929],[0.10956,0.05741,0.61828],[0.11862,0.05216,0.61726],[0.12676,0.04651,0.61627],[0.13394,0.04052,0.61532],[0.1401,0.03423,0.61446],[0.1452,0.02769,0.61372],[0.1492,0.02095,0.61311],[0.15207,0.01405,0.61266],[0.1538,0.00705,0.61238],[0.15438,0.0,0.61229]],[[0.0,0.08309,0.63623],[0.01395,0.08277,0.63615],[0.02779,0.08181,0.63592],[0.04142,0.08023,0.63553],[0.05471,0.07802,0.63498],[0.06758,0.07522,0.63429],[0.07992,0.07185,0.63346],[0.09163,0.06792,0.63252],[0.10263,0.06348,0.6315],[0.11283,0.05856,0.63043],[0.12216,0.0532,0.62935],[0.13054,0.04744,0.62829],[0.13793,0.04133,0.62728],[0.14427,0.03492,0.62637],[0.14951,0.02824,0.62557],[0.15362,0.02137,0.62493],[0.15658,0.01433,0.62445],[0.15837,0.00719,0.62415],[0.15896,0.0,0.62406]],[[0.0,0.08478,0.64874],[0.01437,0.08445,0.64866],[0.02863,0.08348,0.64841],[0.04266,0.08186,0.64799],[0.05636,0.07961,0.64741],[0.06961,0.07675,0.64666],[0.08232,0.0733,0.64578],[0.09438,0.0693,0.64478],[0.1057,0.06476,0.64369],[0.1162,0.05974,0.64255],[0.1258,0.05427,0.6414],[0.13443,0.04839,0.64027],[0.14203,0.04216,0.6392],[0.14855,0.03561,0.63823],[0.15395,0.02881,0.63738],[0.15818,0.02179,0.6367],[0.16122,0.01462,0.63619],[0.16306,0.00733,0.63588],[0.16367,0.0,0.63577]],[[0.0,0.08659,0.66181],[0.01482,0.08626,0.66173],[0.02953,0.08526,0.66146],[0.044,0.08361,0.66101],[0.05813,0.08131,0.66038],[0.07179,0.07839,0.65959],[0.08489,0.07486,0.65864],[0.09733,0.07077,0.65757],[0.109,0.06614,0.65641],[0.11982,0.061,0.65519],[0.12972,0.05542,0.65396],[0.13861,0.04941,0.65276],[0.14644,0.04305,0.65162],[0.15316,0.03636,0.65058],[0.15872,0.02941,0.64968],[0.16308,0.02225,0.64895],[0.16621,0.01492,0.6484],[0.1681,0.00749,0.64807],[0.16873,0.0,0.64796]],[[0.0,0.08837,0.67431],[0.01527,0.08803,0.67422],[0.03041,0.08701,0.67393],[0.04532,0.08532,0.67346],[0.05987,0.08297,0.67279],[0.07394,0.07999,0.67194],[0.08743,0.07639,0.67093],[0.10024,0.07221,0.66979],[0.11225,0.06748,0.66855],[0.12339,0.06224,0.66725],[0.13357,0.05654,0.66594],[0.14273,0.05041,0.66466],[0.15079,0.04391,0.66345],[0.1577,0.03709,0.66234],[0.16342,0.03,0.66139],[0.1679,0.02269,0.66061],[0.17112,0.01522,0.66003],[0.17307,0.00764,0.65968],[0.17372,0.0,0.65956]],[[0.0,0.09019,0.68681],[0.01573,0.08984,0.68671],[0.03133,0.0888,0.6864],[0.04668,0.08707,0.68589],[0.06166,0.08467,0.68518],[0.07616,0.08163,0.68427],[0.09005,0.07795,0.68319],[0.10323,0.07368,0.68198],[0.1156,0.06885,0.68066],[0.12706,0.06351,0.67928],[0.13754,0.05768,0.67788],[0.14696,0.05143,0.67652],[0.15525,0.0448,0.67523],[0.16236,0.03784,0.67406],[0.16824,0.03061,0.67304],[0.17286,0.02315,0.67221],[0.17617,0.01553,0.6716],[0.17817,0.00779,0.67123],[0.17884,0.0,0.6711]],[[0.0,0.09205,0.6993],[0.0162,0.09169,0.69919],[0.03227,0.09063,0.69886],[0.04808,0.08887,0.69832],[0.06351,0.08642,0.69755],[0.07844,0.0833,0.69659],[0.09274,0.07955,0.69544],[0.10631,0.07519,0.69414],[0.11904,0.07026,0.69274],[0.13084,0.0648,0.69127],[0.14162,0.05885,0.68978],[0.15132,0.05247,0.68833],[0.15985,0.04571,0.68696],[0.16716,0.0386,0.68572],[0.17321,0.03122,0.68464],[0.17795,0.02361,0.68376],[0.18136,0.01584,0.68311],[0.18341,0.00795,0.68271],[0.1841,0.0,0.68258]],[[0.0,0.09404,0.71235],[0.01671,0.09368,0.71223],[0.03328,0.09259,0.71188],[0.04959,0.09079,0.71129],[0.0655,0.08829,0.71048],[0.08089,0.0851,0.70944],[0.09563,0.08126,0.70822],[0.10962,0.07681,0.70683],[0.12274,0.07176,0.70533],[0.1349,0.06618,0.70376],[0.14602,0.06011,0.70218],[0.156,0.05359,0.70063],[0.16479,0.04667,0.69917],[0.17232,0.03942,0.69785],[0.17854,0.03188,0.6967],[0.18343,0.02411,0.69576],[0.18694,0.01617,0.69507],[0.18905,0.00811,0.69465],[0.18976,0.0,0.69451]],[[0.0,0.096,0.72482],[0.01721,0.09563,0.7247],[0.03428,0.09451,0.72432],[0.05107,0.09267,0.7237],[0.06746,0.09011,0.72283],[0.0833,0.08686,0.72172],[0.09848,0.08294,0.72041],[0.11288,0.07839,0.71894],[0.12639,0.07324,0.71734],[0.1389,0.06754,0.71568],[0.15034,0.06134,0.71399],[0.16061,0.05468,0.71235],[0.16964,0.04762,0.7108],[0.17739,0.04022,0.70939],[0.18379,0.03253,0.70817],[0.18881,0.0246,0.70717],[0.19242,0.0165,0.70644],[0.1946,0.00828,0.70599],[0.19532,0.0,0.70584]],[[0.0,0.098,0.73729],[0.01772,0.09762,0.73715],[0.0353,0.09648,0.73676],[0.0526,0.0946,0.73609],[0.06947,0.09199,0.73516],[0.08579,0.08866,0.73398],[0.10142,0.08466,0.73259],[0.11624,0.08,0.73102],[0.13014,0.07474,0.72932],[0.14302,0.06892,0.72754],[0.15478,0.06259,0.72575],[0.16534,0.05579,0.72401],[0.17464,0.04859,0.72236],[0.1826,0.04104,0.72086],[0.18919,0.03318,0.71957],[0.19435,0.0251,0.71851],[0.19806,0.01683,0.71774],[0.20029,0.00844,0.71726],[0.20104,0.0,0.7171]],[[0.0,0.10005,0.74975],[0.01825,0.09966,0.74961],[0.03636,0.0985,0.74918],[0.05417,0.09657,0.74847],[0.07154,0.0939,0.74748],[0.08834,0.0905,0.74622],[0.10444,0.08641,0.74474],[0.11969,0.08166,0.74306],[0.134,0.07629,0.74126],[0.14725,0.07034,0.73937],[0.15935,0.06387,0.73747],[0.17021,0.05693,0.73561],[0.17977,0.04958,0.73386],[0.18796,0.04187,0.73227],[0.19473,0.03386,0.7309],[0.20003,0.0256,0.72978],[0.20385,0.01717,0.72895],[0.20614,0.00862,0.72845],[0.20691,0.0,0.72828]],[[0.0,0.10224,0.76276],[0.01882,0.10184,0.76261],[0.03749,0.10066,0.76216],[0.05586,0.09869,0.76139],[0.07378,0.09595,0.76033],[0.0911,0.09248,0.75899],[0.10768,0.08829,0.75741],[0.12341,0.08343,0.75562],[0.13815,0.07793,0.75369],[0.1518,0.07186,0.75168],[0.16426,0.06524,0.74966],[0.17545,0.05815,0.74768],[0.18529,0.05064,0.74581],[0.19372,0.04276,0.74412],[0.20068,0.03458,0.74266],[0.20614,0.02615,0.74147],[0.21006,0.01753,0.74059],[0.21243,0.0088,0.74006],[0.21322,0.0,0.73987]],[[0.0,0.10439,0.77521],[0.01938,0.10398,0.77504],[0.03861,0.10277,0.77456],[0.05753,0.10076,0.77375],[0.07597,0.09796,0.77262],[0.09381,0.09441,0.77119],[0.11088,0.09013,0.7695],[0.12706,0.08516,0.7676],[0.14223,0.07955,0.76555],[0.15627,0.07334,0.76341],[0.16909,0.06659,0.76126],[0.18059,0.05934,0.75916],[0.19071,0.05167,0.75718],[0.19937,0.04363,0.75538],[0.20653,0.03528,0.75383],[0.21214,0.02668,0.75257],[0.21617,0.01789,0.75164],[0.2186,0.00898,0.75107],[0.21941,0.0,0.75088]],[[0.0,0.10659,0.78764],[0.01996,0.10617,0.78747],[0.03976,0.10493,0.78695],[0.05924,0.10287,0.78608],[0.07824,0.10002,0.78488],[0.09659,0.09638,0.78336],[0.11417,0.09201,0.78156],[0.13082,0.08693,0.77954],[0.14643,0.0812,0.77736],[0.16087,0.07485,0.77508],[0.17405,0.06796,0.7728],[0.18588,0.06056,0.77057],[0.19628,0.05273,0.76847],[0.20519,0.04452,0.76656],[0.21254,0.036,0.76491],[0.21831,0.02722,0.76358],[0.22245,0.01825,0.76259],[0.22494,0.00916,0.76199],[0.22577,0.0,0.76178]],[[0.0,0.10884,0.80006],[0.02056,0.10842,0.79988],[0.04095,0.10715,0.79933],[0.06101,0.10504,0.7984],[0.08056,0.10212,0.79712],[0.09946,0.09841,0.7955],[0.11755,0.09393,0.79359],[0.13469,0.08874,0.79144],[0.15074,0.08288,0.78912],[0.1656,0.0764,0.7867],[0.17915,0.06936,0.78427],[0.19132,0.0618,0.78191],[0.20201,0.05381,0.77968],[0.21116,0.04543,0.77766],[0.21871,0.03673,0.77591],[0.22464,0.02777,0.77449],[0.22889,0.01862,0.77345],[0.23145,0.00934,0.7728],[0.23231,0.0,0.77259]],[[0.0,0.11125,0.81304],[0.0212,0.11082,0.81285],[0.04223,0.10952,0.81225],[0.0629,0.10736,0.81127],[0.08307,0.10437,0.8099],[0.10255,0.10057,0.80817],[0.12119,0.09599,0.80612],[0.13884,0.09068,0.80383],[0.15538,0.08468,0.80136],[0.17068,0.07806,0.79879],[0.18464,0.07085,0.7962],[0.19715,0.06313,0.79368],[0.20815,0.05496,0.79131],[0.21757,0.0464,0.78916],[0.22534,0.03751,0.7873],[0.23143,0.02836,0.7858],[0.2358,0.01901,0.78468],[0.23844,0.00954,0.784],[0.23931,0.0,0.78377]],[[0.0,0.11361,0.82545],[0.02183,0.11317,0.82524],[0.04348,0.11184,0.82461],[0.06477,0.10963,0.82355],[0.08553,0.10657,0.82209],[0.10558,0.10269,0.82025],[0.12477,0.09801,0.81808],[0.14293,0.09258,0.81564],[0.15995,0.08645,0.81302],[0.17568,0.07967,0.81029],[0.19003,0.07231,0.80754],[0.20289,0.06443,0.80487],[0.21419,0.05608,0.80235],[0.22387,0.04734,0.80007],[0.23185,0.03827,0.7981],[0.2381,0.02893,0.7965],[0.24259,0.0194,0.79532],[0.2453,0.00973,0.7946],[0.2462,0.0,0.79436]],[[0.0,0.11603,0.83784],[0.02248,0.11557,0.83762],[0.04478,0.11421,0.83694],[0.0667,0.11196,0.83582],[0.08807,0.10883,0.83427],[0.10871,0.10485,0.83231],[0.12845,0.10007,0.83],[0.14714,0.09451,0.82741],[0.16464,0.08825,0.82462],[0.18081,0.08133,0.82172],[0.19556,0.07381,0.8188],[0.20878,0.06575,0.81597],[0.2204,0.05723,0.8133],[0.23033,0.04831,0.81088],[0.23853,0.03905,0.80879],[0.24495,0.02952,0.8071],[0.24956,0.01979,0.80585],[0.25233,0.00993,0.80508],[0.25326,0.0,0.80483]],[[0.0,0.1185,0.85022],[0.02315,0.11804,0.84998],[0.04611,0.11664,0.84927],[0.06868,0.11434,0.84807],[0.09068,0.11114,0.84642],[0.11192,0.10707,0.84433],[0.13223,0.10217,0.84188],[0.15146,0.09649,0.83912],[0.16946,0.09009,0.83616],[0.18609,0.08301,0.83308],[0.20125,0.07533,0.82999],[0.21483,0.06711,0.82698],[0.22676,0.0584,0.82415],[0.23696,0.04929,0.82159],[0.24538,0.03984,0.81937],[0.25197,0.03012,0.81758],[0.2567,0.02019,0.81625],[0.25955,0.01013,0.81544],[0.2605,0.0,0.81517]],[[0.0,0.12115,0.86315],[0.02387,0.12067,0.8629],[0.04754,0.11925,0.86213],[0.07081,0.11688,0.86086],[0.09348,0.1136,0.85909],[0.11537,0.10944,0.85687],[0.1363,0.10442,0.85425],[0.15611,0.09861,0.85132],[0.17464,0.09206,0.84816],[0.19176,0.08482,0.84488],[0.20736,0.07696,0.84159],[0.22133,0.06855,0.83839],[0.23359,0.05965,0.83538],[0.24408,0.05034,0.83266],[0.25273,0.04069,0.83031],[0.2595,0.03076,0.8284],[0.26436,0.02062,0.827],[0.26729,0.01034,0.82613],[0.26826,0.0,0.82584]],[[0.0,0.12374,0.87551],[0.02458,0.12325,0.87524],[0.04895,0.12179,0.87443],[0.0729,0.11938,0.87307],[0.09624,0.11602,0.87119],[0.11877,0.11175,0.86882],[0.14031,0.10663,0.86604],[0.16068,0.10068,0.86292],[0.17973,0.09398,0.85957],[0.19733,0.08658,0.85609],[0.21336,0.07855,0.8526],[0.22771,0.06996,0.84921],[0.2403,0.06087,0.84602],[0.25107,0.05137,0.84313],[0.25995,0.04151,0.84064],[0.2669,0.03138,0.83862],[0.27188,0.02103,0.83713],[0.27488,0.01055,0.83622],[0.27588,0.0,0.83591]],[[0.0,0.12639,0.88785],[0.02531,0.12589,0.88757],[0.0504,0.1244,0.8867],[0.07506,0.12193,0.88526],[0.09908,0.11849,0.88326],[0.12227,0.11413,0.88074],[0.14442,0.10888,0.87778],[0.16537,0.1028,0.87447],[0.18496,0.09594,0.87091],[0.20305,0.08838,0.86722],[0.21952,0.08017,0.86352],[0.23426,0.07139,0.85992],[0.24719,0.06212,0.85654],[0.25824,0.05241,0.85349],[0.26734,0.04235,0.85085],[0.27447,0.03201,0.84871],[0.27958,0.02146,0.84713],[0.28266,0.01076,0.84616],[0.28369,0.0,0.84584]],[[0.0,0.12911,0.90018],[0.02606,0.1286,0.89988],[0.05189,0.12707,0.89896],[0.07728,0.12453,0.89742],[0.102,0.12102,0.89529],[0.12586,0.11655,0.89262],[0.14865,0.11118,0.88948],[0.1702,0.10496,0.88596],[0.19033,0.09795,0.88218],[0.20892,0.09021,0.87827],[0.22584,0.08183,0.87434],[0.24097,0.07286,0.87053],[0.25425,0.06339,0.86695],[0.26558,0.05348,0.86371],[0.27493,0.04321,0.86091],[0.28224,0.03266,0.85865],[0.28748,0.02189,0.85698],[0.29063,0.01098,0.85595],[0.29168,0.0,0.85561]],[[0.0,0.13202,0.91306],[0.02686,0.13149,0.91273],[0.05349,0.12992,0.91175],[0.07966,0.12733,0.91011],[0.10515,0.12372,0.90784],[0.12973,0.11914,0.90499],[0.1532,0.11364,0.90164],[0.17538,0.10727,0.8979],[0.19611,0.10009,0.89388],[0.21523,0.09218,0.88972],[0.23262,0.08359,0.88555],[0.24818,0.07442,0.88149],[0.26182,0.06474,0.87769],[0.27346,0.05461,0.87425],[0.28305,0.04412,0.87128],[0.29056,0.03334,0.86887],[0.29594,0.02235,0.8671],[0.29917,0.01121,0.86602],[0.30025,0.0,0.86565]],[[0.0,0.13486,0.92536],[0.02766,0.13432,0.92501],[0.05507,0.13272,0.92397],[0.08201,0.13006,0.92223],[0.10824,0.12637,0.91981],[0.13353,0.12168,0.91678],[0.15767,0.11605,0.91323],[0.18048,0.10953,0.90925],[0.20178,0.10218,0.90499],[0.22142,0.09409,0.90058],[0.23928,0.08532,0.89615],[0.25525,0.07595,0.89185],[0.26924,0.06605,0.88782],[0.28119,0.05572,0.88418],[0.29102,0.04501,0.88104],[0.29871,0.03401,0.87849],[0.30422,0.02279,0.87662],[0.30754,0.01143,0.87547],[0.30864,0.0,0.87508]],[[0.0,0.13777,0.93765],[0.02847,0.13722,0.93728],[0.0567,0.13558,0.93617],[0.08443,0.13285,0.93431],[0.11142,0.12907,0.93175],[0.13743,0.12427,0.92853],[0.16227,0.1185,0.92475],[0.18571,0.11183,0.92053],[0.2076,0.10432,0.91601],[0.22778,0.09604,0.91133],[0.24612,0.08708,0.90664],[0.26251,0.0775,0.90209],[0.27686,0.0674,0.89782],[0.2891,0.05684,0.89396],[0.29918,0.04591,0.89064],[0.30706,0.03469,0.88794],[0.31271,0.02325,0.88596],[0.3161,0.01166,0.88475],[0.31723,0.0,0.88434]],[[0.0,0.14075,0.94992],[0.02931,0.14019,0.94952],[0.05837,0.1385,0.94834],[0.08691,0.13571,0.94637],[0.11468,0.13184,0.94364],[0.14145,0.12692,0.94022],[0.16699,0.12102,0.93621],[0.19109,0.11419,0.93174],[0.21358,0.1065,0.92694],[0.2343,0.09803,0.92198],[0.25312,0.08887,0.91701],[0.26994,0.07908,0.91219],[0.28465,0.06876,0.90767],[0.2972,0.05799,0.90359],[0.30753,0.04683,0.90007],[0.31561,0.03538,0.89722],[0.32139,0.02371,0.89512],[0.32486,0.01189,0.89383],[0.32602,0.0,0.8934]],[[0.0,0.14394,0.96273],[0.03022,0.14336,0.96231],[0.06017,0.14164,0.96105],[0.08958,0.13877,0.95894],[0.1182,0.13479,0.95604],[0.14577,0.12975,0.9524],[0.17206,0.1237,0.94813],[0.19686,0.1167,0.94337],[0.22,0.10883,0.93827],[0.2413,0.10016,0.93299],[0.26064,0.09078,0.92771],[0.2779,0.08077,0.9226],[0.29301,0.07022,0.9178],[0.30588,0.05921,0.91347],[0.31648,0.04781,0.90974],[0.32475,0.03612,0.90671],[0.33068,0.0242,0.90449],[0.33424,0.01214,0.90313],[0.33543,0.0,0.90267]],[[0.0,0.14706,0.97496],[0.03111,0.14647,0.97452],[0.06194,0.1447,0.97317],[0.09221,0.14176,0.97094],[0.12165,0.13769,0.96785],[0.15001,0.13252,0.96399],[0.17704,0.12632,0.95945],[0.20253,0.11916,0.9544],[0.2263,0.1111,0.949],[0.24817,0.10223,0.94341],[0.26801,0.09264,0.93782],[0.28572,0.08241,0.9324],[0.3012,0.07164,0.92732],[0.31439,0.06039,0.92274],[0.32523,0.04876,0.91879],[0.3337,0.03683,0.91559],[0.33977,0.02468,0.91324],[0.34341,0.01238,0.9118],[0.34463,0.0,0.91132]],[[0.0,0.15026,0.98718],[0.03202,0.14965,0.9867],[0.06376,0.14783,0.98528],[0.09491,0.14482,0.9829],[0.12521,0.14065,0.97962],[0.15437,0.13535,0.97552],[0.18216,0.129,0.97071],[0.20836,0.12166,0.96535],[0.23276,0.11341,0.95962],[0.25521,0.10434,0.9537],[0.27556,0.09454,0.94778],[0.29372,0.08409,0.94204],[0.30958,0.07308,0.93667],[0.32309,0.0616,0.93182],[0.33419,0.04973,0.92765],[0.34285,0.03756,0.92427],[0.34906,0.02516,0.92178],[0.35278,0.01262,0.92026],[0.35403,0.0,0.91974]],[[0.0,0.15353,0.99937],[0.03296,0.1529,0.99887],[0.06563,0.15104,0.99735],[0.09769,0.14795,0.99483],[0.12886,0.14367,0.99135],[0.15885,0.13825,0.98699],[0.18742,0.13174,0.98189],[0.21433,0.12422,0.97621],[0.23939,0.11578,0.97013],[0.26243,0.1065,0.96386],[0.2833,0.09647,0.95759],[0.30191,0.08579,0.95152],[0.31815,0.07454,0.94583],[0.33198,0.06282,0.94071],[0.34334,0.05071,0.93629],[0.35221,0.0383,0.93272],[0.35855,0.02566,0.93009],[0.36236,0.01287,0.92848],[0.36363,0.0,0.92794]],[[0.0,0.15702,1.0121],[0.03398,0.15638,1.01156],[0.06764,0.15447,1.00995],[0.10068,0.1513,1.00726],[0.13278,0.14691,1.00355],[0.16367,0.14134,0.99891],[0.19307,0.13466,0.99349],[0.22074,0.12695,0.98745],[0.2465,0.1183,0.98099],[0.27016,0.10879,0.97433],[0.29159,0.09853,0.96768],[0.31067,0.0876,0.96124],[0.32733,0.0761,0.95521],[0.3415,0.06412,0.94978],[0.35313,0.05176,0.9451],[0.3622,0.03908,0.94132],[0.36869,0.02618,0.93853],[0.37258,0.01313,0.93683],[0.37388,0.0,0.93626]],[[0.0,0.16045,1.02426],[0.03497,0.15979,1.02368],[0.06962,0.15783,1.02197],[0.10362,0.15458,1.01911],[0.13664,0.15007,1.01517],[0.1684,0.14436,1.01025],[0.19861,0.13751,1.00449],[0.22704,0.12961,0.99809],[0.25348,0.12075,0.99126],[0.27775,0.11103,0.9842],[0.29971,0.10053,0.97716],[0.31926,0.08936,0.97035],[0.33631,0.07762,0.96397],[0.3508,0.06539,0.95823],[0.36269,0.05277,0.95329],[0.37196,0.03984,0.94929],[0.37859,0.02668,0.94635],[0.38257,0.01338,0.94455],[0.3839,0.0,0.94395]],[[0.0,0.16395,1.03639],[0.036,0.16328,1.03578],[0.07166,0.16126,1.03395],[0.10664,0.15792,1.03092],[0.14061,0.1533,1.02674],[0.17326,0.14744,1.02152],[0.20431,0.14042,1.01541],[0.2335,0.13233,1.00863],[0.26063,0.12326,1.00139],[0.28552,0.1133,0.99392],[0.30803,0.10257,0.98647],[0.32804,0.09115,0.97926],[0.34549,0.07915,0.97253],[0.36031,0.06667,0.96646],[0.37246,0.0538,0.96124],[0.38193,0.04061,0.95701],[0.38869,0.0272,0.95391],[0.39275,0.01364,0.95201],[0.39411,0.0,0.95137]],[[0.0,0.16753,1.04849],[0.03705,0.16684,1.04785],[0.07375,0.16477,1.04591],[0.10974,0.16135,1.04269],[0.14468,0.1566,1.03825],[0.17825,0.15059,1.03271],[0.21015,0.1434,1.02624],[0.24012,0.1351,1.01905],[0.26796,0.12581,1.01138],[0.29348,0.11562,1.00348],[0.31653,0.10464,0.99559],[0.33702,0.09297,0.98798],[0.35487,0.08072,0.98085],[0.37001,0.06797,0.97444],[0.38242,0.05484,0.96893],[0.39209,0.04139,0.96447],[0.39899,0.02772,0.96119],[0.40314,0.01389,0.95919],[0.40452,0.0,0.95851]],[[0.0,0.17137,1.06113],[0.03818,0.17066,1.06044],[0.076,0.16853,1.05837],[0.11308,0.16501,1.05495],[0.14906,0.16013,1.05022],[0.18361,0.15396,1.04433],[0.21642,0.14657,1.03745],[0.24723,0.13806,1.02981],[0.27582,0.12853,1.02167],[0.302,0.11808,1.01329],[0.32564,0.10684,1.00493],[0.34662,0.0949,0.99685],[0.36488,0.08237,0.98931],[0.38037,0.06935,0.98252],[0.39306,0.05594,0.97669],[0.40292,0.04221,0.97197],[0.40997,0.02827,0.9685],[0.4142,0.01417,0.96638],[0.41561,0.0,0.96567]],[[0.0,0.17512,1.07318],[0.0393,0.17439,1.07245],[0.07821,0.17221,1.07026],[0.11636,0.16859,1.06662],[0.15336,0.16358,1.06161],[0.18887,0.15724,1.05536],[0.22257,0.14966,1.04807],[0.2542,0.14094,1.03998],[0.28351,0.13117,1.03136],[0.31034,0.12048,1.02249],[0.33454,0.10898,1.01365],[0.35601,0.09678,1.00512],[0.37467,0.08398,0.99715],[0.39048,0.07069,0.98998],[0.40343,0.057,0.98382],[0.41349,0.04301,0.97884],[0.42067,0.0288,0.97519],[0.42498,0.01443,0.97295],[0.42642,0.0,0.9722]],[[0.0,0.17896,1.08521],[0.04045,0.17821,1.08443],[0.08049,0.17597,1.08211],[0.11973,0.17225,1.07825],[0.15778,0.1671,1.07293],[0.19427,0.1606,1.0663],[0.22889,0.15282,1.05857],[0.26134,0.14387,1.05001],[0.2914,0.13387,1.04088],[0.31888,0.12292,1.0315],[0.34364,0.11115,1.02216],[0.36559,0.09868,1.01314],[0.38465,0.08561,1.00473],[0.40079,0.07204,0.99716],[0.41399,0.05808,0.99066],[0.42425,0.04382,0.98541],[0.43156,0.02933,0.98155],[0.43595,0.0147,0.9792],[0.43741,0.0,0.97841]],[[0.0,0.18288,1.09721],[0.04162,0.18211,1.09639],[0.08283,0.17981,1.09392],[0.1232,0.17599,1.08982],[0.16232,0.1707,1.08418],[0.19982,0.16402,1.07715],[0.23536,0.15604,1.06896],[0.26866,0.14686,1.05989],[0.29947,0.13661,1.05024],[0.32761,0.1254,1.04032],[0.35294,0.11336,1.03044],[0.37537,0.10061,1.02092],[0.39483,0.08726,1.01204],[0.41129,0.07341,1.00405],[0.42475,0.05917,0.9972],[0.43519,0.04464,0.99166],[0.44264,0.02988,0.9876],[0.4471,0.01497,0.98511],[0.44859,0.0,0.98428]],[[0.0,0.18709,1.10972],[0.04289,0.18629,1.10885],[0.08534,0.18392,1.10622],[0.12692,0.17999,1.10186],[0.16719,0.17455,1.09586],[0.20577,0.16768,1.08839],[0.2423,0.15947,1.0797],[0.2765,0.15005,1.07007],[0.3081,0.13953,1.05983],[0.33694,0.12803,1.04931],[0.36287,0.1157,1.03885],[0.38581,0.10265,1.02877],[0.40568,0.089,1.01938],[0.42248,0.07486,1.01093],[0.43619,0.06033,1.00369],[0.44683,0.0455,0.99784],[0.45441,0.03045,0.99354],[0.45895,0.01526,0.99092],[0.46047,0.0,0.99004]],[[0.0,0.1912,1.12166],[0.04414,0.19038,1.12073],[0.08782,0.18794,1.11794],[0.13058,0.1839,1.11332],[0.17198,0.17831,1.10695],[0.21161,0.17125,1.09904],[0.24911,0.16282,1.08983],[0.28418,0.15315,1.07964],[0.31656,0.14236,1.06881],[0.34607,0.13059,1.0577],[0.37258,0.11797,1.04665],[0.39599,0.10463,1.03601],[0.41626,0.09069,1.02609],[0.43337,0.07626,1.01719],[0.44732,0.06144,1.00955],[0.45814,0.04632,1.00339],[0.46585,0.031,0.99886],[0.47047,0.01553,0.9961],[0.472,0.0,0.99517]],[[0.0,0.1954,1.13357],[0.04542,0.19456,1.13258],[0.09036,0.19205,1.12962],[0.13434,0.18789,1.12471],[0.1769,0.18214,1.11796],[0.21761,0.17489,1.10958],[0.25609,0.16623,1.09983],[0.29204,0.15631,1.08905],[0.32521,0.14525,1.0776],[0.35539,0.13319,1.06585],[0.38247,0.12028,1.05418],[0.40636,0.10664,1.04295],[0.42702,0.0924,1.03249],[0.44444,0.07767,1.02311],[0.45864,0.06256,1.01506],[0.46963,0.04716,1.00857],[0.47746,0.03155,1.00381],[0.48214,0.01581,1.0009],[0.4837,0.0,0.99992]],[[0.0,0.1997,1.14544],[0.04674,0.19884,1.14439],[0.09297,0.19625,1.14125],[0.1382,0.19198,1.13604],[0.18194,0.18606,1.12889],[0.22375,0.1786,1.12001],[0.26324,0.16971,1.10968],[0.30009,0.15952,1.09828],[0.33405,0.14818,1.08617],[0.36491,0.13582,1.07376],[0.39257,0.12261,1.06145],[0.41693,0.10866,1.0496],[0.43797,0.09412,1.03857],[0.45569,0.07909,1.02868],[0.47012,0.06369,1.02021],[0.48128,0.048,1.01337],[0.48922,0.03211,1.00836],[0.49397,0.01609,1.0053],[0.49555,0.0,1.00427]],[[0.0,0.2041,1.15728],[0.04809,0.20321,1.15617],[0.09565,0.20055,1.15283],[0.14217,0.19614,1.14731],[0.18712,0.19006,1.13973],[0.23006,0.18239,1.13032],[0.27057,0.17325,1.11939],[0.30833,0.16279,1.10733],[0.34308,0.15115,1.09453],[0.37463,0.13849,1.08142],[0.40285,0.12497,1.06842],[0.42768,0.11071,1.05593],[0.4491,0.09586,1.04431],[0.46712,0.08053,1.03389],[0.48176,0.06482,1.02497],[0.49309,0.04884,1.01778],[0.50114,0.03267,1.01251],[0.50595,0.01636,1.00929],[0.50755,0.0,1.00821]],[[0.0,0.2088,1.16961],[0.04955,0.20788,1.16843],[0.09854,0.20514,1.16488],[0.14642,0.2006,1.15901],[0.19268,0.19433,1.15096],[0.23681,0.18642,1.14096],[0.27841,0.17702,1.12937],[0.31714,0.16626,1.11658],[0.35273,0.15431,1.10302],[0.38499,0.14132,1.08915],[0.41381,0.12746,1.0754],[0.43912,0.11287,1.0622],[0.46092,0.09769,1.04993],[0.47924,0.08203,1.03893],[0.4941,0.06602,1.02952],[0.50559,0.04973,1.02194],[0.51374,0.03325,1.01639],[0.51861,0.01666,1.013],[0.52023,0.0,1.01186]],[[0.0,0.2134,1.18137],[0.05098,0.21246,1.18011],[0.10137,0.20963,1.17635],[0.15061,0.20495,1.17013],[0.19813,0.19849,1.16159],[0.24344,0.19036,1.15101],[0.2861,0.18069,1.13874],[0.32576,0.16964,1.12522],[0.36215,0.15737,1.1109],[0.3951,0.14406,1.09626],[0.42448,0.12987,1.08176],[0.45025,0.11496,1.06784],[0.4724,0.09945,1.05492],[0.49099,0.08348,1.04335],[0.50606,0.06716,1.03345],[0.51768,0.05058,1.02548],[0.52593,0.03381,1.01965],[0.53085,0.01693,1.01609],[0.53249,0.0,1.01489]],[[0.0,0.21811,1.19309],[0.05245,0.21713,1.19176],[0.10428,0.21422,1.18777],[0.15491,0.2094,1.18117],[0.20373,0.20275,1.17213],[0.25023,0.19437,1.16092],[0.29397,0.18442,1.14794],[0.33457,0.17307,1.13365],[0.37177,0.16048,1.11853],[0.4054,0.14684,1.10308],[0.43533,0.13231,1.08779],[0.46154,0.11706,1.07313],[0.48404,0.10122,1.05953],[0.50288,0.08494,1.04736],[0.51814,0.06831,1.03695],[0.5299,0.05143,1.02858],[0.53823,0.03438,1.02245],[0.5432,0.01721,1.01871],[0.54485,0.0,1.01745]],[[0.0,0.22292,1.20476],[0.05396,0.22191,1.20335],[0.10727,0.21891,1.19912],[0.15931,0.21394,1.19213],[0.20947,0.20708,1.18255],[0.25719,0.19846,1.17069],[0.30201,0.18822,1.15696],[0.34357,0.17655,1.14186],[0.38159,0.16363,1.12589],[0.41588,0.14964,1.10959],[0.44636,0.13477,1.09348],[0.473,0.11917,1.07804],[0.49583,0.10301,1.06373],[0.51492,0.0864,1.05094],[0.53035,0.06946,1.04],[0.54222,0.05228,1.03121],[0.55063,0.03494,1.02477],[0.55564,0.01749,1.02085],[0.55731,0.0,1.01953]],[[0.0,0.22806,1.21692],[0.05558,0.22702,1.21542],[0.11049,0.22392,1.21092],[0.16405,0.21879,1.20349],[0.21563,0.21171,1.19332],[0.26464,0.20281,1.18073],[0.31062,0.19226,1.16618],[0.35318,0.18025,1.15019],[0.39205,0.16696,1.13329],[0.42704,0.15261,1.11607],[0.45808,0.13736,1.09905],[0.48516,0.1214,1.08276],[0.50831,0.10487,1.06768],[0.52763,0.08792,1.0542],[0.54322,0.07066,1.04269],[0.55521,0.05316,1.03344],[0.56368,0.03552,1.02667],[0.56873,0.01778,1.02255],[0.5704,0.0,1.02117]],[[0.0,0.23309,1.2285],[0.05718,0.23202,1.22691],[0.11364,0.22882,1.22214],[0.1687,0.22352,1.21427],[0.22167,0.21622,1.20349],[0.27195,0.20705,1.19018],[0.31905,0.19619,1.1748],[0.36257,0.18384,1.1579],[0.40224,0.17019,1.14008],[0.4379,0.15547,1.12192],[0.46946,0.13985,1.104],[0.49693,0.12353,1.08686],[0.52038,0.10666,1.071],[0.5399,0.08938,1.05685],[0.55563,0.0718,1.04477],[0.5677,0.05401,1.03507],[0.57623,0.03607,1.02797],[0.5813,0.01806,1.02365],[0.58299,0.0,1.0222]],[[0.0,0.23824,1.24003],[0.05882,0.23713,1.23834],[0.11689,0.23382,1.23329],[0.17347,0.22836,1.22495],[0.22786,0.22082,1.21354],[0.27942,0.21137,1.19946],[0.32765,0.20018,1.1832],[0.37215,0.18747,1.16536],[0.41263,0.17346,1.14656],[0.44893,0.15835,1.12742],[0.481,0.14236,1.10856],[0.50884,0.12568,1.09054],[0.53256,0.10846,1.07387],[0.55227,0.09084,1.05902],[0.56812,0.07294,1.04635],[0.58026,0.05484,1.03618],[0.58882,0.03662,1.02875],[0.59391,0.01833,1.02422],[0.5956,0.0,1.0227]],[[0.0,0.2435,1.25151],[0.0605,0.24235,1.24972],[0.12021,0.23894,1.24437],[0.17836,0.23329,1.23553],[0.2342,0.22551,1.22346],[0.28707,0.21576,1.20856],[0.33645,0.20423,1.19138],[0.38191,0.19116,1.17255],[0.42319,0.17676,1.15272],[0.46013,0.16126,1.13256],[0.49268,0.14489,1.11272],[0.52088,0.12782,1.09377],[0.54484,0.11024,1.07628],[0.56471,0.09229,1.06069],[0.58065,0.07407,1.04741],[0.59285,0.05567,1.03676],[0.60143,0.03717,1.02898],[0.60654,0.0186,1.02424],[0.60823,0.0,1.02265]],[[0.0,0.24912,1.26345],[0.06231,0.24794,1.26155],[0.12379,0.2444,1.25586],[0.18361,0.23855,1.24648],[0.241,0.23051,1.23367],[0.29526,0.22043,1.21787],[0.34584,0.20853,1.19968],[0.39232,0.19506,1.17976],[0.43443,0.18024,1.15881],[0.47201,0.16432,1.13754],[0.50505,0.14753,1.11661],[0.53359,0.13007,1.09667],[0.55778,0.11211,1.07827],[0.57778,0.09379,1.06189],[0.5938,0.07524,1.04795],[0.60602,0.05653,1.03678],[0.61462,0.03773,1.02862],[0.61972,0.01888,1.02365],[0.62141,0.0,1.02199]],[[0.0,0.25462,1.27482],[0.06409,0.25339,1.2728],[0.1273,0.24973,1.26678],[0.18876,0.24369,1.25684],[0.24766,0.23538,1.24328],[0.30327,0.22497,1.22659],[0.35502,0.21271,1.20737],[0.40247,0.19883,1.18635],[0.44535,0.1836,1.16428],[0.48354,0.16727,1.14189],[0.51701,0.15007,1.11989],[0.54585,0.13221,1.09895],[0.57022,0.11388,1.07965],[0.59033,0.09522,1.0625],[0.60639,0.07635,1.0479],[0.61861,0.05734,1.03622],[0.6272,0.03826,1.02769],[0.63229,0.01914,1.0225],[0.63398,0.0,1.02076]],[[0.0,0.26024,1.28612],[0.06591,0.25897,1.28399],[0.1309,0.25518,1.27761],[0.19404,0.24893,1.26709],[0.25448,0.24034,1.25274],[0.31146,0.22959,1.23509],[0.36437,0.21694,1.21481],[0.4128,0.20265,1.19264],[0.45645,0.18699,1.16939],[0.49521,0.17022,1.14583],[0.52908,0.1526,1.12272],[0.55819,0.13435,1.10075],[0.58271,0.11564,1.08052],[0.60289,0.09664,1.06255],[0.61896,0.07744,1.04729],[0.63117,0.05813,1.03508],[0.63973,0.03877,1.02617],[0.64479,0.01939,1.02076],[0.64647,0.0,1.01894]],[[0.0,0.26598,1.29737],[0.06779,0.26467,1.29511],[0.1346,0.26075,1.28835],[0.19946,0.25428,1.27721],[0.26146,0.24539,1.26204],[0.31983,0.23428,1.24339],[0.37392,0.22123,1.22197],[0.4233,0.2065,1.1986],[0.4677,0.19039,1.17412],[0.50701,0.17319,1.14935],[0.54126,0.15514,1.12508],[0.5706,0.13648,1.10204],[0.59523,0.11739,1.08085],[0.61544,0.09803,1.06205],[0.63149,0.07851,1.0461],[0.64366,0.05891,1.03335],[0.65216,0.03928,1.02405],[0.65719,0.01964,1.0184],[0.65886,0.0,1.01651]],[[0.0,0.27212,1.30906],[0.0698,0.27076,1.30666],[0.13856,0.26669,1.29948],[0.20527,0.25998,1.28766],[0.26894,0.25076,1.27157],[0.32877,0.23927,1.25181],[0.38409,0.22577,1.22916],[0.43447,0.21057,1.20447],[0.47962,0.19398,1.17864],[0.51948,0.17629,1.15255],[0.55408,0.15778,1.12703],[0.58361,0.13868,1.10282],[0.60833,0.11919,1.0806],[0.62853,0.09946,1.06091],[0.64452,0.07961,1.04422],[0.65661,0.05971,1.03089],[0.66504,0.0398,1.02118],[0.67002,0.01989,1.01529],[0.67166,0.0,1.01331]],[[0.0,0.27812,1.32016],[0.07178,0.27671,1.31762],[0.14246,0.27249,1.31002],[0.21096,0.26553,1.29751],[0.27626,0.25599,1.2805],[0.3375,0.24411,1.25963],[0.39401,0.23017,1.23574],[0.44532,0.2145,1.20973],[0.49118,0.19743,1.18255],[0.53152,0.17926,1.15515],[0.56642,0.1603,1.12837],[0.59609,0.14077,1.10302],[0.62083,0.12089,1.07978],[0.64098,0.10081,1.05922],[0.65688,0.08064,1.0418],[0.66886,0.06045,1.02791],[0.6772,0.04027,1.0178],[0.68211,0.02013,1.01166],[0.68373,0.0,1.0096]],[[0.0,0.28425,1.3312],[0.07381,0.28278,1.32851],[0.14646,0.27841,1.32046],[0.21679,0.2712,1.30723],[0.28375,0.26132,1.28924],[0.34642,0.24901,1.26721],[0.4041,0.23461,1.24201],[0.45634,0.21845,1.21461],[0.50287,0.20088,1.18604],[0.54365,0.18223,1.15726],[0.5788,0.1628,1.1292],[0.60857,0.14284,1.10267],[0.63329,0.12256,1.07838],[0.65334,0.10212,1.05692],[0.6691,0.08163,1.03877],[0.68094,0.06116,1.0243],[0.68916,0.04073,1.01378],[0.69399,0.02035,1.0074],[0.69559,0.0,1.00526]],[[0.0,0.29051,1.34217],[0.07589,0.28899,1.33932],[0.15055,0.28445,1.33079],[0.22277,0.27697,1.31679],[0.2914,0.26673,1.29778],[0.35551,0.25399,1.27452],[0.41437,0.2391,1.24795],[0.46751,0.22243,1.21912],[0.51468,0.20434,1.18908],[0.55586,0.18519,1.15889],[0.59122,0.16527,1.12949],[0.62103,0.14487,1.10174],[0.64567,0.12419,1.07638],[0.66557,0.1034,1.05401],[0.68116,0.08259,1.03511],[0.69282,0.06185,1.02006],[0.70089,0.04117,1.00913],[0.70563,0.02057,1.0025],[0.70719,0.0,1.00028]],[[0.0,0.2972,1.35355],[0.07813,0.29562,1.35052],[0.15495,0.2909,1.34148],[0.22917,0.28312,1.32663],[0.29959,0.27248,1.30649],[0.36521,0.25926,1.28188],[0.42529,0.24385,1.25381],[0.47934,0.22662,1.2234],[0.52714,0.20796,1.19178],[0.5687,0.18826,1.16004],[0.6042,0.16783,1.1292],[0.634,0.14696,1.10015],[0.6585,0.12585,1.07364],[0.67819,0.10469,1.05029],[0.69354,0.08356,1.0306],[0.70497,0.06253,1.01494],[0.71286,0.04161,1.00358],[0.71748,0.02078,0.99669],[0.719,0.0,0.99439]],[[0.0,0.30374,1.36435],[0.08033,0.3021,1.36114],[0.15926,0.29719,1.35157],[0.23544,0.28911,1.33587],[0.30759,0.27807,1.3146],[0.37467,0.26437,1.28863],[0.4359,0.24842,1.25906],[0.4908,0.23064,1.22707],[0.53916,0.21142,1.19387],[0.58102,0.19118,1.16061],[0.61661,0.17024,1.12835],[0.64632,0.14891,1.09802],[0.67062,0.1274,1.07039],[0.69005,0.10588,1.0461],[0.70512,0.08445,1.02564],[0.7163,0.06315,1.00939],[0.72398,0.042,0.99761],[0.72847,0.02097,0.99048],[0.72994,0.0,0.98809]],[[0.0,0.31042,1.37506],[0.08258,0.30871,1.37167],[0.16368,0.30361,1.36155],[0.24185,0.29521,1.34494],[0.31576,0.28374,1.32247],[0.3843,0.26955,1.29508],[0.44667,0.25304,1.26393],[0.50239,0.23467,1.2303],[0.55126,0.21487,1.19546],[0.59336,0.19407,1.16063],[0.62896,0.17261,1.12692],[0.65852,0.15081,1.09527],[0.68257,0.12889,1.06651],[0.70168,0.10702,1.04126],[0.71642,0.08528,1.02004],[0.72729,0.06374,1.0032],[0.73474,0.04237,0.99101],[0.73907,0.02115,0.98363],[0.74049,0.0,0.98116]],[[0.0,0.31724,1.38569],[0.08489,0.31546,1.3821],[0.16821,0.31015,1.37139],[0.24842,0.30142,1.35383],[0.3241,0.2895,1.3301],[0.39411,0.27477,1.30122],[0.4576,0.25768,1.26843],[0.5141,0.2387,1.23309],[0.56342,0.2183,1.19656],[0.60569,0.19692,1.1601],[0.64125,0.17494,1.12489],[0.67058,0.15266,1.09191],[0.6943,0.13032,1.062],[0.71302,0.1081,1.03579],[0.72737,0.08607,1.01379],[0.7379,0.06428,0.99637],[0.74507,0.04271,0.98377],[0.74924,0.02131,0.97615],[0.7506,0.0,0.9736]],[[0.0,0.32452,1.3967],[0.08737,0.32266,1.39289],[0.17307,0.31713,1.38153],[0.25544,0.30802,1.36293],[0.333,0.29561,1.33782],[0.40454,0.2803,1.3073],[0.46918,0.26257,1.27271],[0.52644,0.24292,1.23551],[0.57618,0.22186,1.19713],[0.61856,0.19986,1.15894],[0.65398,0.1773,1.12212],[0.683,0.15452,1.08773],[0.70628,0.13175,1.05659],[0.72453,0.10916,1.02938],[0.73841,0.08684,1.00658],[0.74853,0.0648,0.98855],[0.75538,0.04304,0.97553],[0.75934,0.02146,0.96766],[0.76064,0.0,0.96503]],[[0.0,0.33163,1.40713],[0.0898,0.3297,1.4031],[0.17783,0.32393,1.39108],[0.26232,0.31445,1.37143],[0.34169,0.30154,1.34492],[0.41468,0.28564,1.31276],[0.48039,0.26726,1.27638],[0.53834,0.24695,1.23733],[0.58841,0.22524,1.19714],[0.63082,0.20262,1.15722],[0.66601,0.1795,1.11885],[0.69464,0.15623,1.08308],[0.71744,0.13304,1.05077],[0.73516,0.11011,1.0226],[0.74853,0.08751,0.99904],[0.7582,0.06525,0.98044],[0.76471,0.04331,0.96702],[0.76846,0.02159,0.95892],[0.76968,0.0,0.95622]],[[0.0,0.33889,1.41746],[0.0923,0.33688,1.4132],[0.1827,0.33086,1.40049],[0.26934,0.32098,1.37972],[0.35055,0.30755,1.35175],[0.42499,0.29102,1.31787],[0.49174,0.27197,1.27963],[0.55031,0.25096,1.23866],[0.60064,0.22857,1.19659],[0.64298,0.20532,1.15491],[0.67788,0.18163,1.11494],[0.70603,0.15786,1.07779],[0.72824,0.13426,1.04431],[0.74536,0.11098,1.01519],[0.75816,0.08811,0.99088],[0.76733,0.06565,0.97173],[0.77347,0.04355,0.95793],[0.77697,0.02171,0.9496],[0.77811,0.0,0.94682]],[[0.0,0.3463,1.42768],[0.09486,0.3442,1.42318],[0.18769,0.33792,1.40974],[0.27653,0.32762,1.3878],[0.35958,0.31363,1.3583],[0.43545,0.29645,1.32262],[0.50319,0.27668,1.28242],[0.56234,0.25495,1.23947],[0.61284,0.23186,1.19547],[0.65504,0.20795,1.15199],[0.68952,0.18368,1.11041],[0.7171,0.1594,1.07186],[0.73866,0.13539,1.03722],[0.75509,0.11178,1.00716],[0.76724,0.08865,0.98212],[0.77588,0.066,0.96243],[0.78159,0.04375,0.94826],[0.78484,0.0218,0.93973],[0.78589,0.0,0.93688]],[[0.0,0.35421,1.43825],[0.0976,0.35201,1.43347],[0.19304,0.34545,1.41923],[0.2842,0.33467,1.39601],[0.36919,0.32007,1.36482],[0.44654,0.30217,1.32717],[0.51528,0.28162,1.28486],[0.57495,0.25909,1.23975],[0.62555,0.23523,1.19367],[0.66748,0.21062,1.14828],[0.70143,0.18572,1.10499],[0.72831,0.16091,1.06498],[0.74906,0.13646,1.02914],[0.76469,0.11252,0.99811],[0.77611,0.08913,0.97234],[0.78411,0.0663,0.95211],[0.78935,0.04392,0.93759],[0.7923,0.02187,0.92884],[0.79325,0.0,0.92593]],[[0.0,0.36193,1.44824],[0.10029,0.35963,1.44319],[0.19827,0.35277,1.42814],[0.29169,0.34153,1.40361],[0.37855,0.32629,1.37073],[0.4573,0.30767,1.33112],[0.52694,0.28633,1.2867],[0.58702,0.26301,1.23946],[0.63761,0.23839,1.19135],[0.67919,0.21308,1.14408],[0.71253,0.18757,1.09916],[0.73861,0.16225,1.05776],[0.75851,0.13739,1.02078],[0.77329,0.11313,0.98886],[0.78392,0.08951,0.96242],[0.79127,0.06652,0.94171],[0.79601,0.04403,0.92686],[0.79865,0.02192,0.91794],[0.7995,0.0,0.91496]],[[0.0,0.36981,1.45811],[0.10305,0.36741,1.45277],[0.20363,0.36023,1.43686],[0.29934,0.34848,1.41097],[0.38807,0.33259,1.37632],[0.46819,0.31319,1.33466],[0.53867,0.29103,1.28805],[0.59909,0.26689,1.23862],[0.64957,0.24147,1.18841],[0.69067,0.21544,1.13926],[0.72328,0.18931,1.09269],[0.74847,0.16348,1.04992],[0.76741,0.13821,1.01183],[0.78125,0.11364,0.97906],[0.79103,0.08981,0.95198],[0.79766,0.06667,0.93082],[0.80187,0.0441,0.91568],[0.80419,0.02195,0.90659],[0.80492,0.0,0.90356]],[[0.0,0.37784,1.46785],[0.10587,0.37533,1.4622],[0.20911,0.36782,1.4454],[0.30715,0.35553,1.41808],[0.39775,0.33894,1.38157],[0.4792,0.31873,1.33777],[0.55046,0.29571,1.28888],[0.61112,0.2707,1.2372],[0.66138,0.24447,1.18487],[0.70189,0.2177,1.1338],[0.73364,0.19093,1.08559],[0.75783,0.16458,1.04146],[0.77571,0.13891,1.00231],[0.78851,0.11404,0.96872],[0.79737,0.09001,0.94106],[0.80324,0.06675,0.91949],[0.80688,0.04413,0.90409],[0.80884,0.02195,0.89485],[0.80946,0.0,0.89178]],[[0.0,0.38641,1.47789],[0.1089,0.38377,1.47191],[0.21497,0.37589,1.45411],[0.31547,0.36301,1.42522],[0.40803,0.34565,1.38667],[0.49083,0.32454,1.34054],[0.56283,0.30057,1.2892],[0.62364,0.27461,1.23509],[0.67354,0.24749,1.18049],[0.71329,0.21993,1.12742],[0.74401,0.19249,1.0775],[0.76701,0.16559,1.03199],[0.78367,0.1395,0.99177],[0.79531,0.11435,0.95739],[0.80313,0.09013,0.92917],[0.80814,0.06676,0.90723],[0.81114,0.0441,0.89159],[0.81271,0.02192,0.88224],[0.8132,0.0,0.87912]],[[0.0,0.39477,1.48736],[0.11186,0.392,1.48103],[0.2207,0.38375,1.46224],[0.32359,0.37026,1.43176],[0.41801,0.35211,1.39118],[0.50206,0.3301,1.34272],[0.57468,0.30517,1.28895],[0.63552,0.27827,1.23246],[0.68495,0.25027,1.17567],[0.72384,0.22192,1.12067],[0.75344,0.19383,1.06914],[0.77518,0.16641,1.02236],[0.79056,0.13994,0.98117],[0.80099,0.11451,0.9461],[0.80774,0.09014,0.91741],[0.81188,0.0667,0.89517],[0.81424,0.04402,0.87935],[0.81542,0.02187,0.86991],[0.81577,0.0,0.86676]],[[0.0,0.40329,1.49667],[0.1149,0.40039,1.48999],[0.22656,0.39173,1.47015],[0.33186,0.3776,1.438],[0.42813,0.35862,1.3953],[0.51338,0.33566,1.34443],[0.58652,0.30972,1.28815],[0.64728,0.28183,1.22922],[0.6961,0.25292,1.17021],[0.73399,0.22378,1.11329],[0.76232,0.19502,1.06019],[0.78269,0.16709,1.01219],[0.79668,0.14023,0.97011],[0.80581,0.11456,0.93442],[0.81143,0.09004,0.90532],[0.81464,0.06655,0.88285],[0.81632,0.04388,0.8669],[0.81709,0.02179,0.8574],[0.81731,0.0,0.85424]],[[0.0,0.41197,1.50584],[0.118,0.40892,1.49878],[0.23254,0.39984,1.47783],[0.34028,0.38503,1.44395],[0.43838,0.36516,1.39901],[0.52477,0.3412,1.34564],[0.59835,0.31421,1.28678],[0.65889,0.28529,1.22537],[0.70695,0.25543,1.16412],[0.74368,0.22547,1.1053],[0.77062,0.19605,1.05067],[0.78947,0.1676,1.00152],[0.80197,0.14038,0.95862],[0.80972,0.11448,0.9224],[0.81414,0.08984,0.89299],[0.81638,0.06632,0.87034],[0.81736,0.0437,0.85432],[0.8177,0.02169,0.84479],[0.81777,0.0,0.84162]],[[0.0,0.42123,1.51525],[0.12133,0.41802,1.50778],[0.23893,0.40846,1.48561],[0.34925,0.39289,1.44982],[0.44923,0.37204,1.40246],[0.53674,0.34696,1.34637],[0.61065,0.31882,1.28472],[0.67082,0.28878,1.22068],[0.71793,0.2579,1.15708],[0.75329,0.22706,1.0963],[0.7786,0.19693,1.04014],[0.79574,0.16795,0.98987],[0.80656,0.14037,0.94622],[0.81278,0.11424,0.90955],[0.81588,0.08951,0.8799],[0.81707,0.06599,0.85716],[0.81728,0.04344,0.84113],[0.81716,0.02155,0.8316],[0.81707,0.0,0.82844]],[[0.0,0.43025,1.52409],[0.12458,0.42687,1.51619],[0.24517,0.41682,1.49281],[0.35796,0.40048,1.45509],[0.45973,0.37864,1.40531],[0.54823,0.35244,1.34653],[0.62234,0.32313,1.28215],[0.682,0.29198,1.21555],[0.72803,0.26009,1.14971],[0.76191,0.2284,1.0871],[0.78552,0.19759,1.02955],[0.80088,0.16811,0.97831],[0.81,0.14019,0.93405],[0.81467,0.11388,0.89706],[0.81646,0.08908,0.86729],[0.81661,0.06559,0.84455],[0.81607,0.04314,0.82857],[0.81549,0.02139,0.81909],[0.81525,0.0,0.81596]],[[0.0,0.43943,1.53275],[0.12791,0.43588,1.52442],[0.25154,0.42531,1.49974],[0.36682,0.40815,1.46002],[0.47033,0.38526,1.40772],[0.55974,0.35787,1.34615],[0.63392,0.32735,1.27898],[0.69291,0.29503,1.20979],[0.73769,0.26211,1.14172],[0.76993,0.22954,1.07734],[0.79168,0.19805,1.01849],[0.80515,0.16808,0.96639],[0.81246,0.13985,0.92165],[0.81552,0.11338,0.88446],[0.81594,0.08854,0.85468],[0.81502,0.06511,0.83203],[0.81371,0.04278,0.81617],[0.81267,0.0212,0.80679],[0.81228,0.0,0.80369]],[[0.0,0.44878,1.54124],[0.13131,0.44504,1.53244],[0.25804,0.43393,1.50641],[0.37582,0.41589,1.46459],[0.48103,0.39188,1.40967],[0.57124,0.36324,1.34522],[0.64536,0.33144,1.2752],[0.70351,0.29792,1.2034],[0.74687,0.26392,1.13314],[0.77729,0.23048,1.06705],[0.79703,0.19831,1.00702],[0.80848,0.16786,0.95419],[0.81389,0.13933,0.9091],[0.81528,0.11273,0.87184],[0.8143,0.08788,0.84217],[0.81229,0.06454,0.81972],[0.8102,0.04236,0.80405],[0.8087,0.02098,0.79481],[0.80816,0.0,0.79176]],[[0.0,0.45874,1.54991],[0.13495,0.45479,1.5406],[0.26497,0.44305,1.51309],[0.38537,0.42404,1.46897],[0.4923,0.3988,1.41119],[0.58325,0.36878,1.34365],[0.65713,0.33558,1.27059],[0.71422,0.30074,1.19605],[0.75589,0.2656,1.12355],[0.78422,0.23122,1.05578],[0.80171,0.19834,0.99463],[0.81092,0.16741,0.94119],[0.81426,0.13861,0.89591],[0.81384,0.11189,0.85873],[0.81137,0.08707,0.82932],[0.80821,0.06385,0.80718],[0.80531,0.04187,0.7918],[0.80332,0.02072,0.78276],[0.80262,0.0,0.77978]],[[0.0,0.46843,1.558],[0.13851,0.46427,1.54818],[0.27172,0.4519,1.51918],[0.39463,0.4319,1.47276],[0.50316,0.4054,1.41214],[0.59468,0.37399,1.34155],[0.66818,0.33939,1.26553],[0.72406,0.30324,1.1884],[0.76391,0.26698,1.1138],[0.79007,0.23169,1.04454],[0.80525,0.19815,0.98247],[0.81221,0.16678,0.92862],[0.81349,0.13773,0.88332],[0.8113,0.11094,0.84639],[0.8074,0.08618,0.81737],[0.80313,0.06311,0.79564],[0.79947,0.04134,0.78063],[0.79703,0.02045,0.77183],[0.79618,0.0,0.76893]],[[0.0,0.47829,1.56589],[0.14214,0.47389,1.55553],[0.27859,0.46086,1.52497],[0.40401,0.4398,1.47615],[0.51406,0.41197,1.41259],[0.60604,0.3791,1.33887],[0.67897,0.34303,1.25986],[0.73345,0.30553,1.18014],[0.77129,0.26811,1.10353],[0.79509,0.23192,1.0329],[0.80783,0.19772,0.97008],[0.81243,0.16593,0.916],[0.81161,0.13668,0.87086],[0.80763,0.10985,0.83435],[0.80229,0.08517,0.80586],[0.79693,0.06229,0.78468],[0.79252,0.04076,0.7701],[0.78964,0.02015,0.7616],[0.78865,0.0,0.7588]],[[0.0,0.48831,1.57357],[0.14585,0.48367,1.56264],[0.28559,0.46992,1.53044],[0.4135,0.44774,1.47912],[0.52501,0.4185,1.41252],[0.6173,0.38408,1.33558],[0.68948,0.34649,1.25356],[0.74235,0.3076,1.17129],[0.77797,0.269,1.09277],[0.79925,0.23189,1.02092],[0.8094,0.19705,0.95753],[0.81157,0.16488,0.90342],[0.8086,0.13545,0.85865],[0.80281,0.10861,0.82274],[0.79605,0.08406,0.79494],[0.78964,0.06139,0.77441],[0.78451,0.04013,0.76037],[0.78121,0.01983,0.75221],[0.78008,0.0,0.74953]],[[0.0,0.49897,1.58136],[0.14981,0.49406,1.5698],[0.29303,0.4795,1.53582],[0.42354,0.45607,1.48176],[0.53646,0.42527,1.41186],[0.62893,0.38915,1.3315],[0.70012,0.34988,1.24631],[0.75106,0.30949,1.16144],[0.78416,0.26964,1.08105],[0.80261,0.23158,1.0081],[0.80993,0.19609,0.94434],[0.80948,0.16354,0.89043],[0.80423,0.13397,0.84626],[0.79658,0.10718,0.81118],[0.78838,0.08279,0.78427],[0.78091,0.06037,0.76456],[0.77506,0.03943,0.75118],[0.77137,0.01947,0.74344],[0.7701,0.0,0.7409]],[[0.0,0.50933,1.58857],[0.15367,0.50414,1.57639],[0.30028,0.48877,1.54061],[0.43323,0.46406,1.48383],[0.54742,0.43168,1.41068],[0.63988,0.39385,1.32697],[0.70991,0.35291,1.23875],[0.75879,0.31102,1.15146],[0.78925,0.26996,1.06943],[0.80484,0.231,0.99564],[0.80934,0.19492,0.93174],[0.80633,0.16205,0.87827],[0.7989,0.13238,0.83491],[0.78951,0.10567,0.80082],[0.77998,0.08148,0.77493],[0.77157,0.05934,0.75614],[0.7651,0.03872,0.74347],[0.76105,0.01911,0.73618],[0.75968,0.0,0.7338]],[[0.0,0.51985,1.59555],[0.15762,0.51436,1.58271],[0.30763,0.49812,1.54505],[0.44302,0.47205,1.48544],[0.55836,0.438,1.40893],[0.65063,0.39837,1.32182],[0.71927,0.35569,1.23058],[0.76587,0.31228,1.14097],[0.79349,0.26999,1.05746],[0.80606,0.23014,0.98305],[0.80765,0.19349,0.91927],[0.80206,0.16034,0.86649],[0.79248,0.13063,0.82417],[0.7814,0.10403,0.79128],[0.77062,0.08008,0.76657],[0.76134,0.05824,0.74882],[0.75432,0.03797,0.73694],[0.74997,0.01873,0.73015],[0.7485,0.0,0.72794]],[[0.0,0.53054,1.60227],[0.16163,0.52473,1.58875],[0.3151,0.50755,1.54912],[0.45287,0.48004,1.48657],[0.56925,0.44422,1.40661],[0.66115,0.4027,1.31606],[0.72817,0.35822,1.22183],[0.77224,0.31324,1.13001],[0.79684,0.26972,1.04522],[0.80624,0.22899,0.97043],[0.80485,0.19182,0.90704],[0.79666,0.15844,0.85521],[0.78498,0.12872,0.81417],[0.77231,0.10229,0.78268],[0.76039,0.07861,0.75932],[0.75035,0.0571,0.74272],[0.74285,0.0372,0.73173],[0.73825,0.01834,0.72548],[0.7367,0.0,0.72346]],[[0.0,0.54138,1.60874],[0.16573,0.53523,1.5945],[0.32267,0.51706,1.55281],[0.46279,0.48802,1.48721],[0.58008,0.45032,1.40371],[0.67139,0.40682,1.30967],[0.73656,0.36047,1.21252],[0.77787,0.31389,1.11863],[0.79923,0.26913,1.03277],[0.80535,0.22755,0.95787],[0.80093,0.18989,0.89516],[0.79018,0.15633,0.84456],[0.77648,0.12667,0.80505],[0.76232,0.10044,0.77517],[0.74939,0.07707,0.75331],[0.73871,0.05593,0.73797],[0.73084,0.03641,0.72793],[0.72605,0.01795,0.72227],[0.72445,0.0,0.72044]],[[0.0,0.55288,1.61522],[0.17009,0.54635,1.60018],[0.3307,0.52707,1.55625],[0.47322,0.49632,1.48734],[0.59129,0.45655,1.40004],[0.68176,0.41088,1.30234],[0.74472,0.3625,1.2022],[0.78289,0.31421,1.10633],[0.80068,0.26816,1.01962],[0.80325,0.22574,0.94491],[0.79565,0.18762,0.88325],[0.78228,0.15394,0.83423],[0.76659,0.12438,0.79659],[0.75105,0.09842,0.7686],[0.73723,0.07541,0.74846],[0.72603,0.05467,0.73456],[0.71789,0.03557,0.72558],[0.71298,0.01753,0.72056],[0.71134,0.0,0.71895]],[[0.0,0.56404,1.62112],[0.17433,0.55712,1.6053],[0.33848,0.5367,1.55913],[0.48322,0.50421,1.48693],[0.60188,0.46234,1.39591],[0.69131,0.4145,1.29471],[0.7519,0.36412,1.1918],[0.78682,0.31417,1.09424],[0.80102,0.2669,1.00699],[0.80011,0.2237,0.93281],[0.78948,0.18521,0.87246],[0.7737,0.15147,0.82527],[0.75628,0.12208,0.78967],[0.73959,0.09642,0.76368],[0.72511,0.07379,0.74532],[0.71358,0.05346,0.73288],[0.70531,0.03477,0.72496],[0.70037,0.01713,0.72059],[0.69873,0.0,0.71919]],[[0.0,0.57535,1.62674],[0.17865,0.56801,1.61009],[0.34635,0.54638,1.56158],[0.49324,0.51204,1.48599],[0.61232,0.46796,1.39118],[0.70047,0.41785,1.28648],[0.75841,0.3654,1.18093],[0.78985,0.31378,1.0819],[0.8003,0.2653,0.99443],[0.79587,0.22138,0.9211],[0.78226,0.18258,0.86241],[0.76422,0.14885,0.81734],[0.74524,0.11968,0.78401],[0.72763,0.09438,0.76019],[0.71269,0.07216,0.74373],[0.70102,0.05225,0.73281],[0.69276,0.03398,0.72599],[0.68787,0.01674,0.72228],[0.68626,0.0,0.7211]],[[0.0,0.58681,1.63205],[0.18304,0.57902,1.61453],[0.3543,0.55609,1.5636],[0.50326,0.5198,1.48451],[0.62257,0.47339,1.38584],[0.70918,0.4209,1.27768],[0.7642,0.36632,1.16963],[0.79194,0.31301,1.06939],[0.79852,0.26337,0.98202],[0.79053,0.21878,0.90991],[0.77404,0.17975,0.85322],[0.75391,0.1461,0.81057],[0.73361,0.11722,0.77972],[0.71533,0.09231,0.75823],[0.70018,0.07053,0.74376],[0.68855,0.05106,0.7344],[0.68046,0.03321,0.72869],[0.67572,0.01636,0.72564],[0.67416,0.0,0.72469]],[[0.0,0.59893,1.63727],[0.18771,0.59064,1.61881],[0.3627,0.56627,1.56523],[0.51372,0.5278,1.48236],[0.63305,0.47882,1.3796],[0.71776,0.42374,1.26787],[0.76944,0.36689,1.1574],[0.79308,0.31181,1.05621],[0.79549,0.26098,0.96933],[0.78382,0.21578,0.8989],[0.76445,0.17659,0.84467],[0.74238,0.1431,0.80485],[0.721,0.1146,0.77683],[0.70231,0.09016,0.75789],[0.68721,0.06886,0.74556],[0.67588,0.04986,0.73786],[0.66813,0.03243,0.73331],[0.66365,0.01598,0.73094],[0.66218,0.0,0.73021]],[[0.0,0.61066,1.64193],[0.19224,0.60186,1.62252],[0.3708,0.57601,1.56631],[0.52368,0.53533,1.47973],[0.64281,0.48376,1.37301],[0.72542,0.42611,1.25794],[0.77362,0.36703,1.14538],[0.79313,0.31026,1.0436],[0.79148,0.25836,0.95759],[0.77634,0.21265,0.88916],[0.75442,0.1734,0.83765],[0.73077,0.14016,0.8008],[0.70868,0.11207,0.77566],[0.68993,0.08812,0.75926],[0.67517,0.06731,0.749],[0.66435,0.04876,0.74286],[0.6571,0.03174,0.73939],[0.65296,0.01565,0.73764],[0.65163,0.0,0.73712]],[[0.0,0.62253,1.64626],[0.19683,0.61317,1.62586],[0.37897,0.58575,1.56692],[0.53358,0.54272,1.47651],[0.65228,0.48843,1.36582],[0.73248,0.42811,1.24751],[0.77694,0.36676,1.13309],[0.79215,0.30833,1.03108],[0.78639,0.25542,0.94635],[0.76791,0.20929,0.88034],[0.74367,0.17007,0.83188],[0.71876,0.13717,0.79825],[0.69631,0.10957,0.77612],[0.67784,0.08615,0.7623],[0.66372,0.06584,0.7541],[0.65365,0.04773,0.74947],[0.64707,0.0311,0.74701],[0.64339,0.01534,0.74585],[0.64221,0.0,0.74551]],[[0.0,0.63451,1.65024],[0.20149,0.62457,1.62881],[0.38718,0.59547,1.56704],[0.54339,0.54996,1.47272],[0.66141,0.49281,1.35803],[0.73892,0.42973,1.23662],[0.77935,0.36607,1.12061],[0.7901,0.306,1.01876],[0.78024,0.25217,0.93575],[0.75858,0.20572,0.87256],[0.73233,0.16664,0.82747],[0.70653,0.13416,0.79726],[0.68411,0.10711,0.77825],[0.66628,0.08426,0.76701],[0.65311,0.06446,0.76079],[0.64404,0.0468,0.75759],[0.63829,0.03052,0.75605],[0.63516,0.01507,0.75541],[0.63417,0.0,0.75523]],[[0.0,0.64716,1.65401],[0.20643,0.63656,1.63147],[0.39581,0.6056,1.56662],[0.55353,0.55732,1.46812],[0.67056,0.49704,1.34927],[0.74492,0.43097,1.22477],[0.78087,0.36489,1.10744],[0.78683,0.30316,1.00621],[0.77274,0.24845,0.92548],[0.74799,0.20179,0.86567],[0.71999,0.16299,0.82443],[0.69371,0.13105,0.79798],[0.67178,0.10464,0.78226],[0.65503,0.0824,0.77366],[0.64319,0.06316,0.76939],[0.63541,0.04593,0.76752],[0.63071,0.03,0.76683],[0.62826,0.01483,0.76664],[0.6275,0.0,0.76661]],[[0.0,0.65936,1.65724],[0.21121,0.6481,1.63358],[0.40409,0.61523,1.56569],[0.56309,0.56416,1.46311],[0.67889,0.50073,1.3403],[0.7499,0.43172,1.21305],[0.78133,0.3633,1.09482],[0.7826,0.30005,0.99465],[0.76458,0.24461,0.91657],[0.73716,0.1979,0.8604],[0.70793,0.15947,0.82311],[0.68166,0.12813,0.80037],[0.66064,0.10239,0.78777],[0.64533,0.08078,0.78157],[0.63508,0.06205,0.779],[0.62877,0.04523,0.77823],[0.62522,0.0296,0.77818],[0.6235,0.01464,0.77832],[0.62299,0.0,0.77838]],[[0.0,0.67167,1.66008],[0.21605,0.65968,1.63526],[0.41239,0.62478,1.56424],[0.57249,0.57076,1.4575],[0.68675,0.50405,1.33079],[0.75411,0.43202,1.20101],[0.78078,0.36127,1.08227],[0.77733,0.29657,0.98363],[0.75553,0.24054,0.90869],[0.7258,0.19389,0.85654],[0.69578,0.15597,0.82341],[0.67003,0.12533,0.80443],[0.6504,0.10031,0.79486],[0.63692,0.07934,0.79087],[0.62856,0.06112,0.78976],[0.62392,0.04466,0.78986],[0.62165,0.02928,0.79028],[0.62072,0.01451,0.79062],[0.62049,0.0,0.79074]],[[0.0,0.68405,1.66253],[0.22093,0.6713,1.63651],[0.42068,0.63424,1.56225],[0.58168,0.5771,1.45129],[0.69411,0.50697,1.32076],[0.7575,0.43185,1.18872],[0.77921,0.35879,1.06989],[0.77104,0.29273,0.9733],[0.74569,0.23625,0.90197],[0.71406,0.18982,0.85416],[0.68378,0.15253,0.82536],[0.65907,0.12268,0.81012],[0.64131,0.09843,0.80341],[0.63003,0.0781,0.80137],[0.62383,0.06036,0.80143],[0.62103,0.04424,0.80213],[0.62015,0.02907,0.8028],[0.62006,0.01442,0.80321],[0.62011,0.0,0.80335]],[[0.0,0.69708,1.66464],[0.22608,0.68348,1.63732],[0.42934,0.64401,1.55958],[0.59105,0.58343,1.44417],[0.70121,0.50956,1.30974],[0.76013,0.43115,1.17566],[0.77647,0.35571,1.05725],[0.76341,0.28837,0.96336],[0.73468,0.23158,0.89629],[0.70157,0.18556,0.85337],[0.67162,0.14906,0.82919],[0.64859,0.12012,0.81773],[0.63329,0.09671,0.81374],[0.62469,0.07705,0.81338],[0.62099,0.05978,0.81429],[0.62026,0.04396,0.81529],[0.62089,0.02896,0.81596],[0.62172,0.01439,0.81629],[0.62207,0.0,0.81638]],[[0.0,0.7096,1.66624],[0.23105,0.69513,1.63762],[0.43758,0.65321,1.55646],[0.59975,0.58916,1.43675],[0.7074,0.51158,1.29874],[0.76172,0.42996,1.16306],[0.77278,0.35231,1.04556],[0.75518,0.28388,0.95481],[0.72358,0.22698,0.89228],[0.68962,0.18152,0.85427],[0.66061,0.14591,0.83453],[0.63977,0.11791,0.82649],[0.62727,0.09533,0.82475],[0.62156,0.07629,0.82558],[0.62043,0.05944,0.82689],[0.62176,0.04385,0.82781],[0.62386,0.02895,0.82821],[0.62556,0.01441,0.8283],[0.6262,0.0,0.8283]],[[0.0,0.72218,1.6674],[0.23605,0.70677,1.63744],[0.44578,0.66225,1.55277],[0.60815,0.59454,1.42875],[0.71295,0.51312,1.28733],[0.76237,0.42827,1.15044],[0.76807,0.34848,1.03439],[0.74611,0.27912,0.94734],[0.71209,0.2223,0.88975],[0.67788,0.17757,0.85684],[0.65045,0.14297,0.84144],[0.63236,0.11599,0.83653],[0.62308,0.09423,0.83661],[0.62049,0.07579,0.83814],[0.62204,0.05931,0.8394],[0.62546,0.0439,0.83987],[0.629,0.02905,0.83973],[0.63153,0.01447,0.83941],[0.63244,0.0,0.83925]],[[0.0,0.73478,1.66812],[0.24108,0.71838,1.63678],[0.45391,0.6711,1.54851],[0.61622,0.59955,1.42019],[0.71782,0.51415,1.27556],[0.76207,0.42605,1.13789],[0.76235,0.34424,1.02386],[0.73629,0.27414,0.94105],[0.70038,0.2176,0.88879],[0.66659,0.17378,0.86106],[0.64139,0.14031,0.84983],[0.62658,0.11438,0.84764],[0.62087,0.09345,0.84901],[0.62159,0.07556,0.85071],[0.62586,0.05939,0.85142],[0.63129,0.0441,0.85104],[0.63618,0.02924,0.85009],[0.63949,0.01459,0.84919],[0.64064,0.0,0.84883]],[[0.0,0.74798,1.66838],[0.24636,0.73047,1.63554],[0.46231,0.68013,1.54344],[0.62426,0.60435,1.41064],[0.72214,0.51467,1.26293],[0.76071,0.42318,1.12495],[0.75535,0.33938,1.01367],[0.72536,0.26872,0.93587],[0.6881,0.21272,0.88951],[0.6555,0.17004,0.86721],[0.63335,0.13786,0.86002],[0.6225,0.11307,0.86012],[0.62082,0.09298,0.86219],[0.62507,0.07561,0.86343],[0.63211,0.05968,0.86302],[0.63951,0.04445,0.86134],[0.64567,0.02953,0.85923],[0.64966,0.01474,0.85756],[0.65103,0.0,0.85693]],[[0.0,0.7606,1.66815],[0.25143,0.74196,1.63384],[0.47024,0.68851,1.53799],[0.63154,0.6085,1.40097],[0.72548,0.5146,1.25059],[0.7584,0.41989,1.11286],[0.74771,0.33436,1.00485],[0.7144,0.26341,0.93236],[0.67654,0.20816,0.89189],[0.64585,0.16674,0.87467],[0.62727,0.13589,0.87091],[0.62064,0.1122,0.87258],[0.623,0.09286,0.87462],[0.63059,0.07592,0.87476],[0.64011,0.06015,0.87276],[0.64916,0.04491,0.86944],[0.65631,0.02988,0.86597],[0.66081,0.01493,0.86343],[0.66234,0.0,0.8625]],[[0.0,0.77321,1.66743],[0.2565,0.75336,1.63161],[0.47803,0.69662,1.53197],[0.63836,0.61218,1.3908],[0.72801,0.51397,1.23809],[0.75509,0.41609,1.10116],[0.73924,0.32901,0.99705],[0.70311,0.25802,0.93036],[0.66539,0.20376,0.89592],[0.63736,0.16378,0.88355],[0.62295,0.13432,0.88267],[0.62088,0.11171,0.88519],[0.62733,0.09307,0.88646],[0.63811,0.07646,0.88487],[0.64983,0.06078,0.88077],[0.66022,0.04546,0.87546],[0.6681,0.03027,0.87042],[0.67293,0.01513,0.86689],[0.67455,0.0,0.86562]],[[0.0,0.78578,1.66623],[0.26157,0.76465,1.62885],[0.48566,0.70443,1.52537],[0.64471,0.61536,1.38015],[0.72971,0.51275,1.22548],[0.7508,0.41179,1.08997],[0.73,0.32338,0.99039],[0.69165,0.25263,0.92994],[0.65487,0.1996,0.90158],[0.63028,0.1612,0.89369],[0.62057,0.13318,0.89502],[0.62328,0.11162,0.89758],[0.63375,0.09358,0.89731],[0.64743,0.07721,0.89334],[0.66093,0.06152,0.88668],[0.67228,0.04607,0.8791],[0.68055,0.03069,0.87233],[0.6855,0.01534,0.86773],[0.68714,0.0,0.8661]],[[0.0,0.79885,1.66443],[0.26686,0.7763,1.62539],[0.49345,0.71224,1.51785],[0.65077,0.61813,1.36855],[0.73056,0.51084,1.21229],[0.74528,0.40677,1.07894],[0.71966,0.31724,0.9848],[0.67971,0.24706,0.93124],[0.64481,0.19558,0.90916],[0.6246,0.15896,0.90541],[0.6203,0.13247,0.90819],[0.62808,0.11193,0.90986],[0.6425,0.09441,0.90714],[0.65873,0.07818,0.90005],[0.67358,0.0624,0.8903],[0.6854,0.04674,0.88011],[0.69369,0.03113,0.87143],[0.69851,0.01555,0.86569],[0.70009,0.0,0.86368]],[[0.0,0.81128,1.66219],[0.2719,0.78728,1.62152],[0.50069,0.71933,1.51008],[0.656,0.6202,1.35706],[0.73045,0.5084,1.19976],[0.73906,0.4015,1.06917],[0.70922,0.31119,0.98085],[0.66854,0.24187,0.93417],[0.63633,0.19211,0.91787],[0.62102,0.15732,0.91741],[0.62222,0.13226,0.92067],[0.63478,0.1126,0.92053],[0.65255,0.09544,0.91469],[0.67063,0.07922,0.90408],[0.68613,0.06326,0.89109],[0.69785,0.04737,0.87829],[0.70574,0.03152,0.86778],[0.71019,0.01574,0.86096],[0.71162,0.0,0.85861]],[[0.0,0.8236,1.65943],[0.2769,0.79806,1.6171],[0.50769,0.72601,1.50175],[0.66062,0.62168,1.34522],[0.72943,0.50534,1.1874],[0.73195,0.3958,1.06029],[0.69841,0.30503,0.97837],[0.65784,0.23689,0.93875],[0.6292,0.18908,0.92787],[0.61941,0.15619,0.92989],[0.62628,0.13251,0.93262],[0.64334,0.11359,0.92975],[0.66389,0.09665,0.92008],[0.68311,0.08032,0.90553],[0.69855,0.06411,0.88914],[0.7096,0.04794,0.87376],[0.71666,0.03186,0.86151],[0.72049,0.01589,0.8537],[0.72169,0.0,0.85104]],[[0.0,0.83579,1.65615],[0.28186,0.80862,1.61213],[0.51442,0.73226,1.49288],[0.6646,0.62255,1.33309],[0.72748,0.50167,1.17533],[0.72403,0.38971,1.05241],[0.68739,0.29883,0.97744],[0.64782,0.23222,0.94492],[0.62364,0.18654,0.93893],[0.61987,0.15558,0.94249],[0.6324,0.13319,0.94364],[0.6535,0.11485,0.93711],[0.67608,0.09797,0.92302],[0.69561,0.08141,0.90428],[0.71024,0.06488,0.88449],[0.72001,0.04842,0.86668],[0.72583,0.03212,0.85287],[0.7288,0.016,0.84424],[0.7297,0.0,0.84131]],[[0.0,0.84837,1.65214],[0.28699,0.81939,1.60633],[0.52115,0.73829,1.48305],[0.66804,0.62277,1.32016],[0.72446,0.49719,1.16313],[0.71496,0.38299,1.04539],[0.67582,0.2924,0.97819],[0.63835,0.22773,0.95299],[0.6197,0.18448,0.95137],[0.62262,0.15553,0.9554],[0.64085,0.13432,0.95371],[0.66546,0.11639,0.94246],[0.68918,0.09939,0.92326],[0.70804,0.08247,0.90005],[0.721,0.06555,0.87692],[0.72881,0.04878,0.85689],[0.73294,0.03228,0.84179],[0.73479,0.01606,0.83252],[0.7353,0.0,0.8294]],[[0.0,0.86021,1.64776],[0.29182,0.8294,1.60021],[0.52726,0.74353,1.47313],[0.6706,0.62231,1.30764],[0.72063,0.49231,1.15199],[0.70564,0.37627,1.03995],[0.66493,0.28637,0.98058],[0.63049,0.22389,0.96213],[0.6179,0.1831,0.9638],[0.62741,0.15601,0.96708],[0.65064,0.13575,0.96155],[0.6777,0.11799,0.94505],[0.70146,0.1007,0.92069],[0.71869,0.08333,0.89337],[0.72926,0.066,0.86742],[0.73468,0.04895,0.84575],[0.73688,0.03231,0.82983],[0.73751,0.01604,0.82022],[0.7376,0.0,0.81702]],[[0.0,0.87183,1.64283],[0.29658,0.83908,1.59354],[0.53301,0.74823,1.46273],[0.67241,0.62116,1.29502],[0.71589,0.48686,1.14147],[0.6958,0.36934,1.03588],[0.65441,0.28056,0.98462],[0.62401,0.22059,0.97248],[0.61813,0.18234,0.97642],[0.63419,0.15698,0.97769],[0.66175,0.13744,0.96728],[0.69021,0.11963,0.94498],[0.71287,0.10187,0.91545],[0.72751,0.08397,0.88439],[0.73502,0.06622,0.85622],[0.73763,0.04892,0.8335],[0.73769,0.0322,0.81726],[0.73701,0.01596,0.80764],[0.73667,0.0,0.80446]],[[0.0,0.88321,1.63736],[0.30124,0.84842,1.58632],[0.53838,0.75235,1.45189],[0.67346,0.61931,1.28241],[0.71029,0.48086,1.13171],[0.68558,0.36227,1.03325],[0.64449,0.27506,0.99026],[0.61913,0.21787,0.98383],[0.62045,0.1822,0.98884],[0.6428,0.15839,0.98681],[0.67378,0.13931,0.9706],[0.7024,0.12119,0.94218],[0.72279,0.10283,0.90774],[0.73395,0.08433,0.87356],[0.73785,0.06617,0.84394],[0.7374,0.04869,0.82091],[0.73525,0.03195,0.80492],[0.73326,0.01581,0.79562],[0.73248,0.0,0.79259]],[[0.0,0.8948,1.63106],[0.30599,0.85776,1.57818],[0.54354,0.756,1.44013],[0.6737,0.61663,1.26932],[0.70354,0.47406,1.12245],[0.67465,0.35482,1.03214],[0.635,0.26974,0.9978],[0.61592,0.21573,0.99647],[0.62509,0.1827,1.00119],[0.65347,0.16026,0.99436],[0.6868,0.14133,0.97128],[0.71417,0.12264,0.93641],[0.73095,0.1035,0.89741],[0.73766,0.08436,0.86093],[0.73739,0.06582,0.83079],[0.73367,0.04821,0.8083],[0.72929,0.03154,0.79319],[0.72605,0.01558,0.78462],[0.72487,0.0,0.78186]],[[0.0,0.90558,1.62447],[0.31041,0.86625,1.56985],[0.54803,0.75883,1.4285],[0.67311,0.61332,1.25698],[0.69631,0.46708,1.11462],[0.66413,0.34773,1.03271],[0.627,0.26515,1.00648],[0.61482,0.21438,1.00899],[0.63158,0.18377,1.01197],[0.66489,0.16233,0.99931],[0.69909,0.14322,0.96915],[0.72384,0.12374,0.92839],[0.7361,0.10376,0.88592],[0.73799,0.08402,0.84834],[0.73364,0.06519,0.81878],[0.72696,0.04756,0.79767],[0.72071,0.03103,0.784],[0.71647,0.0153,0.77646],[0.71499,0.0,0.77406]],[[0.0,0.916,1.61735],[0.31469,0.87428,1.561],[0.55203,0.76096,1.41655],[0.67169,0.60931,1.24493],[0.68839,0.45971,1.10791],[0.65375,0.34077,1.03491],[0.62028,0.26113,1.01642],[0.61573,0.21374,1.02159],[0.63991,0.18536,1.02134],[0.67707,0.16457,1.00179],[0.71062,0.14493,0.96434],[0.73138,0.12448,0.91832],[0.73828,0.1036,0.87351],[0.73509,0.08332,0.8361],[0.72683,0.0643,0.80823],[0.71759,0.04674,0.7893],[0.7099,0.03043,0.77758],[0.70499,0.01499,0.77134],[0.70331,0.0,0.76939]],[[0.0,0.92603,1.60969],[0.31881,0.8818,1.55164],[0.55553,0.76239,1.40434],[0.66945,0.60458,1.23327],[0.67986,0.452,1.10243],[0.6437,0.33404,1.03873],[0.61503,0.25778,1.02744],[0.61869,0.21381,1.03388],[0.64981,0.1874,1.02891],[0.68948,0.16684,1.00162],[0.72079,0.14636,0.95701],[0.73631,0.12476,0.90672],[0.73726,0.103,0.86096],[0.72906,0.08227,0.82509],[0.7174,0.06318,0.79997],[0.70625,0.04579,0.78392],[0.69771,0.02977,0.77454],[0.69251,0.01466,0.76977],[0.69078,0.0,0.76832]],[[0.0,0.93607,1.60112],[0.32294,0.88909,1.54134],[0.55861,0.76308,1.39136],[0.66624,0.5989,1.22161],[0.67042,0.44367,1.09814],[0.63377,0.32737,1.04444],[0.61132,0.25504,1.03985],[0.62396,0.21464,1.04597],[0.6615,0.18989,1.03452],[0.7021,0.16911,0.99853],[0.72933,0.14741,0.94702],[0.73827,0.12451,0.89369],[0.73277,0.1019,0.84864],[0.71983,0.08085,0.81582],[0.70548,0.06185,0.79457],[0.69328,0.04474,0.78207],[0.68461,0.02908,0.77535],[0.67959,0.01432,0.77218],[0.67797,0.0,0.77126]],[[0.0,0.9452,1.59239],[0.32669,0.89545,1.53102],[0.56099,0.76295,1.37881],[0.66234,0.59278,1.21111],[0.66101,0.43552,1.0955],[0.62504,0.32144,1.05148],[0.60964,0.25322,1.05226],[0.63096,0.21609,1.05639],[0.67352,0.19249,1.0374],[0.71322,0.17104,0.99287],[0.73496,0.14789,0.93574],[0.73688,0.12373,0.88119],[0.72544,0.10044,0.8385],[0.70885,0.07927,0.80988],[0.69307,0.06049,0.79303],[0.68092,0.04375,0.78416],[0.67293,0.02845,0.77998],[0.66857,0.01403,0.77824],[0.66721,0.0,0.77777]],[[0.0,0.95382,1.58317],[0.33022,0.90119,1.52026],[0.56277,0.76203,1.36619],[0.65766,0.58601,1.20134],[0.65138,0.42729,1.09438],[0.61729,0.31607,1.05995],[0.60989,0.25222,1.06487],[0.63971,0.21813,1.06528],[0.68586,0.19516,1.03765],[0.72279,0.17257,0.98479],[0.73771,0.14779,0.92344],[0.73231,0.12243,0.86952],[0.71562,0.09865,0.83082],[0.69663,0.07756,0.80738],[0.68076,0.05916,0.79527],[0.66978,0.04285,0.78994],[0.66326,0.02792,0.788],[0.66002,0.01379,0.78745],[0.65906,0.0,0.78735]],[[0.0,0.9619,1.57347],[0.33354,0.90627,1.5091],[0.56395,0.7603,1.35358],[0.65224,0.57865,1.19243],[0.64167,0.41909,1.09483],[0.61073,0.31134,1.06971],[0.61214,0.25204,1.07732],[0.64993,0.22065,1.07228],[0.69798,0.19774,1.0352],[0.73026,0.1736,0.97467],[0.73732,0.14707,0.91086],[0.72482,0.12065,0.85955],[0.70406,0.09663,0.82627],[0.68423,0.07585,0.80863],[0.66973,0.05795,0.80118],[0.66102,0.0421,0.79893],[0.65667,0.02752,0.79869],[0.6549,0.01362,0.79892],[0.65445,0.0,0.79904]],[[0.0,0.96972,1.56284],[0.33674,0.91082,1.49705],[0.56451,0.7576,1.34051],[0.64584,0.57037,1.18416],[0.63164,0.41067,1.09702],[0.60536,0.3072,1.08108],[0.61661,0.25273,1.08974],[0.66181,0.22366,1.07722],[0.70977,0.20017,1.02978],[0.7353,0.174,0.96249],[0.73352,0.14565,0.89832],[0.71442,0.11838,0.85181],[0.69112,0.09442,0.82538],[0.67231,0.07419,0.81393],[0.66078,0.05691,0.81075],[0.65546,0.04156,0.81082],[0.65391,0.02729,0.81153],[0.65392,0.01354,0.81201],[0.65408,0.0,0.81216]],[[0.0,0.97655,1.55222],[0.33954,0.91441,1.4852],[0.56439,0.75417,1.32821],[0.63907,0.56196,1.17737],[0.62233,0.40287,1.10077],[0.60182,0.30409,1.09285],[0.62286,0.25419,1.10064],[0.67386,0.22675,1.07939],[0.71959,0.20206,1.02209],[0.73711,0.17368,0.95001],[0.72682,0.1437,0.88783],[0.70277,0.11594,0.84768],[0.67908,0.09238,0.82839],[0.66311,0.07286,0.8224],[0.6557,0.05623,0.82223],[0.65428,0.04131,0.82332],[0.65566,0.02724,0.82397],[0.65739,0.01355,0.82409],[0.65812,0.0,0.82406]],[[0.0,0.98272,1.54121],[0.34205,0.91722,1.47307],[0.56362,0.7499,1.3162],[0.63176,0.55314,1.1718],[0.61351,0.39545,1.1061],[0.60002,0.30187,1.10518],[0.63088,0.25636,1.11018],[0.6861,0.22988,1.07892],[0.72743,0.20338,1.01228],[0.73577,0.17261,0.93752],[0.71756,0.14126,0.87964],[0.69045,0.11342,0.84719],[0.66853,0.09055,0.835],[0.65708,0.07188,0.83339],[0.65469,0.0559,0.83475],[0.65741,0.04133,0.83549],[0.66159,0.02737,0.83504],[0.66486,0.01365,0.83418],[0.66607,0.0,0.83377]],[[0.0,0.98817,1.52982],[0.34427,0.91922,1.46073],[0.5622,0.7448,1.30458],[0.62398,0.54399,1.16753],[0.60538,0.38854,1.11296],[0.60005,0.3006,1.11778],[0.64045,0.25913,1.11797],[0.69796,0.23285,1.07574],[0.7328,0.20401,1.00087],[0.73131,0.17083,0.92586],[0.70642,0.13847,0.87447],[0.67855,0.11099,0.85047],[0.66059,0.08909,0.84464],[0.65498,0.07135,0.84577],[0.65798,0.05594,0.84688],[0.66458,0.0416,0.8458],[0.67106,0.02764,0.84329],[0.67545,0.0138,0.84092],[0.67698,0.0,0.83998]],[[0.0,0.99307,1.51757],[0.34626,0.9204,1.44765],[0.56001,0.7386,1.29296],[0.61547,0.53418,1.16456],[0.59782,0.38197,1.12167],[0.60212,0.30029,1.13085],[0.65178,0.26254,1.12387],[0.70934,0.23559,1.06962],[0.73535,0.2038,0.98793],[0.72358,0.16827,0.9155],[0.69373,0.13538,0.87283],[0.6678,0.10874,0.85771],[0.65605,0.08809,0.85693],[0.65735,0.07129,0.85869],[0.66569,0.05635,0.85749],[0.67547,0.04209,0.85309],[0.68344,0.02803,0.8476],[0.68835,0.01401,0.84329],[0.68998,0.0,0.84168]],[[0.0,0.99695,1.50555],[0.34782,0.92064,1.43505],[0.55727,0.73186,1.28248],[0.6071,0.52468,1.16324],[0.5917,0.37646,1.13132],[0.60607,0.30098,1.14287],[0.66348,0.26612,1.12708],[0.71865,0.23767,1.06133],[0.73464,0.20274,0.97538],[0.71377,0.16529,0.90818],[0.6817,0.13246,0.87513],[0.66027,0.10706,0.86765],[0.65592,0.0877,0.8695],[0.66382,0.07168,0.86945],[0.67626,0.057,0.86424],[0.68775,0.04267,0.85565],[0.69596,0.02842,0.84689],[0.7006,0.01419,0.84062],[0.70208,0.0,0.83837]],[[0.0,1.0,1.4933],[0.34905,0.91998,1.42243],[0.5539,0.72437,1.27272],[0.59864,0.51518,1.16345],[0.58686,0.3718,1.14208],[0.61188,0.30258,1.154],[0.67556,0.26981,1.1277],[0.72587,0.23904,1.05106],[0.73082,0.20084,0.9635],[0.70234,0.16195,0.90404],[0.67093,0.12982,0.88107],[0.65633,0.10597,0.87954],[0.66005,0.08787,0.88137],[0.67367,0.07244,0.87721],[0.68856,0.05779,0.86663],[0.70008,0.04326,0.85338],[0.70725,0.02876,0.84142],[0.71086,0.01434,0.8334],[0.71193,0.0,0.83061]]];
+var IWATA_REF = { fc: 320, rt: 12.7, T0: 0.707107, norm: 346.5424935568508 };
+// entry 152 (user report: "there must be a way to choose an exit driver in this
+// horn by cutting through this long neck to the correct driver size"): the
+// decoded Iwata's generative entry is a long slow-expanding neck; real builds
+// saw it off where the section reaches the driver exit. The cut row is where
+// the MEAN streamline radius reaches exitD/2 (the neck is near-circular, so a
+// grid row is an excellent approximation of the physical saw plane).
+function iwataCutRow(exitD, sc) {
+  if (!(exitD > 0)) return null;
+  var G = IWATA_GRID, target = (exitD / 2) / sc;
+  // entry 233: the cut row is chosen by SECTION AREA (quarter-polygon shoelace x 4,
+  // in the grid's x/y), not by the mean of the 19 streamline radii -- the stats
+  // called the cut "area-equiv" while the code matched mean radius, which at the
+  // 2-inch cut (64 x 37 mm rim) gave 9% LESS area than the driver exit: the
+  // adapter would have contracted. meanR is now the true area-equivalent radius.
+  for (var i = 0; i < G.length; i++) {
+    var A = 0;
+    for (var g = 0; g < 18; g++) A += G[i][g][0] * G[i][g + 1][1] - G[i][g + 1][0] * G[i][g][1];
+    A = 2 * Math.abs(A);   // quarter polygon (axis-to-axis, the axis legs add nothing) x 4 / 2
+    var rEq = Math.sqrt(A / Math.PI);
+    if (rEq >= target) {
+      if (i === 0) return null;   // the driver exit is smaller than the natural throat -- no cut
+      return { row: i, zRaw: G[i][18][2], meanR: rEq };
+    }
+  }
+  return null;   // never reaches the exit diameter (huge exitD) -- no cut
+}
+// entry 233: the driver adapter loft used by iwataWall (meridians) and
+// buildIwataRings (every azimuth): cubic Hermite in r over a linear z ramp from
+// the round exit (r = exR, dr/dz = 0: the driver bore) to the streamline's cut
+// point (r0 at z0, slope = the streamline's own first-segment slope). NA = 14
+// stations. Returns the prepended array; the cut geometry is shifted by +adL.
+function iwataAdapterPts(z0, r0, slope0, exR, adL, NA) {
+  var out = [], zSpan = z0 + adL, m1 = slope0 * zSpan;
+  for (var a = 0; a < NA; a++) {
+    var u = a / NA, u2 = u * u, u3 = u2 * u;
+    var h00 = 2 * u3 - 3 * u2 + 1, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+    out.push({ z: u * zSpan, r: h00 * exR + h01 * r0 + h11 * m1 });
+  }
+  return out;
+}
+function iwataAdapterMeridian(W, exR, adL, fac) {
+  if (!W || W.length < 2 || !(adL > 0)) return W;
+  var dz = W[1].z - W[0].z, sl = Math.abs(dz) > 1e-9 ? (W[1].r - W[0].r) / dz : 0;
+  var out = iwataAdapterPts(W[0].z, W[0].r, sl, exR, adL, 14);
+  if (fac) for (var a = 0; a < out.length; a++) out[a].r *= fac[a];
+  for (var i = 0; i < W.length; i++) out.push({ z: W[i].z + adL, r: W[i].r });
+  return out;
+}
+function iwataWall(P) {
+  // entry 102 (user report: "I do not see this narrowing throat in other iwata
+  // horns"): he was right -- the entry-99 throat-correction factor WAS the
+  // narrowing (a bulge fading over 12% of the march whenever the requested
+  // throat exceeded the grid's natural one). His quasi-Iwata is a FIXED-
+  // PROPORTION design: one shape, scaled. fc alone sets the scale
+  // (size = ref_fc/fc), and the throat FOLLOWS the geometry:
+  // throat_r = 12.7 mm * (320/fc). It is REPORTED, not controlled.
+  var sc = IWATA_REF.norm * (IWATA_REF.fc / Math.max(30, P.fc));
+  var H = [], V = [], i;
+  var nCut9 = Math.min(0.9, Math.max(0, P.decoupeN !== undefined ? P.decoupeN : 0.3));
+  var vEnd9 = Math.max(2, Math.round((1 - nCut9) * (IWATA_GRID.length - 1)) + 1);   // the V streamline (t = 90) takes the FULL cut
+  for (i = 0; i < IWATA_GRID.length; i++) {
+    var h9 = IWATA_GRID[i][18];
+    H.push({ z: h9[2] * sc, r: h9[0] * sc });
+    var v9 = IWATA_GRID[Math.min(i, vEnd9 - 1)][0];   // past the cut: HOLD the end point (equal-length H/V for the prof pipeline)
+    V.push({ z: v9[2] * sc, r: v9[1] * sc });
+  }
+  var cut9 = iwataCutRow(P.iwExitD, sc), cutZ9 = 0, cutU9 = 0;
+  // entry 233 (flutter_happier, forum #47: "I had to fill the gap induced by the
+  // modified throat value (400 Hz fc and 2\" throat)"): the saw plane is NOT a
+  // round hole. At the 2" cut the Iwata section is already ~64 x 37 mm (H x V)
+  // and the streamlines cross the cut at different z (1.6 mm spread), so a
+  // round Ø50.8 driver exit sat inside the wall on the V axis and outside it
+  // on the H axis -- the gap he filled by hand. The fix is a DRIVER ADAPTER:
+  // a short loft from the round, planar driver exit (Ø = the requested exit,
+  // z = 0) to the actual cut section, C1 at both ends (tangent to the driver
+  // bore at z = 0, tangent to each streamline at the cut). Length = the
+  // Driver-entry dial when set, else 0.4 x cut diameter (min 10 mm). The cut
+  // section itself is untouched; the adapter is prepended, so the horn now
+  // starts at the driver face. Rings (buildIwataRings) and the H/V meridians
+  // read from them carry the same loft, so STL / STEP / BEM / drawing agree.
+  var adL9 = 0, exR9 = 0;
+  if (cut9) {
+    cutZ9 = cut9.zRaw * sc; cutU9 = cut9.row / (IWATA_GRID.length - 1);
+    H = H.slice(cut9.row); V = V.slice(cut9.row);
+    for (var c9 = 0; c9 < H.length; c9++) { H[c9] = { z: H[c9].z - cutZ9, r: H[c9].r }; V[c9] = { z: V[c9].z - cutZ9, r: V[c9].r }; }
+    exR9 = P.iwExitD / 2;
+    adL9 = (P.exitLen > 0) ? P.exitLen : Math.max(10, 0.8 * cut9.meanR * sc);
+  }
+  var res9 = { wall: H, wallV: V, sEnd: sc * IWATA_GRID[IWATA_GRID.length - 1][0][2] - cutZ9 + adL9, terminated: "table",
+           iwScale: sc, iwThroatR: (cut9 ? cut9.meanR : IWATA_GRID[0][18][0]) * sc,
+           iwAdaptL: adL9, iwExitR: exR9, iwAdaptScale: null,
+           iwCutU: cutU9, iwCutZ: cutZ9, iwCutD: cut9 ? 2 * cut9.meanR * sc : 0,
+           iwTrunc: (P.trunc !== undefined && P.trunc > 0 ? P.trunc : 268),
+           iwN: nCut9, iwP: (P.decoupeP !== undefined ? P.decoupeP : 11),
+           Ttrace: null, diagnostics: [] };
+  if (adL9 > 0) {   // entry 233: area-monotone adapter -- per-ring radial factors measured on a 64-azimuth loft, shared by rings and meridians
+    res9.iwAdaptScale = buildIwataRings(res9, 64, 0, 0, { factorsOnly: true });
+    res9.wall = iwataAdapterMeridian(H, exR9, adL9, res9.iwAdaptScale);
+    res9.wallV = iwataAdapterMeridian(V, exR9, adL9, res9.iwAdaptScale);
+  }
+  return res9;
+}
+// Rings from the decoded grid: the DECOUPE cuts each STREAMLINE at
+// uCut(t) = 1 - n*|sin t|^p (t = the streamline's ellipse parameter, 90-5g deg,
+// exactly his sheet's readout), then each iso-fraction ring is resampled to
+// uniform GEOMETRIC azimuth per quadrant and mirrored (quarter symmetry).
+function buildIwataRings(horn, segs, flareR, wrap, opts9) {
+  var G = IWATA_GRID, sc = horn.iwScale, n9 = Math.min(0.9, Math.max(0, horn.iwN || 0)), p9 = Math.max(0.1, horn.iwP || 1);
+  var M = 130, NS = G.length, NG = 19;
+  var pos = new Float32Array(M * segs * 3);
+  // entry 100 (rollback fix, two mechanisms): (a) rings are interpolated between
+  // adjacent streamlines at the SAME ABSOLUTE march fraction -- relative-fraction
+  // lerp joined points at different phases of the fold and the segments cut
+  // THROUGH the rolled lip (the striations in the user's render); (b) each angle
+  // folds into the quarter's parameter space with both axes sampled exactly
+  // (segs % 4 == 0), mirrored by sign -- azimuth-scan resampling folded rings
+  // where streamline azimuths are non-monotone in the roll.
+  // entry 101 (user report: "this roll back needs to be controlled cut"): HIS uncut
+  // march COILS past the roll on low-t streamlines (the H tail literally spirals
+  // twice inside the horn -- verified in his g18 data). Each streamline is now
+  // truncated where its OWN planar turning reaches truncDeg (the jmlc convention),
+  // and the decoupe applies on top of that.
+  var truncLim = (horn.iwTrunc || 268) * Math.PI / 180;
+  var rollFr = [];
+  for (var gR = 0; gR < NG; gR++) {
+    var tot = 0, fr = 1;
+    for (var iR = 2; iR < NS; iR++) {
+      var A1 = G[iR - 1][gR], A0 = G[iR - 2][gR], A2 = G[iR][gR];
+      var r1 = Math.hypot(A1[0], A1[1]) - Math.hypot(A0[0], A0[1]), z1 = A1[2] - A0[2];
+      var r2 = Math.hypot(A2[0], A2[1]) - Math.hypot(A1[0], A1[1]), z2 = A2[2] - A1[2];
+      if (Math.hypot(r1, z1) < 1e-9 || Math.hypot(r2, z2) < 1e-9) continue;
+      tot += Math.abs(Math.atan2(z1 * r2 - r1 * z2, z1 * z2 + r1 * r2));
+      if (tot >= truncLim) { fr = iR / (NS - 1); break; }
+    }
+    rollFr.push(fr);
+  }
+  function ucOf(g) { var t = (90 - 5 * g) * Math.PI / 180; return Math.min(rollFr[g], 1 - n9 * Math.pow(Math.abs(Math.sin(t)), p9)); }
+  function ptAbs(g, uAbs) { // sample streamline g at ABSOLUTE march fraction, clamped to its own cut
+    var u = Math.min(uAbs, ucOf(g));
+    var x = u * (NS - 1), i0 = Math.min(NS - 2, Math.floor(x)), f = x - i0;
+    var A = G[i0][g], B = G[i0 + 1][g];
+    return [(A[0] + f * (B[0] - A[0])) * sc, (A[1] + f * (B[1] - A[1])) * sc, (A[2] + f * (B[2] - A[2])) * sc];
+  }
+  var NA9 = (horn.iwAdaptL > 0) ? 14 : 0, adL9 = horn.iwAdaptL || 0;   // entry 233: driver adapter rings prepended
+  if (NA9) pos = new Float32Array((M + NA9) * segs * 3);
+  for (var iM = 0; iM < M; iM++) {
+    var w = iM / (M - 1);
+    var k = (iM + NA9) * segs * 3;
+    for (var j = 0; j < segs; j++) {
+      var tj = 2 * Math.PI * j / segs;
+      var tq = tj % Math.PI; if (tq > Math.PI / 2) tq = Math.PI - tq;
+      var pP = 18 * tq / (Math.PI / 2);
+      var i2 = Math.min(17, Math.floor(pP)), f2 = Math.min(1, pP - i2);
+      var g1 = 18 - i2, g2 = 18 - (i2 + 1);                 // qp ordering was g18 -> g0
+      var uc12 = ucOf(g1) + f2 * (ucOf(g2) - ucOf(g1));
+      var uS9 = horn.iwCutU || 0;   // entry 152: driver-exit cut = the march starts at the saw plane
+      var uT = uS9 + w * Math.max(0, uc12 - uS9);
+      var A9 = ptAbs(g1, uT), B9 = ptAbs(g2, uT);
+      var px = A9[0] + f2 * (B9[0] - A9[0]);
+      var py = A9[1] + f2 * (B9[1] - A9[1]);
+      var pzq = A9[2] + f2 * (B9[2] - A9[2]);
+      pos[k + j * 3] = pzq - (horn.iwCutZ || 0) + adL9;
+      pos[k + j * 3 + 1] = (Math.cos(tj) >= 0 ? 1 : -1) * px;
+      pos[k + j * 3 + 2] = (Math.sin(tj) >= 0 ? 1 : -1) * py;
+    }
+  }
+  if (NA9) {   // entry 233: per-azimuth Hermite loft from the round driver exit to the cut section
+    var kC = NA9 * segs * 3, kN = (NA9 + 1) * segs * 3;
+    for (var jA = 0; jA < segs; jA++) {
+      var zc = pos[kC + jA * 3] - adL9, xc = pos[kC + jA * 3 + 1], yc = pos[kC + jA * 3 + 2], rc = Math.hypot(xc, yc);
+      var zn = pos[kN + jA * 3] - adL9, rn = Math.hypot(pos[kN + jA * 3 + 1], pos[kN + jA * 3 + 2]);
+      var slA = Math.abs(zn - zc) > 1e-9 ? (rn - rc) / (zn - zc) : 0;
+      var ptsA = iwataAdapterPts(zc, rc, slA, horn.iwExitR, adL9, NA9);
+      var ux = rc > 1e-9 ? xc / rc : Math.cos(2 * Math.PI * jA / segs), uy = rc > 1e-9 ? yc / rc : Math.sin(2 * Math.PI * jA / segs);
+      for (var aA = 0; aA < NA9; aA++) {
+        var kA = aA * segs * 3 + jA * 3;
+        pos[kA] = ptsA[aA].z; pos[kA + 1] = ux * ptsA[aA].r; pos[kA + 2] = uy * ptsA[aA].r;
+      }
+    }
+    // area-monotone: the H axis expands while the V axis contracts (round exit ->
+    // elongated Iwata section) and the raw Hermite product dips ~5-8% mid-way.
+    // Scale each adapter ring radially so its polygon area runs LINEARLY from the
+    // exit area to the cut-ring area. Factors depend on the ring index only, so
+    // they are computed once (64 azimuths, iwataWall) and shared with the meridians.
+    var fac9 = horn.iwAdaptScale;
+    if (!fac9) {
+      fac9 = [];
+      function ringArea9(iR) { var A = 0; for (var jR = 0; jR < segs; jR++) { var a1 = (iR * segs + jR) * 3, b1 = (iR * segs + (jR + 1) % segs) * 3; A += pos[a1 + 1] * pos[b1 + 2] - pos[b1 + 1] * pos[a1 + 2]; } return Math.abs(A) / 2; }
+      var A0 = ringArea9(0), A1 = ringArea9(NA9);
+      for (var aF = 0; aF < NA9; aF++) { var At = A0 + (A1 - A0) * aF / NA9, Ar = ringArea9(aF); fac9.push(Ar > 1e-9 ? Math.sqrt(At / Ar) : 1); }
+    }
+    if (opts9 && opts9.factorsOnly) return fac9;
+    for (var aS = 0; aS < NA9; aS++) for (var jS = 0; jS < segs; jS++) { var kS = aS * segs * 3 + jS * 3; pos[kS + 1] *= fac9[aS]; pos[kS + 2] *= fac9[aS]; }
+  } else if (opts9 && opts9.factorsOnly) return null;
+  return { rings: pos, M: M + NA9, segs: segs };
+}
+function araiFinBlockage(res, P) {
+  // entry 171 (community report + Arai's own published figure): the fins block
+  // cross-sectional area, so the sidewall must move when the fin mode changes
+  // to preserve the expansion law (his third panel: finless walls pull INWARD,
+  // dotted line). The calibrated walls ARE the 4-fin original (calibration was
+  // against the published finned drawings), so: mode arai4 -> unchanged
+  // (bit-compat); off/on -> adjust by the blockage DELTA relative to arai4.
+  // Per-station blockage: a blade at angle th crosses station z where
+  // z/cos(th) lies in [R0, R1], presenting width finT / cos(th).
+  if (!res || !res.wall || !res.finLayoutArai4) return res;
+  var mode = P.fins || "off";
+  if (mode === "arai4") return res;
+  var fT = P.finT || 10;
+  var wArr = res.wall, n = wArr.length, Lz9 = wArr[n - 1].z || 1;
+  // entry 172 ("there are some issues still with the adaptor length affecting
+  // the horn side walls"): the first pass used a HARD crossing indicator per
+  // blade and +-4-STATION averaging -- station counts are not physical, so at
+  // dense sampling the ramps collapsed into visible steps (a notch right
+  // after the adapter, jags at each blade's entry/exit). v2: smooth in z --
+  // per-blade smoothstep ramps of width 6% of the horn length at entry and
+  // exit, and a smoothstep GATE opening after the adapter (whose linear wedge
+  // must stay untouched, entries 81+83).
+  var rw9 = 25;   // entry 174: FIXED physical ramp width (a %-of-length ramp broke translation invariance across adapter lengths)
+  function ss9(x) { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); }
+  function Bof(layout, z) {
+    if (!layout || !layout.angles) return 0;
+    // entry 174 ("the adaptor should not modify the Yuichi horn at all"): the
+    // blade windows are anchored at the FAN ORIGIN (layout.originZ) -- R0/R1
+    // are radial distances from the fan apex, and the apex translates with the
+    // adapter. The previous window used R cos(th) in ABSOLUTE z, so at long
+    // adapters the blockage landed ~an adapter-length too early, the
+    // adaptL-keyed gate fought it, and the interference drew a square collar
+    // after the adapter. With the origin honored, the window translates with
+    // the horn automatically and NO adapter gate is needed (the fan zone
+    // starts past the wedge by construction).
+    var B = 0, o9 = layout.originZ || 0;
+    for (var bi = 0; bi < layout.angles.length; bi++) {
+      var c = Math.max(0.2, Math.cos(layout.angles[bi] * Math.PI / 180));
+      var zIn = o9 + layout.R0 * c, zOut = o9 + layout.R1 * c;
+      var g = ss9((z - (zIn - rw9)) / (2 * rw9)) * (1 - ss9((z - (zOut - rw9)) / (2 * rw9)));
+      B += g * fT / c;
+    }
+    return B;
+  }
+  var ref = res.finLayoutArai4, tgt = mode === "on" ? res.finLayout : null;
+  var w = wArr;
+  var d = new Array(n);
+  var zJ9 = (P.adaptL || 0);   // junction clamp: protects the ADAPTER (whose linear wedge must stay untouched) from the entry ramp's backward bleed; the horn-side pattern stays origin-anchored and translation-invariant
+  for (var i = 0; i < n; i++) {
+    var gJ9 = ss9((w[i].z - zJ9) / 12);
+    d[i] = gJ9 * ((tgt ? Bof(tgt, w[i].z) : 0) - Bof(ref, w[i].z)) / 2;
+  }
+  // entry 175 ("why is there these two sections of the throat"): near the
+  // throat the blades block up to ~66% of the local channel, so pure width
+  // subtraction demands a wall BELOW the throat -- the old throat-clamp +
+  // monotone guard converted that impossible demand into a FLAT COLLAR (a
+  // 35 mm parallel tube grafted after the adapter: the reported "second
+  // throat"). Arai's own figure deviates MID-BODY and tapers to nothing at
+  // the throat. Mechanism here: a GROWTH FLOOR -- the compensated wall keeps
+  // at least 30% of the reference's expansion everywhere, so the correction
+  // phases in exactly as fast as the opening channel can afford it. Floor ->
+  // 25 mm blur -> floor (the blur removes the floor-engage corner).
+  var rt0 = w[0].r;
+  var aRef9 = new Array(n), aC9 = new Array(n);
+  for (var i3 = 0; i3 < n; i3++) { aRef9[i3] = w[i3].r; aC9[i3] = Math.max(rt0, w[i3].r + d[i3]); }
+  function floor9(arr) {
+    for (var f9 = 1; f9 < n; f9++) arr[f9] = Math.max(arr[f9], arr[f9 - 1] + 0.30 * (aRef9[f9] - aRef9[f9 - 1]));
+    return arr;
+  }
+  floor9(aC9);
+  var dEff9 = new Array(n);
+  for (var b9 = 0; b9 < n; b9++) dEff9[b9] = aC9[b9] - aRef9[b9];
+  var dS9 = new Array(n);
+  for (var s9 = 0; s9 < n; s9++) {
+    var acc9 = 0, wsum9 = 0;
+    for (var t9 = 0; t9 < n; t9++) {
+      var dz9 = Math.abs(w[t9].z - w[s9].z);
+      if (dz9 > 25) continue;
+      var wg9 = 1 - dz9 / 25;
+      acc9 += wg9 * dEff9[t9]; wsum9 += wg9;
+    }
+    dS9[s9] = (acc9 / Math.max(1e-9, wsum9)) * ss9((w[s9].z - zJ9) / 12);   // the blur must not re-import deltas across the junction
+  }
+  for (var u9 = 0; u9 < n; u9++) aC9[u9] = Math.max(rt0, aRef9[u9] + Math.min(0, Math.max(dS9[u9], -(tgt ? 1e9 : 1e9)))) ;
+  for (var u29 = 0; u29 < n; u29++) aC9[u29] = aRef9[u29] + dS9[u29];
+  floor9(aC9);
+  for (var v9 = 0; v9 < n; v9++) w[v9] = { z: w[v9].z, r: Math.max(rt0, aC9[v9]) };
+  res.finWallDelta = dS9;
+  return res;
+}
+function computeFamily(P) {
+  var res;
+  if (P.family === "swh") res = swhWall(P);
+  else if (P.family === "tractrix") res = tractrixWall(P);
+  else if (P.family === "hypex") res = hypexWall(P);
+  else if (P.family === "conical") res = conicalWall(P);
+  else if (P.family === "os") res = osseWall(P);
+  else if (P.family === "osc") res = osWall(P);      // AUDIT #14: Classic OS (Geddes 1989) now selectable -- osWall was reachable-but-unrouted
+  else if (P.family === "wn") res = wnWall(P);       // William Neile-inspired biradial (equal-path construction)
+  else if (P.family === "rosse") res = rosseWall(P);
+  else if (P.family === "cd") res = P.cdRound ? cdWallRound(P) : cdWall(P);
+  else if (P.family === "biradial") res = araiFinBlockage(araiOptWall(P), P); // UI family: Arai optimized (2026-07-13); entry 171: fin-blockage wall compensation
+  else if (P.family === "arai") res = araiWall(P);         // legacy straight-fan wall, preserved + smoke-anchored
+  else if (P.family === "cd82") res = keele82Wall(P); // UI-retired 2026-07-13 (replaced by biradial at the user's request); preserved + smoke-guarded
+  else if (P.family === "jmlcell") res = jmlcEllWall(P);
+  else if (P.family === "iwata") res = iwataWall(P);   // entry 92 rewrite: the decoded shape-table family
+  else res = jmlcWall(P);
+  // AUDIT #4 (2026-07-13): mouth-referenced PETF is a fixed-point problem -- the single
+  // extra pass could oscillate between solutions/termination states. Bounded solver:
+  // max 12 iterations, under-relaxation 0.6, dual tolerance (reference coordinate +
+  // final mouth radius), two-cycle detection, termination-state history.
+  if (P.petf && P.petfRef === "mouth" && !P.sEndEst) {
+    var est = res.sEnd, hist = [est], termHist = [res.terminated], mouthHist = [];
+    var conv = false, iters = 0, resid = Infinity, cycle = false;
+    function mouthOf(r9) { var mr9 = 0; for (var q9 = 0; q9 < r9.wall.length; q9++) if (r9.wall[q9].r > mr9) mr9 = r9.wall[q9].r; return mr9; }
+    mouthHist.push(mouthOf(res));
+    for (iters = 1; iters <= 12; iters++) {
+      var trial = computeFamily(Object.assign({}, P, { sEndEst: est }));
+      var newEnd = trial.sEnd, newMouth = mouthOf(trial);
+      resid = Math.abs(newEnd - est);
+      var mouthResid = Math.abs(newMouth - mouthHist[mouthHist.length - 1]);
+      termHist.push(trial.terminated);
+      res = trial;
+      if (resid < 0.25 && mouthResid < 0.25 && trial.terminated === termHist[termHist.length - 2]) { conv = true; break; }
+      // two-cycle detection: est revisits an earlier value
+      for (var h9 = 0; h9 < hist.length - 1; h9++) if (Math.abs(newEnd - hist[h9]) < 0.1) { cycle = true; break; }
+      if (cycle) break;
+      est = est + 0.6 * (newEnd - est);   // under-relaxation
+      hist.push(newEnd); mouthHist.push(newMouth);
+    }
+    res.petfConverged = conv;
+    res.petfIterations = iters;
+    res.petfResidual = resid;
+    res.petfCycleDetected = cycle;
+    res.petfTerminationHistory = termHist;
+  }
+  var length = 0, mouthR = 0;
+  for (var i = 0; i < res.wall.length; i++) {
+    if (res.wall[i].z > length) length = res.wall[i].z;
+    if (res.wall[i].r > mouthR) mouthR = res.wall[i].r;
+  }
+  res.length = length; res.mouthR = mouthR;
+    // AUDIT #1 (2026-07-13): explicit length semantics. sEnd was overloaded (wavefront
+  // distance in JMLC, axial length in analytic profiles, final z in R-OSSE, averaged
+  // wall movement elsewhere) and the UI labeled all of them "Path s". These fields are
+  // computed uniformly from the generated walls; null when not applicable.
+  if (res && res.wall && res.wall.length > 1) {
+    var _w = res.wall, _v = res.wallV || null, _zmax = 0, _hArc = 0, _vArc = 0, _q1;
+    for (_q1 = 0; _q1 < _w.length; _q1++) if (_w[_q1].z > _zmax) _zmax = _w[_q1].z;
+    if (_v) for (_q1 = 0; _q1 < _v.length; _q1++) if (_v[_q1].z > _zmax) _zmax = _v[_q1].z;
+    for (_q1 = 1; _q1 < _w.length; _q1++) _hArc += Math.hypot(_w[_q1].z - _w[_q1 - 1].z, _w[_q1].r - _w[_q1 - 1].r);
+    if (_v) for (_q1 = 1; _q1 < _v.length; _q1++) _vArc += Math.hypot(_v[_q1].z - _v[_q1 - 1].z, _v[_q1].r - _v[_q1 - 1].r);
+    res.axialDepth = _zmax;
+    res.finalAxialZ = _w[_w.length - 1].z;
+    res.horizontalWallArcLength = _hArc;
+    res.verticalWallArcLength = _v ? _vArc : null;
+    res.wavefrontDistance = (P.family === "jmlc") ? res.sEnd : null;  // only JMLC genuinely marches a wavefront coordinate
+    res.websterCoordinateLength = null;  // set by the loading path per family (audit #2)
+    // sEnd retained as a temporary compatibility alias only.
+  }
+  return res;
+}
+
+/* ============ decimate / morph / per-plane end flares ============ */
+function dec(arr, maxPts, criticalZ) {
+  var out;
+  if (arr.length <= maxPts) out = arr.slice();
+  else {
+    out = [];
+    var step = (arr.length - 1) / (maxPts - 1);
+    for (var i = 0; i < maxPts; i++) out.push(arr[Math.round(i * step)]);
+  }
+  // AUDIT #5 (2026-07-13): fixed increments miss exact junctions (e.g. the Keele
+  // round-to-rect endpoint at 12.7 landed at ~12.6). Insert EXACT critical positions.
+  if (criticalZ && criticalZ.length) {
+    for (var c = 0; c < criticalZ.length; c++) {
+      var zc = criticalZ[c];
+      if (!isFinite(zc) || zc <= out[0].z || zc >= out[out.length - 1].z) continue;
+      var hit = false;
+      for (var q = 0; q < out.length; q++) if (Math.abs(out[q].z - zc) < 1e-6) { hit = true; break; }
+      if (hit) continue;
+      for (var q2 = 1; q2 < out.length; q2++) if (out[q2].z > zc) {
+        var f = (zc - out[q2 - 1].z) / (out[q2].z - out[q2 - 1].z || 1e-12);
+        out.splice(q2, 0, { z: zc, r: out[q2 - 1].r + f * (out[q2].r - out[q2 - 1].r) });
+        break;
+      }
+    }
+  }
+  return out;
+}
+function junctionReport(H, V, criticalZ) {
+  // AUDIT #5: at each declared junction, measure what is actually there. Never claim
+  // tangency where the computed slopes are discontinuous.
+  function slopes(arr, zc) {
+    var iC = -1;
+    for (var q = 0; q < arr.length; q++) if (Math.abs(arr[q].z - zc) < 1e-6) { iC = q; break; }
+    if (iC < 2 || iC > arr.length - 3) return null;
+    var sl = Math.atan2(arr[iC].r - arr[iC - 2].r, arr[iC].z - arr[iC - 2].z) * 180 / Math.PI;
+    var sr = Math.atan2(arr[iC + 2].r - arr[iC].r, arr[iC + 2].z - arr[iC].z) * 180 / Math.PI;
+    return { left: sl, right: sr, d: sr - sl, r: arr[iC].r };
+  }
+  var out = [];
+  for (var c = 0; c < (criticalZ || []).length; c++) {
+    var zc = criticalZ[c];
+    var sh = slopes(H, zc), sv = V ? slopes(V, zc) : null;
+    if (!sh && !sv) continue;
+    out.push({ z: zc,
+               hSlopeDiscDeg: sh ? sh.d : null, vSlopeDiscDeg: sv ? sv.d : null,
+               hLeftDeg: sh ? sh.left : null, hRightDeg: sh ? sh.right : null });
+  }
+  return out;
+}
+
+function endAngleDeg(arr) {
+  var n = arr.length;
+  if (n < 2) return 0;
+  return Math.atan2(arr[n - 1].r - arr[n - 2].r, arr[n - 1].z - arr[n - 2].z) * 180 / Math.PI;
+}
+function flareSweepFor(arr, exitDeg) {
+  // ROUNDOVER SEMANTICS rev. 2 (2026-07-13, user report: sliders dead on self-rolling walls):
+  // rolls TO the target exit angle when the wall ends short of it (flush quarter-roll
+  // behavior, UNCHANGED for cd/conical/hypex/etc.), and rolls PAST a wall that already
+  // exits beyond 90 by the wrap amount (exitDeg - 90). A fully-rolled JMLC at truncation
+  // 175 therefore gains additional lip from the sliders -- never structurally inert.
+  // Never unrolls.
+  var end = endAngleDeg(arr), tgt = (exitDeg || 90);
+  if (end <= 90) return Math.max(0, Math.min(270, tgt - end));       // classic: roll to target
+  return Math.max(0, Math.min(270, tgt - 90));                        // rolled wall: wrap = ADDITIONAL sweep
+}
+function flareArc(zr, R, sweepDeg, steps) {
+  // CURVATURE-CONTINUOUS (G2) ROLL (2026-07-13, the user's printed elliptical-OS photo:
+  // "feels much nicer"). A tangent-matched circular arc still JUMPS in curvature at
+  // the roll start (wall kappa -> 1/R instantly) -- the eye reads a mechanical start
+  // line. Here the curvature RAMPS linearly from the wall's measured end curvature to
+  // 1/R over an entry span (clothoid-like), then rolls at constant 1/R; total heading
+  // change still equals the requested sweep, so wrap semantics are unchanged.
+  if (!R || R <= 0 || sweepDeg <= 0) return [];
+  if (zr.length < 2) return [];   // defect-terminated walls can be 1 point (2026-07-13 crash fix)
+  var n = zr.length, e = zr[n - 1], p = zr[n - 2];
+  var ph = Math.atan2(e.r - p.r, e.z - p.z);
+  var k0 = 0;                                        // wall end curvature (3-pt estimate)
+  if (n >= 3) {
+    var p2 = zr[n - 3];
+    var a1 = Math.atan2(p.r - p2.r, p.z - p2.z);
+    var ds = Math.hypot(e.z - p.z, e.r - p.r) || 1e-9;
+    k0 = (ph - a1) / ds;
+    if (!isFinite(k0) || Math.abs(k0) > 1 / Math.max(R * 0.25, 1)) k0 = 0; // noisy estimate: fall back
+  }
+  var kR = 1 / R, sw = sweepDeg * Math.PI / 180;
+  var Lb = 0.6 * R;                                  // curvature ramp span
+  var dThB = 0.5 * (k0 + kR) * Lb;                   // heading consumed by the ramp
+  if (dThB > 0.6 * sw) { Lb *= 0.6 * sw / dThB; dThB = 0.6 * sw; } // short wraps: shrink the ramp
+  var swC = sw - dThB;                               // remaining constant-R sweep
+  var NB = Math.max(4, Math.round(steps * Lb / (Lb + swC * R)));
+  var NC = Math.max(2, steps - NB);
+  var out = [], z = e.z, r = e.r, th = ph;
+  for (var k1 = 1; k1 <= NB; k1++) {                 // ramp: kappa linear in s
+    var sA = Lb * (k1 - 0.5) / NB, dsB = Lb / NB;
+    var kap = k0 + (kR - k0) * sA / Lb;
+    th += kap * dsB;
+    z += dsB * Math.cos(th); r += dsB * Math.sin(th);
+    out.push({ z: z, r: r });
+  }
+  for (var k2 = 1; k2 <= NC; k2++) {                 // constant-R roll
+    var dsC = swC * R / NC;
+    th += kR * dsC;
+    z += dsC * Math.cos(th); r += dsC * Math.sin(th);
+    out.push({ z: z, r: r });
+  }
+  return out;
+}
+
+function planeProfiles(wall, nPts, A, flareRh, flareRv, flareExit, shape, rho, rhoM, criticalZ) {
+  // round throat -> target section (ellipse or WN rounded-rect), smoothstep ramp; area = pi r^2 per station
+  shape = shape || "ellipse";
+  var P = dec(wall, nPts, criticalZ), M = P.length, cum = [0], i;
+  for (i = 1; i < M; i++)
+    cum.push(cum[i - 1] + Math.hypot(P[i].z - P[i - 1].z, P[i].r - P[i - 1].r));
+  var total = cum[M - 1] || 1;
+  var Hp = [], Vp = [], rhoArr = [], seNArr = [];
+  for (i = 0; i < M; i++) {
+    var u = cum[i] / total, w = u * u * (3 - 2 * u);
+    var Ai = 1 + (A - 1) * w, a, b;
+    if (shape === "rrect") {
+      // entry 199 (the reported tractrix-fins case, ROOT CAUSE): the ramp was ABSOLUTE from the
+      // THROAT radius -- but the horn flares away from rt immediately, so one
+      // station in, a - rho is already large and the section is a rectangle
+      // with big corners: the morph starts at full speed instead of staying
+      // circular near the throat, and the interpolating NURBS turns that
+      // instant onset into azimuthal pleats. RELATIVE ramp: from the LOCAL
+      // round-equivalent radius, so w = 0 gives an exact circle at EVERY
+      // station and w = 1 lands the identical mouth.
+      /* entry 204 (user report: "still not sharp where the 4 sides meet" -- and the
+         measurement agreed: median corner-normal break mid-horn was 7.6 deg
+         because rhoT still ran the SAME leisurely smoothstep as the shape
+         morph, keeping the corner an arc of half the section radius at half
+         the length; sharpness only arrived at the mouth). Classical rect-
+         section craft transitions round-to-sharp in the first third, then
+         runs sharp edges. PACING: when the corner target is small, the rho
+         ramp completes by u = 0.35; large targets keep the original schedule
+         (sharpness = clamp(1 - target/40): target 0 -> early completion,
+         target >= 40 -> unchanged). Area per station preserved either way. */
+      var rhoTarget4 = Math.max(0, rhoM === undefined ? rho : rhoM);
+      var sharp4 = Math.max(0, Math.min(1, 1 - rhoTarget4 / 40));
+      var uT4 = 1 + (0.35 - 1) * sharp4;
+      var uR4 = Math.min(1, u / uT4), wR4 = uR4 * uR4 * (3 - 2 * uR4);
+      var rhoT = P[i].r + (rhoTarget4 - P[i].r) * wR4;
+      var ab = (Math.PI * P[i].r * P[i].r + (4 - Math.PI) * rhoT * rhoT) / 4;
+      b = Math.sqrt(ab / Ai); a = ab / b;
+      if (rhoT > Math.min(a, b)) {                               // clamp + one re-solve for exact area
+        rhoT = Math.min(a, b) * 0.999;
+        ab = (Math.PI * P[i].r * P[i].r + (4 - Math.PI) * rhoT * rhoT) / 4;
+        b = Math.sqrt(ab / Ai); a = ab / b;
+      }
+      rhoArr.push(rhoT);
+    } else if (shape.indexOf("sellipse") === 0) {
+      // Lame section: exponent morphs 2 (round throat) -> n (mouth) on the same smoothstep,
+      // with exact per-station area preservation at the morphed exponent
+      rhoArr.push(0);
+      var nMouth = parseFloat(shape.split(":")[1]) || 2.5;
+      var nEff = 2 + (nMouth - 2) * w;
+      seNArr.push(nEff);
+      var fac = superellipseAreaFactor(nEff);
+      var ab2 = Math.PI * P[i].r * P[i].r / fac;   // A_lame = fac*a*b == pi r^2
+      b = Math.sqrt(ab2 / Ai); a = ab2 / b;
+    } else {
+      rhoArr.push(0);
+      var f = Math.sqrt(Ai);
+      a = P[i].r * f; b = P[i].r / f;
+    }
+    Hp.push({ z: P[i].z, r: a });
+    Vp.push({ z: P[i].z, r: b });
+  }
+  var FS = 14;
+  var fh = flareArc(Hp, flareRh, flareSweepFor(Hp, flareExit), FS);
+  var fv = flareArc(Vp, flareRv, flareSweepFor(Vp, flareExit), FS);
+  var nf = Math.max(fh.length, fv.length);
+  while (fh.length < nf) fh.push(fh.length ? fh[fh.length - 1] : Hp[M - 1]);
+  while (fv.length < nf) fv.push(fv.length ? fv[fv.length - 1] : Vp[M - 1]);
+  while (rhoArr.length < Hp.length + fh.length) rhoArr.push(rhoArr[rhoArr.length - 1] || rho);
+  while (seNArr.length && seNArr.length < Hp.length + fh.length) seNArr.push(seNArr[seNArr.length - 1]);
+  return { H: Hp.concat(fh), V: Vp.concat(fv), baseStations: M, shape: shape, rho: rho, rhoArr: rhoArr,
+           seNArr: seNArr.length ? seNArr : null,
+           flareToPlane: true, flareExit: (flareExit || 90) * Math.PI / 180, flareR: flareRh };
+}
+
+/* boundary point of the cross-section at perimeter fraction u in [0,1), CCW from (a,0).
+   returns {x: horizontal, y: vertical, wH: blend weight (1 = pure H-plane, 0 = pure V-plane)} */
+function sectionPoint(shape, a, b, rho, u) {
+  if (shape && shape.indexOf("sellipse") === 0) {
+    // Lame curve, published eqs (7)-(8): x = sgn(cos)*a*|cos|^(2/n), y = sgn(sin)*b*|sin|^(2/n)
+    var nSE = parseFloat(shape.split(":")[1]) || 2.5;
+    var th2 = 2 * Math.PI * u, c2 = Math.cos(th2), s2 = Math.sin(th2), e = 2 / nSE;
+    return { x: Math.sign(c2) * a * Math.pow(Math.abs(c2), e), y: Math.sign(s2) * b * Math.pow(Math.abs(s2), e), wH: c2 * c2 };
+  }
+  if (shape !== "rrect") {
+    var th = 2 * Math.PI * u, c = Math.cos(th), s = Math.sin(th);
+    return { x: a * c, y: b * s, wH: c * c };
+  }
+  // entry 206 (user report: "the back of the horn... a lot of errors" after the
+  // sharp-corner pacing): the old allocation gave the corner 3/4 of the
+  // vertices unconditionally -- right for a WN-ish rounded rect, catastrophic
+  // when rho -> 0: 32 of 48 samples landed COINCIDENT on the four corner
+  // points, degenerate quads zeroed the offset normals, and the outer shell
+  // collapsed onto the inner in stripes. ARC-LENGTH-ADAPTIVE allocation: per
+  // quadrant half, samples split between the flat and the half-arc by their
+  // true lengths; the corner stays PINNED at vv = 0.5 (one exact vertex --
+  // the crease machinery of entries 202/204 depends on that fixed index). At
+  // large rho this approximates the old corner-heavy spirit; at rho 0 the
+  // flats inherit the samples and exactly one vertex sits on the corner.
+  rho = Math.min(rho, 0.999 * Math.min(a, b)); // a rounded rectangle cannot have rho > min(a,b)
+  var sh = Math.max(0.02, a - rho), sv = Math.max(0.02, b - rho);
+  u = ((u % 1) + 1) % 1;
+  var q = Math.floor(u * 4), v = u * 4 - q;
+  var x, y, wH, t;
+  var vv = (q === 1 || q === 3) ? 1 - v : v; // mirrored quadrants traverse reversed
+  var arcQ = rho * Math.PI / 4;              // half-arc length
+  var b1 = sv / Math.max(1e-9, sv + arcQ);   // first-half breakpoint: flat | half-arc
+  var b2 = arcQ / Math.max(1e-9, arcQ + sh); // second-half breakpoint: half-arc | flat
+  /* entry 207 (user report: "ribs perpendicular to the line where the faces
+     meet"): the geometry measured rib-free to 0.02 mm -- the visible banding
+     was SKINNY-QUAD SHADING at the crease (uniform arc-length sampling left
+     16 mm azimuthal gaps beside the corner). The flat mapping now eases with
+     p = 1.55 toward the corner: quad width at the crease drops ~3x, spacing
+     stays bounded (no coincidence at any segs), the corner stays pinned. */
+  var pE7 = 1.55;
+  if (vv < 0.5) {
+    var h1 = vv * 2;
+    if (h1 < b1) { x = a; y = sv * (1 - Math.pow(1 - h1 / Math.max(1e-9, b1), pE7)); wH = 1; }
+    else { t = (h1 - b1) / Math.max(1e-9, 1 - b1) * Math.PI / 4;
+      x = sh + rho * Math.cos(t); y = sv + rho * Math.sin(t); wH = Math.cos(t) * Math.cos(t); }
+  } else {
+    var h2 = (vv - 0.5) * 2;
+    if (h2 < b2) { t = Math.PI / 4 + h2 / Math.max(1e-9, b2) * Math.PI / 4;
+      x = sh + rho * Math.cos(t); y = sv + rho * Math.sin(t); wH = Math.cos(t) * Math.cos(t); }
+    else { x = sh * (1 - Math.pow((h2 - b2) / Math.max(1e-9, 1 - b2), pE7)); y = b; wH = 0; }   /* p (not 1/p): f-prime(0) = 0 compresses at the corner; the inverse exponent EXPANDED the first step to 31 mm */
+  }
+  if (q === 1) x = -x;
+  else if (q === 2) { x = -x; y = -y; }
+  else if (q === 3) y = -y;
+  return { x: x, y: y, wH: wH };
+}
+
+function sectionArea(shape, a, b, rho) {
+  if (shape && shape.indexOf("sellipse") === 0) {
+    var nSE = parseFloat(shape.split(":")[1]) || 2.5;
+    return superellipseAreaFactor(nSE) * a * b;
+  }
+  if (shape === "rrect") {
+    rho = Math.min(rho, 0.999 * Math.min(a, b));
+    return 4 * a * b - (4 - Math.PI) * rho * rho;
+  }
+  return Math.PI * a * b;
+}
+
+/* ============ solid mesh: blended rings + surface-normal shell + mouth roundover ============ */
+// GLOBAL RIBBON THROAT (entry 90, user report: "add it as a toggle on the throat
+// globally" -- replaces the export-only tagging he disliked). Per-station Lame
+// exponent ramp: ~n=10 at the throat (rectangular ribbon with naturally rounded
+// Lame corners) easing to n=2 (the family's EXACT elliptical section) over the
+// transition length; half-widths blend W/2, H/2 into the family walls the same
+// way. Applied to the prof, so EVERYTHING downstream -- drawings, 3-D, STL, the
+// BEM/Akabak source cap -- carries the true rectangular throat geometry.
+// DRIVER MOUNTING PLATE (entry 104, the user). A flat annular flange at the
+// throat (z from -T to a 0.6 mm overlap into the horn wall so slicers union
+// cleanly), with N REAL circular bolt through-holes. Watertight construction:
+// polar grid over the annulus with a 4x4-cell block cut at each bolt center
+// (16-vertex boundary) stitched to a 16-gon hole circle (one quad ring), hole
+// bores as 16-gon cylinders. Defaults per throat size (VERIFY against the
+// driver datasheet): 1in bolt-on = 3x M6 on 76.2 BC; 1.4/1.5/2in = 4x M6/M8
+// on 101.6 BC (DCX464-class); clearance hole 6.5 mm (M6) / 8.5 (M8).
+function driverPlateDefaults(throatD) {
+  if (throatD < 32) return { boltN: 3, bcD: 76.2, holeD: 6.5, outerD: 95 };
+  return { boltN: 4, bcD: 101.6, holeD: 6.5, outerD: 128 };
+}
+function buildDriverPlate(rt, outerR, T, boltN, bcR, holeR, z0, boreTopR, boreProf) {
+  z0 = z0 || 0;
+  var zTop = z0, zBot = z0 - T;   // entry 110: the plate spans [z0-T, z0] exactly -- flush faces, no overhang
+  boreTopR = Math.max(rt, boreTopR || rt);
+  // entry 108 (user report: "we need to follow the inside horn curve and have that
+  // cut through the plate"): boreProf = [{z, r}] stations zBot -> zTop; the
+  // bore wall SWEEPS the horn's own inner curve through the plate (below the
+  // throat it is the straight driver bore). Fallback: the old 2-station cone.
+  if (!boreProf) boreProf = [{ z: zBot, r: rt }, { z: zTop, r: boreTopR }];
+  boreTopR = boreProf[boreProf.length - 1].r;
+  var cell = Math.max(0.6, holeR * 0.7);
+  var perSec = Math.max(8, 4 * Math.ceil(2 * Math.PI * bcR / (boltN * cell * 4)));
+  perSec = Math.ceil(perSec / 2) * 2;
+  var nP = boltN * perSec;
+  var nR = Math.max(6, Math.ceil((outerR - rt) / cell));
+  if (nR % 2 === 1) nR++;
+  // entry 110b: INDEPENDENT row arrays per face (the bore's two ends differ when
+  // it follows the horn expansion) -- each sheared to pin the bolt circle at the
+  // SAME index so the hole blocks align vertically.
+  function makeRows(rIn) {
+    var rw = [], i2;
+    for (i2 = 0; i2 <= nR; i2++) rw.push(rIn + (outerR - rIn) * i2 / nR);
+    return rw;
+  }
+  var rowsB = makeRows(boreProf[0].r), rowsT = makeRows(boreTopR), i;
+  var iBC = 2, best = 1e9;
+  for (i = 2; i <= nR - 2; i++) if (Math.abs(rowsB[i] - bcR) < best) { best = Math.abs(rowsB[i] - bcR); iBC = i; }
+  [rowsB, rowsT].forEach(function (rw) {
+    var shift = bcR - rw[iBC];
+    for (var i3 = 0; i3 <= nR; i3++) rw[i3] += shift * (1 - Math.abs(i3 - iBC) / Math.max(iBC, nR - iBC));
+  });
+  rowsB[0] = boreProf[0].r; rowsT[0] = boreTopR; rowsB[nR] = outerR; rowsT[nR] = outerR;
+  var jBC = [], b;
+  for (b = 0; b < boltN; b++) jBC.push(b * perSec + (perSec >> 1));
+  function inBlock(i2, j2) {
+    if (i2 < iBC - 2 || i2 >= iBC + 2) return false;
+    for (var b2 = 0; b2 < boltN; b2++) {
+      var dj = ((j2 - jBC[b2]) % nP + nP) % nP;
+      if (dj >= nP - 2 || dj < 2) return true;
+    }
+    return false;
+  }
+  var pos = [], idx = [];
+  function V(x, y, z) { pos.push(x, y, z); return pos.length / 3 - 1; }
+  function quad(a, b3, c, d) { idx.push(a, b3, c, a, c, d); }
+  function ringXY(i2, j2, top) {
+    var ph = 2 * Math.PI * j2 / nP;
+    var rr = (top ? rowsT : rowsB)[i2];   // entry 110b: per-face rows
+    return [top ? zTop : zBot, rr * Math.cos(ph), rr * Math.sin(ph)];
+  }
+  // ---- entry 107: REGION-SPLIT vertices (crisp machined edges). Each face
+  // group owns its vertices; seams are duplicated at identical positions and
+  // weld closed in validateMesh / any slicer. ----
+  // TOP + BOTTOM faces (own grids)
+  var gT = [], gB = [], j;
+  for (i = 0; i <= nR; i++) { gT.push([]); gB.push([]);
+    for (j = 0; j < nP; j++) { var pT = ringXY(i, j, true), pB = ringXY(i, j, false); gT[i].push(V(pT[0], pT[1], pT[2])); gB[i].push(V(pB[0], pB[1], pB[2])); } }
+  for (i = 0; i < nR; i++) for (j = 0; j < nP; j++) {
+    if (inBlock(i, j)) continue;
+    var j3 = (j + 1) % nP;
+    quad(gT[i][j], gT[i + 1][j], gT[i + 1][j3], gT[i][j3]);
+    quad(gB[i][j], gB[i][j3], gB[i + 1][j3], gB[i + 1][j]);
+  }
+  // OUTER rim wall (own ring copies)
+  var oT = [], oB = [];
+  for (j = 0; j < nP; j++) { var q1 = ringXY(nR, j, true), q2 = ringXY(nR, j, false); oT.push(V(q1[0], q1[1], q1[2])); oB.push(V(q2[0], q2[1], q2[2])); }
+  for (j = 0; j < nP; j++) { var j4 = (j + 1) % nP; quad(oT[j4], oT[j], oB[j], oB[j4]); }
+  // INNER bore wall (own ring copies, cone on top)
+  var bore = [];
+  for (var iS = 0; iS < boreProf.length; iS++) {
+    var ring9 = [];
+    for (j = 0; j < nP; j++) { var ph9 = 2 * Math.PI * j / nP; ring9.push(V(boreProf[iS].z, boreProf[iS].r * Math.cos(ph9), boreProf[iS].r * Math.sin(ph9))); }
+    bore.push(ring9);
+  }
+  for (var iS2 = 0; iS2 < bore.length - 1; iS2++)
+    for (j = 0; j < nP; j++) { var j5 = (j + 1) % nP; quad(bore[iS2 + 1][j], bore[iS2 + 1][j5], bore[iS2][j5], bore[iS2][j]); }
+  // BOLT HOLES: per hole -- top ring quads, bottom ring quads (face-owned rims),
+  // and an OWN bore wall ring (crisp hole edge)
+  for (b = 0; b < boltN; b++) {
+    var jc = jBC[b], phC = 2 * Math.PI * jc / nP;
+    var cx = bcR * Math.cos(phC), cy = bcR * Math.sin(phC);
+    var loop = [], k;
+    for (k = -2; k < 2; k++) loop.push([iBC - 2, jc + k]);
+    for (k = -2; k < 2; k++) loop.push([iBC + k, jc + 2]);
+    for (k = 2; k > -2; k--) loop.push([iBC + 2, jc + k]);
+    for (k = 2; k > -2; k--) loop.push([iBC + k, jc - 2]);
+    var lT = loop.map(function (q) { return gT[q[0]][((q[1] % nP) + nP) % nP]; });
+    var lB = loop.map(function (q) { return gB[q[0]][((q[1] % nP) + nP) % nP]; });
+    // entry 107b (final): the hole circle is sampled at angles INTERPOLATED
+    // between consecutive boundary-vertex angles (3 per edge -> 48-gon, chords
+    // <= ~13 deg = visually round), and each boundary vertex FANS to its circle
+    // span -- monotone by construction: cannot cross, no T-junctions, and the
+    // 48-gon bore keeps the crisp wall-owned edge.
+    var angsB = lT.map(function (vv) { return Math.atan2(pos[vv * 3 + 2] - cy, pos[vv * 3 + 1] - cx); });
+    for (var q9 = 1; q9 < 16; q9++) { while (angsB[q9] > angsB[q9 - 1]) angsB[q9] -= 2 * Math.PI; }
+    var angC = [];
+    for (k = 0; k < 16; k++) {
+      var aA = angsB[k], aB = (k < 15 ? angsB[k + 1] : angsB[0] - 2 * Math.PI);
+      for (var mS = 0; mS < 3; mS++) angC.push(aA + (aB - aA) * mS / 3);
+    }
+    var hTf = [], hBf = [], hTw = [], hBw = [];
+    for (k = 0; k < 48; k++) {
+      var hx = cx + holeR * Math.cos(angC[k]), hy = cy + holeR * Math.sin(angC[k]);
+      hTf.push(V(zTop, hx, hy)); hBf.push(V(zBot, hx, hy));
+      hTw.push(V(zTop, hx, hy)); hBw.push(V(zBot, hx, hy));
+    }
+    for (k = 0; k < 16; k++) {
+      var kN = (k + 1) % 16, c0 = 3 * k;
+      for (var fS = 0; fS < 3; fS++) {
+        var cA = hTf[(c0 + fS) % 48], cB = hTf[(c0 + fS + 1) % 48];
+        idx.push(lT[k], cA, cB);
+        var dA = hBf[(c0 + fS) % 48], dB = hBf[(c0 + fS + 1) % 48];
+        idx.push(lB[k], dB, dA);
+      }
+      idx.push(lT[k], hTf[(c0 + 3) % 48], lT[kN]);
+      idx.push(lB[k], lB[kN], hBf[(c0 + 3) % 48]);
+    }
+    for (k = 0; k < 48; k++) {
+      var k2 = (k + 1) % 48;
+      quad(hTw[k], hTw[k2], hBw[k2], hBw[k]);
+    }
+  }
+  return { pos: new Float32Array(pos), idx: new Uint32Array(idx) };
+}
+// STRAIGHT DRIVER ENTRY (entry 104, user report: "some throats are curved which is
+// not great for compression drivers"). Replaces the first exLen mm of a wall
+// with a STRAIGHT segment at the driver's exit half-angle from exactly rt,
+// then a C1 Hermite blend over the next exLen into the family wall. The law
+// is locally overridden (standard practice -- the driver's own exit defines
+// this region); everything past 2*exLen is untouched.
+function osVirtualEntry(wall, rt, exDeg, exLen, cov) {
+  // entry 190 (the same reporter, second review: "the correct point (Z=0 /
+  // r=19.5) should actually be your point at (Z=12 / r~20.6)... in addition
+  // the roundover does not work any more"). BOTH RIGHT. (1) The 12 mm cone
+  // is INSIDE HIS DRIVER, behind the mounting flange -- the horn is pure OS
+  // from z=0, launched AT the driver angle: r(0) = rt, r'(0) = tanA (virtual
+  // origin z0 = rt tanA / tan^2 th, rc^2 = rt^2 (1 - tan^2 A / tan^2 th)).
+  // exLen no longer shapes the horn (it described the driver, not the horn).
+  // (2) The v1 rebuild flattened the profile monotone to the LAST radius --
+  // but the profile arrives WITH the mouth roll appended (descending tail),
+  // so the roundover got erased. v2 rebuilds only up to the input's maximum
+  // radius (the true mouth) and re-appends the roll tail translated to the
+  // new mouth position.
+  if (!wall || wall.length < 8) return wall;
+  var tanA = Math.tan(exDeg * Math.PI / 180);
+  var th = Math.min(70, Math.max(15, cov / 2)) * Math.PI / 180;
+  var tth = Math.tan(th);
+  if (!(tanA > 1e-6)) return wall;                    // no driver angle: untouched
+  if (tanA >= tth * 0.98) return wall;                // degenerate: at/above coverage
+  // entry 190b: the v2 split used the radius MAXIMUM to find the roll -- but
+  // the default flare is a 90-degree FLUSH roll whose radius stays MONOTONE,
+  // so the whole roll read as body and got absorbed into the OS (the
+  // reporter's 994.5 mm "mouth" was the roll's reach flattened in). The split
+  // is STRUCTURAL: baseN = the profile's baseStations (body count); the flare
+  // arc follows. The rebuilt body keeps EXACTLY baseN points so every
+  // downstream consumer of baseStations stays index-valid.
+  var baseN = (typeof exLen === "object" && exLen && exLen.baseN) ? exLen.baseN : (arguments.length > 5 && arguments[5] > 0 ? arguments[5] : wall.length);
+  baseN = Math.min(baseN, wall.length);
+  // entry 193 (v4): recompute r ONLY, on the profile's OWN z stations. v3
+  // resampled each plane over its own zMouthNew grid, which broke the H/V
+  // per-index z-alignment the sections loft requires (invisible at 90x90
+  // where the grids coincide; wrong for elliptical covH != covV). With
+  // shared stations the alignment holds BY CONSTRUCTION, the roll tail
+  // appends verbatim (no z shift), and only its r translates by the small
+  // body-end delta so the arc stays attached.
+  var z0 = rt * tanA / (tth * tth);
+  var rc2 = rt * rt * (1 - (tanA * tanA) / (tth * tth));
+  var out = [], i;
+  for (i = 0; i < baseN; i++) {
+    out.push({ z: wall[i].z, r: Math.sqrt(rc2 + Math.pow((wall[i].z + z0) * tth, 2)) });
+  }
+  var dR9 = out[baseN - 1].r - wall[baseN - 1].r;
+  for (i = baseN; i < wall.length; i++) out.push({ z: wall[i].z, r: wall[i].r + dR9 });
+  return out;
+}
+function straightEntry(wall, rt, exDeg, exLen) {
+  if (!(exLen > 0) || !wall || wall.length < 8) return wall;
+  // entry 184: adaptive blend length + physical-width slope stencil +
+  // Fritsch-Carlson tangent clamp (the fixed 2*exLen cubic overshot into
+  // steep family walls). For the Classic OS specifically the app routes to
+  // osVirtualEntry above -- this generic graft remains for shallow-throat
+  // families where it is well-conditioned.
+  var tanA = Math.tan(exDeg * Math.PI / 180);
+  var r1 = rt + tanA * exLen;
+  function slopeAt9(iq) {
+    var span = Math.max(1, exLen / 3);
+    var iL = iq, iR = iq;
+    while (iL > 0 && wall[iq].z - wall[iL].z < span) iL--;
+    while (iR < wall.length - 1 && wall[iR].z - wall[iq].z < span) iR++;
+    var dz = wall[iR].z - wall[iL].z;
+    return dz > 1e-9 ? (wall[iR].r - wall[iL].r) / dz : 0;
+  }
+  var zB = 2 * exLen, iB = 0, sB = 0, rB = r1, g9;
+  for (g9 = 0; g9 < 40; g9++) {
+    iB = 0;
+    while (iB < wall.length - 2 && wall[iB].z < zB) iB++;
+    rB = wall[iB].r; sB = slopeAt9(iB);
+    var avg = (rB - r1) / Math.max(1e-9, wall[iB].z - exLen);
+    if (avg <= Math.max(tanA * 1.05, 0.98 * sB) || zB > exLen + 6 * exLen) break;
+    zB += 0.5 * exLen;
+  }
+  var span9 = wall[iB].z - exLen;
+  var avg9 = (rB - r1) / Math.max(1e-9, span9);
+  var m0 = Math.min(tanA, 3 * avg9), m1 = Math.min(sB, 3 * avg9);
+  var out = [], i;
+  for (i = 0; i < wall.length; i++) {
+    var z = wall[i].z;
+    if (z <= exLen) out.push({ z: z, r: rt + tanA * z });
+    else if (z < wall[iB].z) {
+      var t = (z - exLen) / span9;
+      var t2 = t * t, t3 = t2 * t;
+      var h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t, h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
+      out.push({ z: z, r: h00 * r1 + h10 * span9 * m0 + h01 * rB + h11 * span9 * m1 });
+    } else out.push(wall[i]);
+  }
+  return out;
+}
+function throatRibbonMorph(prof, Wmm, Hmm, Lmm) {
+  // entry 229 REWRITE (Hans, third review: "The rectangular versions continue to
+  // exhibit discontinuities"). The old morph pulled each plane MULTIPLICATIVELY
+  // toward its target on a smoothstep: launch slope 0 (a flat start -- the exact
+  // "linear values" class his entry-221 report banned) and, whenever the target
+  // half-width exceeded the wall's start radius (every ribbon's WIDE plane), a
+  // WAIST: r dipped below W/2 then recovered -- one guaranteed slope reversal,
+  // measured on os/rosse/jmlc alike (bench_ribbon.js). Per-plane strategies now:
+  //   wide plane (target > wall start): Z-SHIFT INTO THE FAMILY CURVE -- find zS
+  //     where the wall reaches the target, then r(z) = wall(z + zS*(1-e)). The
+  //     contour IS the family curve at the throat (native slope AT the target
+  //     radius, C1 everywhere, monotone while zS*max e'/L < 1 -- L is auto-
+  //     extended to 2.2*zS to guarantee it), easing to the untouched wall by L.
+  //   narrow plane (target <= wall start): NATIVE-SLOPE SCALING -- r(z) =
+  //     wall(z) * (s + (1-s)e), s = target/start. Launch slope = s * native
+  //     (nonzero), every term positive => monotone by construction.
+  // e = quintic smootherstep (e'(0)=e''(0)=0): C2 at both ends of the blend.
+  if (!(Wmm > 0 && Hmm > 0) || !prof || !prof.H || !prof.V) return prof;
+  var Hp = prof.H, Vp = prof.V, B = prof.baseStations || Hp.length;
+  var aT = Wmm / 2, bT = Hmm / 2, nT = 10;
+  function rAt(arr, zq) {                                   // monotone-z region sampler
+    if (zq <= arr[0].z) return arr[0].r;
+    for (var q = 1; q < arr.length; q++) {
+      if (arr[q].z < arr[q - 1].z) break;                   // rollback region: stop
+      if (arr[q].z >= zq) {
+        var f = (zq - arr[q - 1].z) / (arr[q].z - arr[q - 1].z || 1e-12);
+        return arr[q - 1].r + f * (arr[q].r - arr[q - 1].r);
+      }
+    }
+    return arr[arr.length - 1].r;
+  }
+  function zWhere(arr, rq) {                                // first z with wall r >= rq (null if never)
+    for (var q = 1; q < arr.length; q++) {
+      if (arr[q].z < arr[q - 1].z) break;
+      if (arr[q].r >= rq) {
+        var f = (rq - arr[q - 1].r) / (arr[q].r - arr[q - 1].r || 1e-12);
+        return arr[q - 1].z + f * (arr[q].z - arr[q - 1].z);
+      }
+    }
+    return null;
+  }
+  var zSH = aT > Hp[0].r ? zWhere(Hp, aT) : null;
+  var zSV = bT > Vp[0].r ? zWhere(Vp, bT) : null;
+  var L = Lmm > 0 ? Lmm : 2 * Math.max(Wmm, Hmm);
+  if (zSH !== null) L = Math.max(L, 2.2 * zSH);             // monotone guarantee for the shift
+  if (zSV !== null) L = Math.max(L, 2.2 * zSV);
+  var sH = aT / Hp[0].r, sV = bT / Vp[0].r;
+  var H2 = new Array(Hp.length), V2 = new Array(Vp.length), seN = new Array(Hp.length);
+  for (var i = 0; i < Hp.length; i++) {
+    var t = Math.max(0, Math.min(1, Hp[i].z / L));
+    var e = t * t * t * (t * (t * 6 - 15) + 10);            // smootherstep
+    if (i < B) {
+      H2[i] = { z: Hp[i].z, r: zSH !== null ? rAt(Hp, Hp[i].z + zSH * (1 - e)) : Hp[i].r * (sH + (1 - sH) * e) };
+      V2[i] = { z: Vp[i].z, r: zSV !== null ? rAt(Vp, Vp[i].z + zSV * (1 - e)) : Vp[i].r * (sV + (1 - sV) * e) };
+    } else { H2[i] = Hp[i]; V2[i] = Vp[i]; }
+    seN[i] = nT + (2 - nT) * e;
+  }
+  // entry 101 monotone guard, kept as belt-and-braces (both strategies are
+  // monotone by construction; the clamp should never fire).
+  for (var i2 = 1; i2 < Hp.length && Hp[i2].z < L; i2++) {
+    if (H2[i2].r < H2[i2 - 1].r) H2[i2] = { z: H2[i2].z, r: H2[i2 - 1].r };
+    if (V2[i2].r < V2[i2 - 1].r) V2[i2] = { z: V2[i2].z, r: V2[i2 - 1].r };
+  }
+  return Object.assign({}, prof, { H: H2, V: V2, shape: "sellipse:2", seNArr: seN, ribbon: { w: Wmm, h: Hmm, L: L } });
+}
+function buildRings(prof, segs) {
+  if (prof.azProfiles) { // wide-format loft: ring vertex (u, phi) from that azimuth's own profile
+    var az = prof.azProfiles, MM = prof.baseStations, out = new Float32Array(MM * segs * 3);
+    var last = az.length - 1;
+    for (var ii = 0; ii < MM; ii++) {
+      var u = ii / (MM - 1);
+      for (var jj = 0; jj < segs; jj++) {
+        var th = 2 * Math.PI * jj / segs;
+        var phiQ = Math.abs(Math.atan2(Math.sin(th), Math.cos(th)));
+        if (phiQ > Math.PI / 2) phiQ = Math.PI - phiQ;
+        var fk = phiQ / (Math.PI / 2) * last;
+        var k0 = Math.min(last - 1, Math.floor(fk)), ff = fk - k0;
+        var p0 = prof.azAt(az[k0], u), p1 = prof.azAt(az[k0 + 1], u);
+        var zz = p0.z + ff * (p1.z - p0.z), rr = p0.r + ff * (p1.r - p0.r);
+        var k3 = (ii * segs + jj) * 3;
+        out[k3] = zz; out[k3 + 1] = rr * Math.cos(th); out[k3 + 2] = rr * Math.sin(th);
+      }
+    }
+    return out;
+  }
+  // inner-surface ring vertices for ALL stations.
+  // Base stations: section machinery (blended z).  Flare stations: perimeter-normal
+  // roll -- every point of the mouth ring (corners included) rolls outward around
+  // an arc of the roundover radius in its own local (radial, z) plane, so the lip
+  // is uniform around the perimeter instead of only in the principal planes.
+  var H = prof.H, V = prof.V, M = H.length, B = prof.baseStations || M;
+  var shape = prof.shape || "ellipse", rho = prof.rho || 0, rhoArr = prof.rhoArr, seNA = prof.seNArr;
+  var inner = new Float32Array(M * segs * 3), i, j;
+  for (i = 0; i < B; i++) {
+    var shp_i = seNA ? "sellipse:" + seNA[Math.min(i, seNA.length - 1)] : shape;
+    for (j = 0; j < segs; j++) {
+      var sp = sectionPoint(shp_i, H[i].r, V[i].r, rhoArr ? rhoArr[Math.min(i, rhoArr.length - 1)] : rho, j / segs);
+      var k = (i * segs + j) * 3;
+      inner[k] = H[i].z * sp.wH + V[i].z * (1 - sp.wH);
+      inner[k + 1] = sp.x;
+      inner[k + 2] = sp.y;
+    }
+  }
+  if (M > B && B >= 2) {
+    // flare radius: use the profile's own roundover radius when known; else recover it
+    // from the principal-plane arc geometry (identical per plane by construction)
+    var Rf = prof.flareR || 0;
+    if (!Rf && M - B > 0) {
+      // recover R from first flare step in H plane: chord fit is fragile; use arc-length inversion instead
+      // the appended arcs used sweep 90deg over (M-B) steps of radius R -> step arc angle:
+      var dphi = (Math.PI / 2) / (M - B);
+      var dzf = H[B].z - H[B - 1].z, drf = H[B].r - H[B - 1].r;
+      // for small first step from local slope ph: dz = R(sin(ph+dphi)-sin(ph)) ...
+      // solve R directly from chord length: chord = 2R sin(dphi/2)
+      Rf = Math.sqrt(dzf * dzf + drf * drf) / (2 * Math.sin(dphi / 2));
+    }
+    for (j = 0; j < segs; j++) {
+      var kA = ((B - 1) * segs + j) * 3, kB2 = ((B - 2) * segs + j) * 3;
+      var x0 = inner[kA + 1], y0 = inner[kA + 2], z0 = inner[kA];
+      var l0 = Math.sqrt(x0 * x0 + y0 * y0);
+      // TRUE perimeter-normal roll (the radial-from-axis roll bulged flat walls: constant
+      // radial dl gives only dl*cos(skew) of clearance off-center -> a point at every wall
+      // center on rect sections, the "pointy wrap" bug). Direction = outward 2-D normal of
+      // the section curve at this point (central difference around the mouth ring); wall
+      // angle measured in that SAME (normal, z) plane. Flat walls translate uniformly and
+      // stay flat; corner arcs inflate to concentric arcs (parallel-curve construction --
+      // crease-free for any convex section). At plane centers normal == radial, so the
+      // principal-plane H/V profiles (flareArc) still agree with the mesh exactly.
+      var jm = ((j - 1 + segs) % segs), jq2 = ((j + 1) % segs);
+      var kJm = ((B - 1) * segs + jm) * 3, kJp = ((B - 1) * segs + jq2) * 3;
+      var tx = inner[kJp + 1] - inner[kJm + 1], ty = inner[kJp + 2] - inner[kJm + 2];
+      var nx = ty, ny = -tx, nl = Math.hypot(nx, ny);
+      if (nl < 1e-9) { nx = l0 > 1e-9 ? x0 / l0 : 1; ny = l0 > 1e-9 ? y0 / l0 : 0; nl = 1; }
+      nx /= nl; ny /= nl;
+      if (nx * x0 + ny * y0 < 0) { nx = -nx; ny = -ny; }  // orient outward
+      var dn = (x0 - inner[kB2 + 1]) * nx + (y0 - inner[kB2 + 2]) * ny; // normal growth, last base step
+      var ph = Math.atan2(Math.max(0, dn), z0 - inner[kB2]); // local wall angle in the normal plane
+      var tgtA = prof.flareExit || Math.PI / 2;
+      var sweepJ = Math.max(0, tgtA - ph); // absolute exit angle: uniform lip all around
+      for (i = B; i < M; i++) {
+        var t2 = sweepJ * (i - B + 1) / (M - B);
+        var dl = Rf * (Math.cos(ph) - Math.cos(ph + t2));
+        var dz = Rf * (Math.sin(ph + t2) - Math.sin(ph));
+        var k2 = (i * segs + j) * 3;
+        inner[k2] = z0 + dz;
+        inner[k2 + 1] = x0 + nx * dl;
+        inner[k2 + 2] = y0 + ny * dl;
+      }
+    }
+  }
+  if (prof.sp && !prof.spApplied) {
+    var rd = prof.sp.round;
+    for (i = 0; i < M; i++)
+      for (j = 0; j < segs; j++) {
+        var k3 = (i * segs + j) * 3;
+        var pt = prof.sp.T(inner[k3 + 1], inner[k3 + 2], inner[k3], rd[Math.min(i, rd.length - 1)]);
+        inner[k3] = pt.z; inner[k3 + 1] = pt.x; inner[k3 + 2] = pt.y;
+      }
+  }
+  return inner;
+}
+// entry 203 (user report: "the throat is still rounded on the driver side edge"
+// -- after 201 flattened the GEOMETRY, the SHADING still rounded it: the flat
+// annulus shares vertices with the wall and the outer shell, and averaged
+// vertex normals bend the lighting into a fillet that is not there). Pure
+// helper: duplicate every throat-plane vertex that is shared between planar
+// (annulus) and non-planar triangles; the planar triangles reference the
+// duplicates, so normal averaging stops at the crease. Geometry unchanged.
+function creaseThroatRows(pos, idx) {
+  var nV = pos.length / 3, onPlane = new Uint8Array(nV), i;
+  for (i = 0; i < nV; i++) if (Math.abs(pos[i * 3]) < 0.01) onPlane[i] = 1;
+  var planarTri = new Uint8Array(idx.length / 3);
+  var mixedUse = new Uint8Array(nV);
+  for (i = 0; i < idx.length; i += 3) {
+    var p3 = onPlane[idx[i]] && onPlane[idx[i + 1]] && onPlane[idx[i + 2]];
+    planarTri[i / 3] = p3 ? 1 : 0;
+    if (!p3) { mixedUse[idx[i]] |= 2; mixedUse[idx[i + 1]] |= 2; mixedUse[idx[i + 2]] |= 2; }
+  }
+  for (i = 0; i < idx.length; i += 3)
+    if (planarTri[i / 3]) { mixedUse[idx[i]] |= 1; mixedUse[idx[i + 1]] |= 1; mixedUse[idx[i + 2]] |= 1; }
+  var extra = [], remap = {}, out = new Uint32Array(idx.length);
+  out.set(idx);
+  for (i = 0; i < idx.length; i += 3) {
+    if (!planarTri[i / 3]) continue;
+    for (var e = 0; e < 3; e++) {
+      var v = idx[i + e];
+      if (mixedUse[v] === 3) {
+        if (!(v in remap)) { remap[v] = nV + extra.length / 3; extra.push(pos[v * 3], pos[v * 3 + 1], pos[v * 3 + 2]); }
+        out[i + e] = remap[v];
+      }
+    }
+  }
+  if (!extra.length) return { pos: pos, idx: out, added: 0 };
+  var np = new Float32Array(pos.length + extra.length);
+  np.set(pos); np.set(extra, pos.length);
+  return { pos: np, idx: out, added: extra.length / 3 };
+}
+function buildSolidMesh(prof, t, segs, ringsOv, lipStyle) {
+  var H = prof.H, V = prof.V, M = ringsOv ? ringsOv.M : H.length, i, j;
+  var RO = (lipStyle === 'straight') ? 1 : 28; // entry 111: straight = flat end face; rounded = 28 steps (smoother than 20)
+  var inner = ringsOv ? ringsOv.rings : buildRings(prof, segs);
+  // per-vertex outward normals -> outer shell
+  var outer = new Float32Array(M * segs * 3);
+  var nrm = new Float32Array(M * segs * 3);
+  for (i = 0; i < M; i++)
+    for (j = 0; j < segs; j++) {
+      var k0 = (i * segs + j) * 3;
+      var ip = Math.max(0, i - 1) * segs + j, iq = Math.min(M - 1, i + 1) * segs + j;
+      var jp = i * segs + ((j - 1 + segs) % segs), jq = i * segs + ((j + 1) % segs);
+      var tix = inner[iq * 3] - inner[ip * 3], tiy = inner[iq * 3 + 1] - inner[ip * 3 + 1], tiz = inner[iq * 3 + 2] - inner[ip * 3 + 2];
+      /* entry 206b: at a crease, one central-difference normal SMEARS the
+         corner; the offset needs the true dihedral. Left and right azimuthal
+         tangents give the two face normals; the averaged direction is their
+         normalized sum, and the MITER scale 1/cos(half-dihedral) -- capped at
+         1.5 -- keeps the wall at full thickness across the corner instead of
+         t/sqrt(2). Smooth regions: dihedral ~0, miter 1, bit-identical. */
+      var tLx = inner[k0] - inner[jp * 3], tLy = inner[k0 + 1] - inner[jp * 3 + 1], tLz = inner[k0 + 2] - inner[jp * 3 + 2];
+      var tRx = inner[jq * 3] - inner[k0], tRy = inner[jq * 3 + 1] - inner[k0 + 1], tRz = inner[jq * 3 + 2] - inner[k0 + 2];
+      function cx9(ax, ay, az) {
+        var vx = ay * tiz - az * tiy, vy = az * tix - ax * tiz, vz = ax * tiy - ay * tix;
+        var vl = Math.hypot(vx, vy, vz) || 1e-12;
+        return [vx / vl, vy / vl, vz / vl];
+      }
+      var nL9 = cx9(tLx, tLy, tLz), nR9 = cx9(tRx, tRy, tRz);
+      var nx = nL9[0] + nR9[0], ny = nL9[1] + nR9[1], nz = nL9[2] + nR9[2];
+      var nl = Math.hypot(nx, ny, nz) || 1e-12;
+      nrm[k0] = nx / nl; nrm[k0 + 1] = ny / nl; nrm[k0 + 2] = nz / nl;
+      var dotLR9 = Math.max(-1, Math.min(1, nL9[0] * nR9[0] + nL9[1] * nR9[1] + nL9[2] * nR9[2]));
+      var mit9 = Math.min(1.5, 1 / Math.max(0.667, Math.sqrt((1 + dotLR9) / 2)));
+      outer[k0] = inner[k0] + t * mit9 * nrm[k0];
+      outer[k0 + 1] = inner[k0 + 1] + t * mit9 * nrm[k0 + 1];
+      outer[k0 + 2] = inner[k0 + 2] + t * mit9 * nrm[k0 + 2];
+      /* entry 201 (user report: removing the driver plate curved the throat rim):
+         the outer shell offsets along the wall normal, which tilts ~5 deg at
+         the throat -- the outer throat ring dipped to z = -0.56, curling the
+         driver MATING FACE behind the throat plane. Without a plate the horn
+         itself is the mating surface: the outer ring 0 lands ON z = 0, so the
+         throat annulus is a flat machinable face. (With a plate, the plate
+         path replaces this region and already provides the flat face.) */
+      if (i === 0 && outer[k0] < 0) outer[k0] = 0;   /* component 0 = AXIAL in the rings layout -- the first version clamped +2 (lat2) and zeroed the bottom half laterally */
+    }
+  // vertex layout: [inner rings][roundover rings 1..RO-1][outer rings]
+  var nRound = (RO - 1) * segs;
+  var pos = new Float32Array((2 * M * segs + nRound) * 3);
+  pos.set(inner, 0);
+  var roBase = M * segs;
+  // entry 105 (user report: "why does the lip have an edge and is not smooth"): the
+  // old bullnose was a perfect semicircle keyed to the INNER rim tangent -- but
+  // the outer shell is a DISCRETE normal-offset, so over the sharply curving
+  // roundover its rim chord tilts by ~t/R (17 deg at t6/R20) from that
+  // direction and the semicircle landed on it with a real crease. The bullnose
+  // is now a cubic Hermite that matches the MEASURED chord tangent at EACH rim
+  // (C1 at both junctions by construction), bulging half a wall along the
+  // averaged normal like the semicircle did.
+  for (j = 0; j < segs; j++) {
+    var ke = ((M - 1) * segs + j) * 3, kp = ((M - 2) * segs + j) * 3;
+    var koE = ((M - 1) * segs + j) * 3, koP = ((M - 2) * segs + j) * 3;
+    var dx = pos[ke] - pos[kp], dy = pos[ke + 1] - pos[kp + 1], dz2 = pos[ke + 2] - pos[kp + 2];
+    var dl = Math.hypot(dx, dy, dz2) || 1e-12; dx /= dl; dy /= dl; dz2 /= dl;
+    var ox = outer[koE] - outer[koP], oy = outer[koE + 1] - outer[koP + 1], oz = outer[koE + 2] - outer[koP + 2];
+    var ol = Math.hypot(ox, oy, oz) || 1e-12; ox /= ol; oy /= ol; oz /= ol;
+    var P0x = pos[ke], P0y = pos[ke + 1], P0z = pos[ke + 2];
+    var P1x = outer[koE], P1y = outer[koE + 1], P1z = outer[koE + 2];
+    var mag = Math.PI * t / 2;                      // semicircle-equivalent tangent magnitude
+    for (var a2 = 1; a2 < RO; a2++) {
+      var u9 = a2 / RO, u2 = u9 * u9, u3 = u2 * u9;
+      var h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u9, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+      var kk = (roBase + (a2 - 1) * segs + j) * 3;
+      pos[kk]     = h00 * P0x + h10 * mag * dx + h01 * P1x + h11 * (-mag * ox);
+      pos[kk + 1] = h00 * P0y + h10 * mag * dy + h01 * P1y + h11 * (-mag * oy);
+      pos[kk + 2] = h00 * P0z + h10 * mag * dz2 + h01 * P1z + h11 * (-mag * oz);
+    }
+  }
+  var outBase = M * segs + nRound;
+  pos.set(outer, outBase * 3);
+  var idx = [];
+  function quad(a, b, c2, d) { idx.push(a, b, c2, a, c2, d); }
+  for (i = 0; i < M - 1; i++)
+    for (j = 0; j < segs; j++) {
+      var j2 = (j + 1) % segs;
+      quad(i * segs + j, (i + 1) * segs + j, (i + 1) * segs + j2, i * segs + j2);                          // inner
+      quad(outBase + i * segs + j, outBase + i * segs + j2, outBase + (i + 1) * segs + j2, outBase + (i + 1) * segs + j); // outer
+    }
+  // chain: inner rim -> roundover rings -> outer rim
+  if (lipStyle === 'straight') {
+    // entry 111 (user report: "the horn lip is rounded not straight it needs to be
+    // straight"): a machined square-cut mouth -- flat annular end face with
+    // OWN (split) vertices so both edges render crisp; welds closed.
+    var pos2 = new Float32Array(pos.length + segs * 6);
+    pos2.set(pos, 0);
+    var eI = pos.length / 3, eO = eI + segs;
+    for (j = 0; j < segs; j++) {
+      var kI = ((M - 1) * segs + j) * 3, kO = ((outBase + (M - 1) * segs + j)) * 3;
+      pos2[(eI + j) * 3] = pos[kI]; pos2[(eI + j) * 3 + 1] = pos[kI + 1]; pos2[(eI + j) * 3 + 2] = pos[kI + 2];
+      pos2[(eO + j) * 3] = pos[kO]; pos2[(eO + j) * 3 + 1] = pos[kO + 1]; pos2[(eO + j) * 3 + 2] = pos[kO + 2];
+    }
+    pos = pos2;
+    for (j = 0; j < segs; j++) {
+      var j3 = (j + 1) % segs;
+      quad(eI + j, eI + j3, eO + j3, eO + j);
+    }
+  } else {
+    var chain = [];
+    chain.push(function (j5) { return (M - 1) * segs + j5; });
+    for (var a3 = 1; a3 < RO; a3++) (function (a4) { chain.push(function (j5) { return roBase + (a4 - 1) * segs + j5; }); })(a3);
+    chain.push(function (j5) { return outBase + (M - 1) * segs + j5; });
+    for (var cc = 0; cc < chain.length - 1; cc++)
+      for (j = 0; j < segs; j++) {
+        var j3 = (j + 1) % segs;
+        quad(chain[cc](j), chain[cc](j3), chain[cc + 1](j3), chain[cc + 1](j));
+      }
+  }
+  for (j = 0; j < segs; j++) { var j4 = (j + 1) % segs; quad(j, j4, outBase + j4, outBase + j); } // throat annulus
+  return { pos: pos, idx: new Uint32Array(idx), layout: { M: M, segs: segs, RO: RO, roBase: roBase, outBase: outBase } };
+}
+
+// entry 236 (zen_tm, forum #56: "this misshapen form probably isn't meant to
+// happen, even if this is an extreme setting" -- a mouth roll curled back
+// through the horn body). Principal-plane FOLD AUDIT: does the (z, r) meridian
+// cross itself, or cross the axis (r < 0)? Segment-segment test over all non-
+// adjacent pairs (n ~ 200-320 -> < 50k tests, negligible). Returns null when
+// clean, else the first crossing {z, r, i, j} (i < j, station indices). The
+// audit is geometric and family-blind: any dial combination that makes the
+// wall pass through itself trips it -- roundover R x wrap on a short horn,
+// R-OSSE b/m at extremes, a JMLC truncation past its own coil.
+function profileFold(P) {
+  if (!P || P.length < 4) return null;
+  var n = P.length, i, j;
+  for (i = 0; i < n; i++) if (P[i].r < -1e-9) return { z: P[i].z, r: P[i].r, i: i, j: i, axis: true };
+  function cross(ax, ay, bx, by, cx, cy) { return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax); }
+  for (i = 0; i < n - 1; i++) {
+    var a = P[i], b = P[i + 1];
+    if (Math.hypot(b.z - a.z, b.r - a.r) < 1e-12) continue;
+    for (j = i + 2; j < n - 1; j++) {
+      var c = P[j], d = P[j + 1];
+      if (Math.hypot(d.z - c.z, d.r - c.r) < 1e-12) continue;
+      // quick bbox reject
+      if (Math.max(a.z, b.z) < Math.min(c.z, d.z) || Math.min(a.z, b.z) > Math.max(c.z, d.z) ||
+          Math.max(a.r, b.r) < Math.min(c.r, d.r) || Math.min(a.r, b.r) > Math.max(c.r, d.r)) continue;
+      var d1 = cross(a.z, a.r, b.z, b.r, c.z, c.r), d2 = cross(a.z, a.r, b.z, b.r, d.z, d.r);
+      var d3 = cross(c.z, c.r, d.z, d.r, a.z, a.r), d4 = cross(c.z, c.r, d.z, d.r, b.z, b.r);
+      if (((d1 > 1e-12 && d2 < -1e-12) || (d1 < -1e-12 && d2 > 1e-12)) && ((d3 > 1e-12 && d4 < -1e-12) || (d3 < -1e-12 && d4 > 1e-12))) {
+        var t = d1 / (d1 - d2);
+        return { z: c.z + t * (d.z - c.z), r: c.r + t * (d.r - c.r), i: i, j: j, axis: false };
+      }
+    }
+  }
+  return null;
+}
+
+// ============ BULLET PHASE PLUG (entry 237) ============
+// maxgldrr, forum #53: "would it be possible to add an option for a bullet phase
+// plug?" -- for the 8"/12" LF-MF cone-driver horns the 200 mm throat now allows.
+// Marwan's steer (2026-08-21): "our phase plug should be printed in a way that is
+// attached to the horn and not the driver". So: an AXIAL BULLET, a body of
+// revolution on the horn axis with its flat base in the throat plane (z = 0) and
+// an elliptical nose to the tip at z = L (the classic Altec/JBL/Klipsch bullet
+// form), carried by N thin radial SPOKES that run from the bullet into the horn
+// wall -- printed as one part with the horn. What it does acoustically, and what
+// the tool claims: the bullet removes the throat-cavity volume in front of the
+// cone and shortens the longest cone-to-throat path (the reason bullets exist);
+// it also OCCLUDES area, so with "area compensation" the wall is opened so that
+// NET section area (wall minus bullet) follows the design law at every station --
+// the loading is preserved and the 1-D charts read the NET area (one geometry
+// source). No directivity or path-length benefit is quantified: that needs the
+// driver's cone geometry, which the app does not have, and BEM. The bullet body
+// enters the BEM export as a floating closed rigid solid (same path as the WN
+// fins); the spokes do not (they touch the wall and would need a Boolean union) --
+// the README says so.
+// Nose shapes (entry 237, the three a turned bullet actually comes in):
+//   "bullet"  tangent ogive -- circular arc of radius (R^2+L^2)/(2R) leaving the
+//             base PARALLEL to the axis (dr/dz = 0 at z = 0) and meeting the axis at
+//             the tip; the classic machined bullet.
+//   "ellipse" half-ellipsoid of revolution -- r = R sqrt(1 - (z/L)^2).
+//   "cone"    straight taper -- r = R (1 - z/L).
+// Ordered cone < ogive < ellipse at every station (fuller noses hold more volume).
+function bulletRAt(plug, z) {
+  if (!plug || z < 0 || z >= plug.L) return 0;
+  var R = plug.D / 2, L = plug.L, u = z / L, sh = plug.shape || "bullet";
+  if (sh === "cone") return R * (1 - u);
+  if (sh === "ellipse") return R * Math.sqrt(Math.max(0, 1 - u * u));
+  var rho = (R * R + L * L) / (2 * R);                  // tangent ogive
+  return Math.max(0, Math.sqrt(Math.max(0, rho * rho - z * z)) + R - rho);
+}
+function bulletProfile(D, L, n, shape) {
+  var out = [], plug = { D: D, L: L, shape: shape || "bullet" };
+  n = n || 24;
+  for (var i = 0; i <= n; i++) {
+    var z = L * i / n;                   // 0 = base (throat plane) .. L = tip
+    out.push({ z: z, r: i === n ? 0 : bulletRAt(plug, z) });
+  }
+  return out;
+}
+// Area-compensated profile: scale a, b (and the corner radius) of every base
+// station inside the bullet so sectionArea(wall) - pi*rb^2 == the design area.
+// occl[i] = pi*rb(z_i)^2 is stored for the 1-D estimators (they subtract it).
+function plugApply(prof, plug, compensate) {
+  if (!prof || !prof.H || !plug || !(plug.D > 0) || !(plug.L > 0)) return prof;
+  var H = prof.H, V = prof.V, B = prof.baseStations || H.length;
+  var shape = prof.shape || "ellipse", sA = prof.seNArr, rA = prof.rhoArr, rho = prof.rho || 0;
+  var H2 = H.slice(), V2 = V.slice(), rA2 = rA ? rA.slice() : null, occl = new Array(H.length), maxK = 1, maxDr = 0;
+  for (var i = 0; i < H.length; i++) {
+    var z = 0.5 * (H[i].z + (V[i] ? V[i].z : H[i].z));
+    var rb = (i < B) ? bulletRAt(plug, z) : 0;
+    occl[i] = Math.PI * rb * rb;
+    if (compensate && rb > 0) {
+      var shp = sA ? "sellipse:" + sA[Math.min(i, sA.length - 1)] : shape;
+      var r9 = rA ? rA[Math.min(i, rA.length - 1)] : rho;
+      var A0 = sectionArea(shp, H[i].r, V[i].r, r9);
+      if (A0 > 1e-9) {
+        var k = Math.sqrt((A0 + occl[i]) / A0);
+        H2[i] = { z: H[i].z, r: H[i].r * k }; V2[i] = { z: V[i].z, r: V[i].r * k };
+        if (rA2) rA2[i] = r9 * k;
+        if (k > maxK) { maxK = k; maxDr = H[i].r * (k - 1); }
+      }
+    }
+  }
+  return Object.assign({}, prof, { H: H2, V: V2, rhoArr: rA2, occl: occl,
+    plug: { D: plug.D, L: plug.L, shape: plug.shape || "bullet", spokes: plug.spokes, spokeT: plug.spokeT, compensated: !!compensate, maxScale: maxK, maxDr: maxDr } });
+}
+// Closed solid of revolution: base disc at z = 0, elliptical nose, tip vertex.
+// Coordinates match buildRings: [z, x, y]. Outward orientation checked by volume.
+function bulletMesh(plug, segs) {
+  var prof = bulletProfile(plug.D, plug.L, 28, plug.shape), NR = prof.length - 1;   // last profile point is the tip (r = 0)
+  var pos = [], idx = [];
+  pos.push(0, 0, 0);                                     // 0: base centre
+  for (var i = 0; i < NR; i++) for (var j = 0; j < segs; j++) {
+    var th = 2 * Math.PI * j / segs;
+    pos.push(prof[i].z, prof[i].r * Math.cos(th), prof[i].r * Math.sin(th));
+  }
+  var tip = pos.length / 3; pos.push(plug.L, 0, 0);
+  function V(i, j) { return 1 + i * segs + (j % segs); }
+  for (var j2 = 0; j2 < segs; j2++) idx.push(0, V(0, j2 + 1), V(0, j2));                    // base disc (faces -z)
+  for (var i2 = 0; i2 < NR - 1; i2++) for (var j3 = 0; j3 < segs; j3++) {
+    idx.push(V(i2, j3), V(i2, j3 + 1), V(i2 + 1, j3));
+    idx.push(V(i2, j3 + 1), V(i2 + 1, j3 + 1), V(i2 + 1, j3));
+  }
+  for (var j4 = 0; j4 < segs; j4++) idx.push(V(NR - 1, j4), V(NR - 1, j4 + 1), tip);
+  return orientOutward({ pos: new Float32Array(pos), idx: new Uint32Array(idx) });
+}
+function orientOutward(m) {
+  var p = m.pos, ix = m.idx, vol = 0;
+  for (var t = 0; t < ix.length; t += 3) {
+    var A = ix[t] * 3, B = ix[t + 1] * 3, C = ix[t + 2] * 3;
+    vol += (p[A] * (p[B + 1] * p[C + 2] - p[B + 2] * p[C + 1]) - p[A + 1] * (p[B] * p[C + 2] - p[B + 2] * p[C]) + p[A + 2] * (p[B] * p[C + 1] - p[B + 1] * p[C])) / 6;
+  }
+  if (vol < 0) for (var t2 = 0; t2 < ix.length; t2 += 3) { var q = ix[t2 + 1]; ix[t2 + 1] = ix[t2 + 2]; ix[t2 + 2] = q; }
+  m.volume = Math.abs(vol);
+  return m;
+}
+// One spoke: a thin plate of thickness t at azimuth phi, from inside the bullet
+// (overlap ovIn) to inside the horn wall shell (overlap ovOut), spanning
+// z in [0.12 L, 0.72 L]. Built from the profile's own section (sectionPoint at
+// this azimuth, blended z like buildRings) so it meets the wall wherever the
+// section puts it -- ellipse, superellipse or rounded rectangle alike.
+function spokeMesh(prof, plug, phi, t, ovIn, ovOut) {
+  var H = prof.H, V = prof.V, B = prof.baseStations || H.length;
+  var shape = prof.shape || "ellipse", sA = prof.seNArr, rA = prof.rhoArr, rho = prof.rho || 0;
+  var z1 = 0.12 * plug.L, z2 = 0.72 * plug.L, u = phi / (2 * Math.PI);
+  var cx = Math.cos(phi), sy = Math.sin(phi), tx = -Math.sin(phi), ty = Math.cos(phi);
+  var samples = [];
+  for (var i = 0; i < B; i++) {
+    var shp = sA ? "sellipse:" + sA[Math.min(i, sA.length - 1)] : shape;
+    var sp = sectionPoint(shp, H[i].r, V[i].r, rA ? rA[Math.min(i, rA.length - 1)] : rho, u);
+    var z = H[i].z * sp.wH + V[i].z * (1 - sp.wH);
+    if (z < z1 || z > z2) continue;
+    var rw = Math.hypot(sp.x, sp.y), rb = bulletRAt(plug, z);
+    if (rw - rb < 2 * t) continue;                      // no room for a spoke here
+    samples.push({ z: z, rin: Math.max(0.2, rb - ovIn), rout: rw + ovOut });
+  }
+  if (samples.length < 2) return null;
+  var pos = [], idx = [], n = samples.length;
+  for (var s = 0; s < n; s++) {
+    var q = samples[s];
+    // 0: in+  1: in-  2: out+  3: out-   (+/- = tangential side)
+    pos.push(q.z, q.rin * cx + tx * t / 2, q.rin * sy + ty * t / 2);
+    pos.push(q.z, q.rin * cx - tx * t / 2, q.rin * sy - ty * t / 2);
+    pos.push(q.z, q.rout * cx + tx * t / 2, q.rout * sy + ty * t / 2);
+    pos.push(q.z, q.rout * cx - tx * t / 2, q.rout * sy - ty * t / 2);
+  }
+  function Q(a, b, c, d) { idx.push(a, b, c, a, c, d); }
+  for (var s2 = 0; s2 < n - 1; s2++) {
+    var o = s2 * 4, p = o + 4;
+    Q(o + 0, o + 2, p + 2, p + 0);   // + side face
+    Q(o + 1, p + 1, p + 3, o + 3);   // - side face
+    Q(o + 0, p + 0, p + 1, o + 1);   // inner face
+    Q(o + 2, o + 3, p + 3, p + 2);   // outer face
+  }
+  Q(0, 1, 3, 2);                                          // end cap at z1
+  var e = (n - 1) * 4; Q(e + 0, e + 2, e + 3, e + 1);      // end cap at z2
+  return orientOutward({ pos: new Float32Array(pos), idx: new Uint32Array(idx) });
+}
+function plugMeshes(prof, segs, wallThick) {
+  var plug = prof && prof.plug;
+  if (!plug || !(plug.D > 0)) return [];
+  var out = [bulletMesh(plug, segs)];
+  var N = Math.max(0, Math.round(plug.spokes || 0)), t = Math.max(0.8, plug.spokeT || 3);
+  // entry 243 (forum: "I plan on printing the phase plug only to fit into a
+  // previously printed horn"): RETROFIT spokes end 0.2 mm SHORT of the wall
+  // (a fit clearance, glue line) instead of running 2 mm into a shell that is
+  // not being printed with them; DESIGNED-IN keeps the overlap for the union.
+  var ovOut = plug.compensated === false ? -0.2 : Math.min(2, 0.6 * (wallThick || 3));
+  for (var k = 0; k < N; k++) {
+    var m = spokeMesh(prof, plug, Math.PI / 2 + 2 * Math.PI * k / N, t, 1.0, ovOut);
+    if (m) out.push(m);
+  }
+  return out;
+}
+
+function rollAudit(sm) {
+  // entry 178 (user report: "we need a full proof method" for roundovers): the
+  // universal roll invariants. Any geometry change that breaks a mouth roll
+  // trips one of these:
+  //  launchDeg  -- max angle between the roll's first step and the wall's own
+  //                terminal meridian, across azimuths (C1 launch; a lip = a
+  //                launch that departs the wall);
+  //  shearRatio -- worst intra-ring azimuthal neighbor step in the roll rows
+  //                over the rim row's own (frame coherence; the WN entry-167
+  //                diagnostic);
+  //  ledge      -- worst row-to-row advance over the median advance (a step/
+  //                ledge = one interval much larger than its neighbors);
+  //  finite     -- no NaN anywhere in the roll rows.
+  var L = sm.layout, pos = sm.pos;
+  if (!L || L.RO <= 1) return { launchDeg: 0, shearRatio: 1, ledge: 1, finite: true, rows: 0 };
+  var segs = L.segs, M = L.M;
+  function P(row, j) {
+    var base = row === 0 ? (M - 1) * segs : (row === L.RO ? L.outBase + (M - 1) * segs : L.roBase + (row - 1) * segs);
+    var k = (base + (j % segs)) * 3;
+    return [pos[k], pos[k + 1], pos[k + 2]];
+  }
+  var launch = 0, shear = 0, ledge = 0, finite = true;
+  var rimStep = 0;
+  for (var j = 0; j < segs; j++) {
+    var a = P(0, j), b = P(0, j + 1);
+    rimStep = Math.max(rimStep, Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]));
+  }
+  for (var j2 = 0; j2 < segs; j2++) {
+    // C1 launch: wall terminal meridian vs first roll step
+    var kE = ((M - 1) * segs + j2) * 3, kP = ((M - 2) * segs + j2) * 3;
+    var m = [pos[kE] - pos[kP], pos[kE + 1] - pos[kP + 1], pos[kE + 2] - pos[kP + 2]];
+    var r1 = P(1, j2), r0 = P(0, j2);
+    var s = [r1[0] - r0[0], r1[1] - r0[1], r1[2] - r0[2]];
+    var ml = Math.hypot(m[0], m[1], m[2]) || 1e-12, sl = Math.hypot(s[0], s[1], s[2]) || 1e-12;
+    var dot = (m[0] * s[0] + m[1] * s[1] + m[2] * s[2]) / (ml * sl);
+    launch = Math.max(launch, Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI);
+    // ledge: row-to-row advances along this azimuth
+    var adv = [];
+    for (var rr = 0; rr < L.RO; rr++) {
+      var A2 = P(rr, j2), B2 = P(rr + 1, j2);
+      var d2 = Math.hypot(A2[0] - B2[0], A2[1] - B2[1], A2[2] - B2[2]);
+      adv.push(d2);
+      if (!isFinite(d2)) finite = false;
+    }
+    var srt = adv.slice().sort(function (x, y) { return x - y; });
+    var med = srt[Math.floor(srt.length / 2)] || 1e-9;
+    ledge = Math.max(ledge, srt[srt.length - 1] / Math.max(1e-9, med));
+  }
+  for (var rr2 = 1; rr2 < L.RO; rr2++) {
+    for (var j3 = 0; j3 < segs; j3++) {
+      var A3 = P(rr2, j3), B3 = P(rr2, j3 + 1);
+      shear = Math.max(shear, Math.hypot(A3[0] - B3[0], A3[1] - B3[1], A3[2] - B3[2]));
+    }
+  }
+  return { launchDeg: launch, shearRatio: shear / Math.max(1e-9, rimStep), ledge: ledge, finite: finite, rows: L.RO };
+}
+
+/* ============ Build-style extras (2026-07-13): fin solids + cabinet shell ============ */
+function validateMesh(mesh, repair) {
+  // AUDIT #10 (2026-07-13): finite vertices, degenerate triangles, boundary edges,
+  // non-manifold edges. With repair=true, zero-area triangles are dropped from idx.
+  var pos = mesh.pos, idx = mesh.idx, nonFinite = 0, degen = 0, keep = [];
+  for (var q = 0; q < pos.length; q++) if (!isFinite(pos[q])) nonFinite++;
+  // entry 107: WELD coincident vertices (1e-4) before edge accounting -- crisp-
+  // shaded solids duplicate seam vertices at identical positions (sharp feature
+  // edges); closed-after-weld IS printable-closed (slicers weld by position).
+  var weld = {}, remap = new Uint32Array(pos.length / 3);
+  for (var w9 = 0; w9 < pos.length / 3; w9++) {
+    var kw = Math.round(pos[w9 * 3] * 1e4) + "_" + Math.round(pos[w9 * 3 + 1] * 1e4) + "_" + Math.round(pos[w9 * 3 + 2] * 1e4);
+    if (weld[kw] === undefined) weld[kw] = w9;
+    remap[w9] = weld[kw];
+  }
+  var edges = {};
+  for (var t = 0; t < idx.length; t += 3) {
+    var a = remap[idx[t]], b = remap[idx[t + 1]], c = remap[idx[t + 2]];
+    var ux = pos[b*3]-pos[a*3], uy = pos[b*3+1]-pos[a*3+1], uz = pos[b*3+2]-pos[a*3+2];
+    var vx = pos[c*3]-pos[a*3], vy = pos[c*3+1]-pos[a*3+1], vz = pos[c*3+2]-pos[a*3+2];
+    var cx = uy*vz-uz*vy, cy = uz*vx-ux*vz, cz = ux*vy-uy*vx;
+    var area2 = Math.hypot(cx, cy, cz);
+    if (area2 < 1e-7) { degen++; continue; }
+    keep.push(a, b, c);
+    var ee = [[a,b],[b,c],[c,a]];
+    for (var e = 0; e < 3; e++) {
+      var k = Math.min(ee[e][0], ee[e][1]) + "_" + Math.max(ee[e][0], ee[e][1]);
+      edges[k] = (edges[k] || 0) + 1;
+    }
+  }
+  var boundary = 0, nonManifold = 0;
+  for (var k2 in edges) { if (edges[k2] === 1) boundary++; else if (edges[k2] > 2) nonManifold++; }
+  var out = { finite: nonFinite === 0, nonFiniteCount: nonFinite, degenerateTris: degen,
+              boundaryEdges: boundary, nonManifoldEdges: nonManifold,
+              watertight: nonFinite === 0 && boundary === 0 && nonManifold === 0 };
+  if (repair && degen > 0) mesh.idx = new Uint32Array(keep);
+  return out;
+}
+function mergeMeshes(list) {
+  var nP = 0, nI = 0, q;
+  for (q = 0; q < list.length; q++) { nP += list[q].pos.length; nI += list[q].idx.length; }
+  var pos = new Float32Array(nP), idx = new Uint32Array(nI), oP = 0, oI = 0;
+  for (q = 0; q < list.length; q++) {
+    pos.set(list[q].pos, oP);
+    var base = oP / 3;
+    for (var r = 0; r < list[q].idx.length; r++) idx[oI + r] = list[q].idx[r] + base;
+    oP += list[q].pos.length; oI += list[q].idx.length;
+  }
+  return { pos: pos, idx: idx };
+}
+function araiFinMesh(horn, finT, layout) {
+  // Fin pack for the Arai-optimized biradial. Two documented layouts:
+  //   opt6  (default) -- the BEM-tested 6-fin arrangement, blades from near the common
+  //                      origin to the base mouth plane;
+  //   arai4           -- Yuichi's ORIGINAL equal-cell layout (his book plan: covH/5
+  //                      channels), blades on the documented radial span (R0..R1 from
+  //                      the origin, A-290 fractions), lens-shaped like his fin drawing.
+  // Blades span the full interior height wall-to-wall and are emitted as SEPARATE
+  // closed solids (wood-assembly / print reality) merged into one mesh. Thickness
+  // follows a lens profile t(u) = finT*sin(pi*u) (pointed both ends, per the book),
+  // floored at 1 mm so the caps stay printable. Coordinates match buildRings:
+  // [z, x(horizontal), y(vertical)].
+  if (!horn || !horn.finLayout) return { pos: new Float32Array(0), idx: new Uint32Array(0) };
+  var FL = layout || horn.finLayout;
+  var t = Math.max(3, finT || 10), W = horn.wall, V = horn.wallV;
+  function interp(arr, z) {
+    if (z <= arr[0].z) return arr[0].r;
+    for (var i = 1; i < arr.length; i++) if (arr[i].z >= z) {
+      var f = (z - arr[i - 1].z) / (arr[i].z - arr[i - 1].z || 1e-12);
+      return arr[i - 1].r + f * (arr[i].r - arr[i - 1].r);
+    }
+    return arr[arr.length - 1].r;
+  }
+  var solids = [];
+  var FAN = horn.fan || null, INSET = 0.6;   // fins sit 0.6 mm shy of the interior surface
+  for (var f2 = 0; f2 < FL.angles.length; f2++) {
+    var th = FL.angles[f2] * Math.PI / 180, ct = Math.cos(th), st = Math.sin(th);
+    // blade span: radial (R0..R1 from the origin) when documented, else axial to the mouth
+    var R0 = FL.R0 !== undefined ? FL.R0 : 0.03 * (FL.endZ - FL.originZ) / Math.max(0.3, ct);
+    var R1 = FL.R1 !== undefined ? FL.R1 : (FL.endZ - FL.originZ) / Math.max(0.3, ct);
+    var N = 26, pos = [], idx = [], made = 0;
+    for (var i = 0; i <= N; i++) {
+      var u = i / N, R = R0 + (R1 - R0) * u;
+      var z, xC, b;
+      if (FAN) {
+        // SAME mapping as the interior loft (2026-07-13, "fins sticking out"): the loft
+        // blends z off the flat slot plane near the throat -- blades built in raw fan
+        // coordinates sat BEHIND the blended surface and poked through. Blades now share
+        // the blend, and their height comes from the CELL rule at the blade's own fan
+        // radius, inset so edges never coincide with the surface.
+        var tBl = Math.min(1, (R - FAN.Rarr) / (0.9 * FAN.Rarr)); tBl = tBl * tBl * (3 - 2 * tBl);
+        var Zfan = FAN.z0 + R * ct, Zflat = FAN.zTr + (R - FAN.Rarr);
+        z = Zflat + (Zfan - Zflat) * tBl;
+        xC = R * st * tBl + R * th * (1 - tBl);
+        b = Math.max(1, FAN.hHalf(Math.max(0, R - FAN.Rarr)) - INSET);
+      } else {
+        z = FL.originZ + R * ct; xC = R * st;
+        if (z > FL.endZ) z = FL.endZ;
+        b = Math.max(1, interp(V, z) - INSET);
+      }
+      var a = interp(W, z);
+      var tHere = Math.max(1, t * Math.sin(Math.PI * u));  // lens profile (book fin drawing)
+      var dzO = -st * tHere / 2, dxO = ct * tHere / 2;
+      if (Math.abs(xC) + tHere / 2 > a - 1) { xC = (a - 1 - tHere / 2) * (xC < 0 ? -1 : 1); }
+      pos.push(z + dzO, xC + dxO, b,  z + dzO, xC + dxO, -b,  z - dzO, xC - dxO, b,  z - dzO, xC - dxO, -b);
+      made++;
+    }
+    function vq(i2, k) { return i2 * 4 + k; }
+    function quad(a2, b2, c2, d2) { idx.push(a2, b2, c2, a2, c2, d2); }
+    for (var i3 = 0; i3 < made - 1; i3++) {
+      quad(vq(i3, 0), vq(i3, 1), vq(i3 + 1, 1), vq(i3 + 1, 0)); // +offset face
+      quad(vq(i3, 2), vq(i3 + 1, 2), vq(i3 + 1, 3), vq(i3, 3)); // -offset face
+      quad(vq(i3, 0), vq(i3 + 1, 0), vq(i3 + 1, 2), vq(i3, 2)); // top edge
+      quad(vq(i3, 1), vq(i3, 3), vq(i3 + 1, 3), vq(i3 + 1, 1)); // bottom edge
+    }
+    quad(vq(0, 0), vq(0, 2), vq(0, 3), vq(0, 1));                                     // leading cap
+    quad(vq(made - 1, 0), vq(made - 1, 1), vq(made - 1, 3), vq(made - 1, 2));         // trailing cap
+    solids.push({ pos: new Float32Array(pos), idx: new Uint32Array(idx) });
+  }
+  return mergeMeshes(solids);
+}
+
+function buildAraiFanRings(horn, segs, flareR, wrapDeg) {
+  // ARC-MOUTH LOFT v2 (2026-07-13). Rings on cylinders r = const from the fan origin;
+  // the last ring IS the per-cell kr mouth arc (V2 STEP anchors). This rewrite fixes two
+  // shipped defects the user's screenshots exposed:
+  //   (a) ROUND THROAT: the adapter rings morph circle -> square (rho: rt -> sharp) --
+  //       v1 sampled a near-sharp square from z=0 (square driver hole, proud collar);
+  //   (b) EDGE-PROPORTIONAL SAMPLING: v1 reused the corner-anchored planar sampler
+  //       (3/4 of vertices in the corners) -- correct for straight planar sides, but the
+  //       fan's top/bottom edges are ARCS in 3-D, and ~8 points across a 600 mm arc
+  //       renders as flat facets and spikes. Vertices are now distributed by developed
+  //       edge length, with exact corner vertices; ONE fixed allocation (from the mouth
+  //       ring) is used for every ring so strips never twist.
+  var F = horn.fan, M0 = 150;
+  var thM = F.covHrad / 2, rt = F.rt;
+  function hAt(r) { return F.hHalf(Math.max(0, r - F.Rarr)); }
+  function wallA(zq) {
+    var W9 = horn.wall;
+    if (zq <= W9[0].z) return W9[0].r;
+    for (var q9 = 1; q9 < W9.length; q9++) if (W9[q9].z >= zq) {
+      var f9 = (zq - W9[q9 - 1].z) / (W9[q9].z - W9[q9 - 1].z || 1e-12);
+      return W9[q9 - 1].r + f9 * (W9[q9].r - W9[q9 - 1].r);
+    }
+    return W9[W9.length - 1].r;
+  }
+  function thWOf(r) {                          // fan wedge clipped by the physical side wall
+    var lo = 0.05, hi = 1.25 * thM;
+    for (var b9 = 0; b9 < 24; b9++) {
+      var mid = (lo + hi) / 2;
+      if (r * Math.sin(mid) < wallA(F.z0 + r * Math.cos(mid))) lo = mid; else hi = mid;
+    }
+    return Math.min(1.25 * thM, (lo + hi) / 2);
+  }
+  // ---- fixed allocation from the mouth ring proportions ----
+  var thWm = thWOf(F.Rarr + (F.Rm - F.Rarr) * 0.999), hM = hAt(F.Rm);
+  var wDevMouth = F.Rm * thWm;
+  var Lt = 2 * F.Rm * thWm, Ls = 2 * hM, Pfull = 2 * Lt + 2 * Ls;
+  var nT = Math.max(10, Math.round(segs * Lt / Pfull));
+  // entry 82: the side floor was 4 (mouth proportions -- sides are SHORT at the mouth),
+  // which starves the TALL adapter/fan-early sides: with big morph-era corner radii the
+  // faceted side sags up to ~6 mm under the wedge line in top view. Floor at segs/8.
+  var nS = Math.max(Math.max(4, segs >> 3), Math.round(segs * Ls / Pfull));
+  while (2 * (nT + nS) > segs) { if (nT > 10) nT--; else nS--; }
+  while (2 * (nT + nS) < segs) nT++;
+  // arcRect(wDev, h, rho, j): perimeter point in DEVELOPED coords. Exact piecewise
+  // geometry: each edge = [half corner arc | straight | half corner arc]; adjacent edges
+  // SHARE the 45-deg corner point, so the perimeter is gap-free at any rho -- rho = 0 is
+  // a sharp rectangle, rho = min(wDev, h) with wDev = h is an exact circle (the throat).
+  function arcRect(wDev, h, rho, j) {
+    rho = Math.max(0, Math.min(rho, 0.999 * Math.min(wDev, h)));
+    var qa = rho * Math.PI / 4;                        // half-corner arc length
+    var eS = nS, eT = nT;
+    var seg = j < eS ? 0 : j < eS + eT ? 1 : j < 2 * eS + eT ? 2 : 3;
+    var loc = seg === 0 ? j : seg === 1 ? j - eS : seg === 2 ? j - eS - eT : j - 2 * eS - eT;
+    var cnt = (seg === 0 || seg === 2) ? eS : eT;
+    var str = (seg === 0 || seg === 2) ? 2 * (h - rho) : 2 * (wDev - rho);
+    var Lseg = str + 2 * qa, d = (loc / cnt) * Lseg;
+    // walk in local frame: start at the -45deg mid of the entry corner, CCW
+    var sx, sy, cx, cy, a;
+    function corner(cx0, cy0, a0deg, frac) { var a0 = (a0deg + 45 * frac) * Math.PI / 180; return { x: cx0 + rho * Math.cos(a0), y: cy0 + rho * Math.sin(a0) }; }
+    if (seg === 0) {                                   // right side, bottom -> top
+      if (d < qa) { var p = corner(wDev - rho, -h + rho, -45, d / (qa || 1)); sx = p.x; sy = p.y; }
+      else if (d < qa + str) { sx = wDev; sy = -h + rho + (d - qa); }
+      else { var p2 = corner(wDev - rho, h - rho, 0, (d - qa - str) / (qa || 1)); sx = p2.x; sy = p2.y; }
+    } else if (seg === 1) {                            // top, right -> left
+      if (d < qa) { var p3 = corner(wDev - rho, h - rho, 45, d / (qa || 1)); sx = p3.x; sy = p3.y; }
+      else if (d < qa + str) { sx = wDev - rho - (d - qa); sy = h; }
+      else { var p4 = corner(-wDev + rho, h - rho, 90, (d - qa - str) / (qa || 1)); sx = p4.x; sy = p4.y; }
+    } else if (seg === 2) {                            // left side, top -> bottom
+      if (d < qa) { var p5 = corner(-wDev + rho, h - rho, 135, d / (qa || 1)); sx = p5.x; sy = p5.y; }
+      else if (d < qa + str) { sx = -wDev; sy = h - rho - (d - qa); }
+      else { var p6 = corner(-wDev + rho, -h + rho, 180, (d - qa - str) / (qa || 1)); sx = p6.x; sy = p6.y; }
+    } else {                                           // bottom, left -> right
+      if (d < qa) { var p7 = corner(-wDev + rho, -h + rho, 225, d / (qa || 1)); sx = p7.x; sy = p7.y; }
+      else if (d < qa + str) { sx = -wDev + rho + (d - qa); sy = -h; }
+      else { var p8 = corner(wDev - rho, -h + rho, 270, (d - qa - str) / (qa || 1)); sx = p8.x; sy = p8.y; }
+    }
+    return { sx: sx, sy: sy };
+  }
+  // ONE GLOBAL PERIMETER-FRACTION GRID (2026-07-13, third pass at "the bump"). The
+  // per-edge allocation let vertices slide as rho morphed; angle sampling then dual-
+  // scheme blending wandered worse across the widening. Final form: each vertex j owns
+  // a FIXED perimeter fraction u_j (computed once from the mouth's edge-proportional
+  // allocation); every ring is sampled at that arc-length fraction. Meridians are
+  // constant-fraction flow lines -- smooth by construction; the mouth keeps its exact
+  // long-arc density (u_j comes from it).
+  function arcRectFrac(wDev, h, rho, u) {
+    rho = Math.max(0, Math.min(rho, 0.999 * Math.min(wDev, h)));
+    var qa = rho * Math.PI / 4;
+    var Ls = 2 * (h - rho) + 2 * qa, Lt = 2 * (wDev - rho) + 2 * qa;
+    var P = 2 * Ls + 2 * Lt, d = ((u % 1) + 1) % 1 * P;
+    function corner(cx0, cy0, a0deg, frac) { var a0 = (a0deg + 45 * frac) * Math.PI / 180; return { sx: cx0 + rho * Math.cos(a0), sy: cy0 + rho * Math.sin(a0) }; }
+    var str;
+    if (d < Ls) {                                              // right side, bottom -> top
+      str = 2 * (h - rho);
+      if (d < qa) return corner(wDev - rho, -h + rho, -45, d / (qa || 1));
+      if (d < qa + str) return { sx: wDev, sy: -h + rho + (d - qa) };
+      return corner(wDev - rho, h - rho, 0, (d - qa - str) / (qa || 1));
+    }
+    d -= Ls;
+    if (d < Lt) {                                              // top, right -> left
+      str = 2 * (wDev - rho);
+      if (d < qa) return corner(wDev - rho, h - rho, 45, d / (qa || 1));
+      if (d < qa + str) return { sx: wDev - rho - (d - qa), sy: h };
+      return corner(-wDev + rho, h - rho, 90, (d - qa - str) / (qa || 1));
+    }
+    d -= Lt;
+    if (d < Ls) {                                              // left side, top -> bottom
+      str = 2 * (h - rho);
+      if (d < qa) return corner(-wDev + rho, h - rho, 135, d / (qa || 1));
+      if (d < qa + str) return { sx: -wDev, sy: h - rho - (d - qa) };
+      return corner(-wDev + rho, -h + rho, 180, (d - qa - str) / (qa || 1));
+    }
+    d -= Ls;                                                   // bottom, left -> right
+    str = 2 * (wDev - rho);
+    if (d < qa) return corner(-wDev + rho, -h + rho, 225, d / (qa || 1));
+    if (d < qa + str) return { sx: -wDev + rho + (d - qa), sy: -h };
+    return corner(wDev - rho, -h + rho, 270, (d - qa - str) / (qa || 1));
+  }
+  // u_j from the mouth allocation: segment boundaries by mouth edge lengths, vertex
+  // position = segStart + (loc/count) * segLen (mirrors arcRect's walk exactly)
+  var uFrac = (function () {
+    var rhoM = Math.max(0.5, Math.min(3, hM * 0.05));
+    var qaM = rhoM * Math.PI / 4;
+    var LsM = 2 * (hM - rhoM) + 2 * qaM, LtM = 2 * (wDevMouth - rhoM) + 2 * qaM;
+    var PM = 2 * LsM + 2 * LtM, starts = [0, LsM, LsM + LtM, 2 * LsM + LtM], lens = [LsM, LtM, LsM, LtM];
+    var out = [];
+    for (var jq = 0; jq < segs; jq++) {
+      var sg = jq < nS ? 0 : jq < nS + nT ? 1 : jq < 2 * nS + nT ? 2 : 3;
+      var lc = sg === 0 ? jq : sg === 1 ? jq - nS : sg === 2 ? jq - nS - nT : jq - 2 * nS - nT;
+      var ct = (sg === 0 || sg === 2) ? nS : nT;
+      out.push((starts[sg] + (lc / ct) * lens[sg]) / PM);
+    }
+    return out;
+  })();
+  // ============================ ENTRY 84: THE RE-INVENTION ============================
+  // (user report: "now the bump is back... we are going in circles, you need to re-invent
+  // this.") Entries 79-83 stitched TWO surface definitions (a wedge law and the book
+  // wall/fan) inside the cylindrical ring parameterization with fixed-point solves,
+  // monotone holds, feasibility caps and max() switches -- each patch's interaction
+  // bred the next artifact (waist -> tube -> darts -> bump). This is ONE construction:
+  //
+  //   ZONE A (flat extruded stations, z = 0 .. zX): the adapter. Sections are
+  //     arcRect(W(z), H(z), rho(z)) in TRUE (X, Y) at station z -- a flat extrusion
+  //     has NO cylinder-radius constraint, so the wedge runs the FULL horn side
+  //     angle at ANY adaptL (the entry-83 cap is gone).
+  //       W(z)  = rt + z * tan(0.56*covH/2)          (the printed-part wedge)
+  //       H(z)  = hAt(Rarr + max(0, z - zTr))         (same vertical law as the fan)
+  //       rho(z) = smoothstep morph rt -> rhoEnd over the FULL zX (deep-round throat)
+  //     zX = where the wall curve overtakes the wedge line (plain 1-D crossing of two
+  //     given curves in axial coordinates -- no solver, no clamps, always exists
+  //     before the side-plate wings; fallback = the wall/mouth-arc junction).
+  //
+  //   ZONE B (fan cylinder rings, rr = rrX .. Rm, rrX = Rarr + (zX - zTr)): the horn.
+  //     Width comes ONLY from the wall polyline, sampled at the ring edge's blended z
+  //     (two evaluations of a GIVEN curve -- bounded, no equation to solve, and the
+  //     wall is hostable on its own cylinders by construction). The bend ramps from
+  //     rrX, so zone B ring 0 is flat AT zX and matches zone A exactly.
+  //
+  //   The junction is the single natural crease where the cone meets the fan --
+  //   exactly what the hardware has. No dual definitions anywhere.
+  // ====================================================================================
+  var s0wG9 = Math.tan(0.56 * F.covHrad / 2);
+  // JUNCTION SANITY (the one remaining bound): the crossing must land within the
+  // fan's blend capacity, zCap = zTr + 1.2*Rarr, or the flat zone runs deep into
+  // fan territory and the junction rides the coverage clip (spikes/dips/fold at
+  // adaptL 80 measured 24/10/-3.9 before this). Short adapters keep the FULL horn
+  // angle (25 mm: uncapped); long ones shallow just enough to cross in time --
+  // converging, as the real Crowe 65 mm adapter does, to the slow cone.
+  // CLOSED-FORM slope bound: the wedge must meet the wall no later than the fan's
+  // blend capacity zCap = zTr + 1.2*Rarr. s = min(full angle, chord slope to the
+  // wall at zCap). Short adapters keep the FULL horn angle (25 mm: 0.53 > 0.501,
+  // uncapped); long ones shallow toward the Crowe cone. The crossing scan starts
+  // BEYOND the slot -- before it the "wall" is the adapter's own area-law curve
+  // and a crossing there put zone B rings on sub-Rarr cylinders (the waist bug).
+  var zCap9 = F.zTr + 1.2 * F.Rarr;
+  var sW9 = Math.min(s0wG9, Math.max(0.05, (wallA(zCap9) - rt) / zCap9));
+  function wedgeW9(zq) { return rt + zq * sW9; }
+  var zX9 = (function () {
+    var zjW = F.zTr + (F.Rm - F.Rarr);
+    for (var zq9 = F.zTr + 2; zq9 < zjW; zq9 += 1)
+      if (wallA(zq9) >= wedgeW9(zq9)) return zq9;
+    return Math.min(zCap9, zjW * 0.6);
+  })();
+  var rrX9 = F.Rarr + (zX9 - F.zTr);
+  // bend-window sizing: the side edge z regresses if the ramp outpaces the flat-to-arc
+  // gap at the junction (measured -0.53 mm/ring on the smoke fixture). Window >= 2x the
+  // gap keeps d(zEdge)/d(rr) >= 0 (smoothstep max slope 1.5/W vs gap G: W >= 1.5G).
+  var wJ9 = Math.min(0.98 * rrX9, Math.max(rt, F.zTr > 0 ? rt + zX9 * s0wG9 : rt));
+  var G9 = Math.max(0, zX9 - (F.z0 + rrX9 * Math.sqrt(Math.max(0, 1 - (wJ9 / rrX9) * (wJ9 / rrX9)))));
+  var bW9 = Math.max(0.9 * F.Rarr, 2 * G9);
+  var NAD = Math.max(20, Math.round(zX9 / 3)), ringR = [];   // ~3 mm adapter stations
+  for (var ia = 0; ia <= NAD; ia++) ringR.push(-1 - (NAD - ia));
+  var MB0 = 150;
+  for (var ir = 1; ir <= MB0; ir++) ringR.push(rrX9 + (F.Rm - rrX9) * ir / MB0); // ir=0 SKIPPED: duplicates the last adapter station (audit #10)
+  var M = ringR.length;
+  var pos = new Float32Array(M * segs * 3), k = 0;
+  var rhoEnd9 = Math.max(0.5, Math.min(3, rt * 0.05));
+  function rhoOf9(zq) {
+    var u9 = Math.max(0, Math.min(1, zq / zX9));
+    var t9 = u9 * u9 * (3 - 2 * u9);
+    var cap9 = Math.min(rt, wedgeW9(zq));
+    return rhoEnd9 + (cap9 - rhoEnd9) * (1 - t9);
+  }
+  for (var i = 0; i < M; i++) {
+    var rr = ringR[i];
+    for (var j = 0; j < segs; j++) {
+      var X, Y, Z;
+      if (rr < 0) {
+        // ZONE A: flat extrusion. V is height-constant through the user adapter
+        // (the slot-radial design) then follows the fan's own vertical law.
+        var zA9 = zX9 * (i / NAD);
+        var hA9 = hAt(F.Rarr + Math.max(0, zA9 - F.zTr));
+        var p1 = arcRect(wedgeW9(zA9), hA9, Math.min(rhoOf9(zA9), 0.999 * Math.min(wedgeW9(zA9), hA9)), j);
+        X = p1.sx; Y = p1.sy; Z = zA9;
+      } else {
+        // ZONE B (entry 85, user report: "the horn itself got changed"): beyond the ease
+        // window the fan is the ENTRY-76 BOOK CONSTRUCTION VERBATIM -- developed
+        // arcRect(rr*thW) wrapped onto the fan cylinder (arced top/bottom edges,
+        // per-cell kr mouth, coverage clip). The previous permanent wallA/chord
+        // blend rode ~10 mm wide past the junction and DILUTED the mouth by up to
+        // 8 mm per side. The junction ease is a POSITIONAL lerp from the flat
+        // zone-A exit section to the book point across bW9 (>= 2x the flat-to-arc
+        // gap so the side edge never regresses); at tBl = 0 it equals zone A's
+        // exit exactly (width wallA(zX) = the wedge crossing, same hAt, same rho).
+        var tBl = Math.min(1, (rr - rrX9) / bW9); tBl = tBl * tBl * (3 - 2 * tBl);
+        var zFl9 = zX9 + (rr - rrX9);
+        var thW9 = thWOf(rr);
+        var hRR = hAt(rr);
+        // book point (entry-76 pure fan): developed section + cylinder wrap
+        var rhoB9 = Math.max(Math.max(0.5, Math.min(3, rt * 0.05)), Math.min(3, hRR * 0.05));
+        var pF = arcRect(rr * thW9, hRR, Math.min(rhoB9, 0.999 * Math.min(rr * thW9, hRR)), j);
+        var thP = pF.sx / rr;
+        var Xf = rr * Math.sin(thP), Yf = pF.sy, Zf = F.z0 + rr * Math.cos(thP);
+        // flat zone-A-style extension at the same ring (junction anchor)
+        var wA9 = wallA(zFl9);
+        var rhoA9 = Math.max(rhoOf9(zFl9), Math.min(3, hRR * 0.05));
+        var pA = arcRect(wA9, hRR, Math.min(rhoA9, 0.999 * Math.min(wA9, hRR)), j);
+        X = pA.sx * (1 - tBl) + Xf * tBl;
+        Y = pA.sy * (1 - tBl) + Yf * tBl;
+        Z = zFl9 * (1 - tBl) + Zf * tBl;
+      }
+      pos[k++] = Z; pos[k++] = X; pos[k++] = Y;
+    }
+  }
+  // entry 81: the entry-79 per-meridian radius cummax was REMOVED. During the
+  // fan width plateau, fixed-fraction perimeter points legitimately SLIDE along a
+  // growing section (corner -> side), so meridian radius can fall by millimetres
+  // while every section still CONTAINS the previous one -- the true no-neck
+  // invariant. The cummax conflated the two and bulged plateau sections outward.
+  // Containment is now guaranteed by construction (linear-then-held width, monotone
+  // hAt, rho shrinking inside a fixed box) and pinned by the smoke containment guard.
+  var FS = (flareR > 0.5) ? 10 : 0;
+  if (FS > 0) {
+    // entry 179 (user report: "create independent roll back for these square-like
+    // horns for each side"): the OLD inline lip (lateral frames, pre-entry-167)
+    // rolled the rect corners apart -- the back-visible edge. Replaced with the
+    // factored SURFACE-FRAME LIP (T x rim-tangent frames, global sign, spiral
+    // launch): per-azimuth independent rollback = top/bottom roll about
+    // horizontal axes, sides about vertical axes, corners blend continuously.
+    var all = new Float32Array((M + FS) * segs * 3);
+    all.set(pos, 0);
+    surfaceFrameLip(all, M, segs, flareR, wrapDeg, FS);
+    return { rings: all, M: M + FS };
+  }
+  return { rings: pos, M: M };
+}
+function buildInteriorMesh(prof, segs, ringsOv) {
+  // Interior surface only -- no outer shell, no caps (2026-07-13, "get rid of the outer
+  // shell"). Open surface: fine for the viewer (double-sided material) and for CAD
+  // reference; noted as non-watertight for direct printing.
+  var inner = ringsOv ? ringsOv.rings : buildRings(prof, segs);
+  var M = ringsOv ? ringsOv.M : prof.H.length, i, j;
+  var idx = [];
+  function quad(a, b, c2, d) { idx.push(a, b, c2, a, c2, d); }
+  for (i = 0; i < M - 1; i++)
+    for (j = 0; j < segs; j++) {
+      var j2 = (j + 1) % segs;
+      quad(i * segs + j, (i + 1) * segs + j, (i + 1) * segs + j2, i * segs + j2);
+    }
+  return { pos: inner instanceof Float32Array ? inner : new Float32Array(inner), idx: new Uint32Array(idx) };
+}
+
+function buildCabinetMesh(prof, t, segs) {
+  // "Cabinet shell" v2 (2026-07-13, matched to real Arai builds): flat full-length SIDE
+  // BOARDS, top/bottom plates that FOLLOW the vertical curve (the signature silhouette),
+  // and a SQUARE adapter block at the back with a visible step -- v1 was a naive full
+  // prism (flat top at max height, full-width back plate), which reads nothing like the
+  // wood-shop original. Interior identical to the uniform-shell build. Proportions from
+  // the book, scaled by throat: side boards ~2rt eq. -> capped by t, top/bottom plates
+  // ~1.2rt at the mouth, back block half-side 3.3rt (his 162 square on the 2in throat).
+  var ringsOv = arguments.length > 3 ? arguments[3] : null;
+  var inner = ringsOv ? ringsOv.rings : buildRings(prof, segs), M = ringsOv ? ringsOv.M : prof.H.length, i, j;
+  var rt = prof.H[0].r, zF = 0, W2 = 0;
+  for (i = 0; i < M * segs; i++) {
+    var k = i * 3;
+    if (Math.abs(inner[k + 1]) > W2) W2 = Math.abs(inner[k + 1]);
+    if (inner[k] > zF) zF = inner[k];
+  }
+  var tS = Math.max(t, 2.0 * rt);            // side boards (book: 50 mm on the 2in throat)
+  var sB = 3.3 * rt;                          // square back/mounting plate half-side (book 162)
+  var zB = Math.min(0.12 * zF, 30);           // plate depth (the adapter region)
+  var hyFlat = 0;                             // FLAT top/bottom (2026-07-13, the user's build
+  if (ringsOv) {                              // photo): flat slabs at true interior height
+    for (i = 2; i < ringsOv.rings.length; i += 3) if (Math.abs(ringsOv.rings[i]) > hyFlat) hyFlat = Math.abs(ringsOv.rings[i]);
+  } else {
+    for (i = 0; i < prof.V.length; i++) if (prof.V[i].r > hyFlat) hyFlat = prof.V[i].r;
+  }
+  hyFlat += 1.22 * rt;                        // + plate: ext ~= the book's 230 at the mouth
+  function wallAt(arr, z) {
+    if (z <= arr[0].z) return arr[0].r;
+    for (var q = 1; q < arr.length; q++) if (arr[q].z >= z) {
+      var f = (z - arr[q - 1].z) / (arr[q].z - arr[q - 1].z || 1e-12);
+      return arr[q - 1].r + f * (arr[q].r - arr[q - 1].r);
+    }
+    return arr[arr.length - 1].r;
+  }
+  function bAt(z) { return wallAt(prof.V, z); }
+  function aAt(z) { return wallAt(prof.H, z); }
+  var NB = 20;                                // body stations along z
+  var NBR = 10;                               // front bullnose bridge rings (lip -> face edge)
+  // vertex blocks: inner rings | back square ring z=0 | block square ring z=zB |
+  //                body rings zB..zF (NB+1) | bridge rings (NBR-1)
+  var nV = M * segs + 2 * segs + (NB + 1) * segs + (NBR - 1) * segs;
+  var pos = new Float32Array(nV * 3);
+  pos.set(inner, 0);
+  var b0 = M * segs, b1 = b0 + segs, c0 = b1 + segs;
+  for (j = 0; j < segs; j++) {
+    var sq = sectionPoint("rrect", sB, sB, Math.min(6, sB * 0.1), j / segs);
+    var k0 = (b0 + j) * 3, k1 = (b1 + j) * 3;
+    pos[k0] = 0;  pos[k0 + 1] = sq.x; pos[k0 + 2] = sq.y;
+    pos[k1] = zB; pos[k1 + 1] = sq.x; pos[k1 + 2] = sq.y;
+  }
+  for (i = 0; i <= NB; i++) {
+    var zc = zB + (zF - zB) * i / NB;
+    // exterior FOLLOWS the horn in plan (the fan silhouette of real builds): side boards
+    // parallel to the interior side walls, top/bottom slabs riding the vertical curve
+    var wx = Math.max(sB, aAt(zc) + tS);
+    var hy = hyFlat;                          // flat slab top/bottom
+    for (j = 0; j < segs; j++) {
+      var sp = sectionPoint("rrect", wx, hy, Math.min(20, tS * 0.4), j / segs); // eased box edges; corner R on the lip scale (kills the corner crease against the rolled mouth)
+      var kc = ((c0 + i * segs) + j) * 3;
+      pos[kc] = zc; pos[kc + 1] = sp.x; pos[kc + 2] = sp.y;
+    }
+  }
+  // FRONT BULLNOSE (2026-07-13): the mouth roundover BLENDS into the cabinet face --
+  // a per-j cubic Hermite from the lip ring (leaving along the lip's own roll direction)
+  // to the face outer edge (arriving radially, in the face plane). With wrap 0 this
+  // degenerates to a near-flat frame; with wrap it is the carved-in roundover of a
+  // real front face.
+  var g0 = c0 + NB * segs;                     // body front ring (face outer edge)
+  var gB = g0 + segs;                          // bridge rings base
+  for (j = 0; j < segs; j++) {
+    var kL = ((M - 1) * segs + j) * 3, kP = ((M - 2) * segs + j) * 3, kA = (g0 + j) * 3;
+    var B = [pos[kL], pos[kL + 1], pos[kL + 2]], A = [pos[kA], pos[kA + 1], pos[kA + 2]];
+    var ld = [pos[kL] - pos[kP], pos[kL + 1] - pos[kP + 1], pos[kL + 2] - pos[kP + 2]];
+    var ln = Math.hypot(ld[0], ld[1], ld[2]) || 1e-9;
+    var dAB = Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2]);
+    var sc = 0.62 * Math.max(1e-3, dAB);        // near-circular Hermite for up-to-90deg turns
+    var m0 = [ld[0] / ln * sc, ld[1] / ln * sc, ld[2] / ln * sc];
+    var rA = Math.hypot(A[1], A[2]) || 1e-9;
+    var m1 = [0, A[1] / rA * sc, A[2] / rA * sc];  // arrive radially, in the face plane
+    for (i = 1; i < NBR; i++) {
+      var tt = i / NBR, t22 = tt * tt, t33 = t22 * tt;
+      var h00 = 2 * t33 - 3 * t22 + 1, h10 = t33 - 2 * t22 + tt, h01 = -2 * t33 + 3 * t22, h11 = t33 - t22;
+      var kg = ((gB + (i - 1) * segs) + j) * 3;
+      for (var ax = 0; ax < 3; ax++)
+        pos[kg + ax] = h00 * B[ax] + h10 * m0[ax] + h01 * A[ax] + h11 * m1[ax];
+    }
+  }
+  var idx = [];
+  function quad(a, b, c2, d) { idx.push(a, b, c2, a, c2, d); }
+  for (i = 0; i < M - 1; i++)
+    for (j = 0; j < segs; j++) {
+      var j2 = (j + 1) % segs;
+      quad(i * segs + j, (i + 1) * segs + j, (i + 1) * segs + j2, i * segs + j2);   // interior
+    }
+  for (j = 0; j < segs; j++) {
+    var j3 = (j + 1) % segs;
+    quad(b0 + j, b0 + j3, j3, j);                                                   // back face -> throat
+    quad(b0 + j, b1 + j, b1 + j3, b0 + j3);                                          // block sides
+    quad(b1 + j, c0 + j, c0 + j3, b1 + j3);                                          // step annulus
+    for (i = 0; i < NB; i++)
+      quad(c0 + i * segs + j, c0 + (i + 1) * segs + j, c0 + (i + 1) * segs + j3, c0 + i * segs + j3); // body
+    // front: lip -> bridge rings -> face edge (the bullnose)
+    var ch = [function (jj) { return (M - 1) * segs + jj; }];
+    for (var bq = 0; bq < NBR - 1; bq++) (function (b9) { ch.push(function (jj) { return gB + b9 * segs + jj; }); })(bq);
+    ch.push(function (jj) { return g0 + jj; });
+    for (var cc2 = 0; cc2 < ch.length - 1; cc2++)
+      quad(ch[cc2](j), ch[cc2](j3), ch[cc2 + 1](j3), ch[cc2 + 1](j));
+  }
+  return { pos: pos, idx: new Uint32Array(idx) };
+}
+
+
+function bessj0(x) {
+  var ax = Math.abs(x), y, ans;
+  if (ax < 8) { y = x * x;
+    ans = (57568490574.0 + y * (-13362590354.0 + y * (651619640.7 + y * (-11214424.18 + y * (77392.33017 + y * (-184.9052456)))))) /
+          (57568490411.0 + y * (1029532985.0 + y * (9494680.718 + y * (59272.64853 + y * (267.8532712 + y)))));
+  } else { var z = 8 / ax; y = z * z; var xx = ax - 0.785398164;
+    ans = Math.sqrt(0.636619772 / ax) * (Math.cos(xx) * (1 + y * (-0.1098628627e-2 + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)))) -
+      z * Math.sin(xx) * (-0.1562499995e-1 + y * (0.1430488765e-3 + y * (-0.6911147651e-5 + y * (0.7621095161e-6 + y * (-0.934935152e-7))))));
+  }
+  return ans;
+}
+function bessj1(x) {
+  var ax = Math.abs(x), y, ans;
+  if (ax < 8) { y = x * x;
+    ans = x * (72362614232.0 + y * (-7895059235.0 + y * (242396853.1 + y * (-2972611.439 + y * (15704.48260 + y * (-30.16036606)))))) /
+          (144725228442.0 + y * (2300535178.0 + y * (18583304.74 + y * (99447.43394 + y * (376.9991397 + y)))));
+  } else { var z = 8 / ax; y = z * z; var xx = ax - 2.356194491;
+    ans = Math.sqrt(0.636619772 / ax) * (Math.cos(xx) * (1 + y * (0.183105e-2 + y * (-0.3516396496e-4 + y * (0.2457520174e-5 + y * (-0.240337019e-6))))) -
+      z * Math.sin(xx) * (0.04687499995 + y * (-0.2002690873e-3 + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)))));
+    if (x < 0) ans = -ans;
+  }
+  return ans;
+}
+function struveH1(x) { // Aarts & Janssen approximation
+  if (x < 1e-6) return 0;
+  return 2 / Math.PI - bessj0(x) + (16 / Math.PI - 5) * Math.sin(x) / x + (12 - 36 / Math.PI) * (1 - Math.cos(x)) / (x * x);
+}
+function directivityEstimate(fArr, mouthW, mouthH, platH, platV) {
+  // GEOMETRIC ESTIMATE (labeled, not BEM): -6dB beamwidth per plane from the Keele
+  // mouth-size relation theta*d*f = 25.4e6 (deg*mm*Hz) -- the same relation this app
+  // uses to SIZE CD mouths, run in reverse -- clamped to 180 deg below mouth control
+  // and to the design/wall coverage plateau (when one exists) above it. DI from the
+  // rectangular-coverage approximation Q = 180^2/(thetaH*thetaV), DI = 10 log10 Q.
+  var K = 25.4e6, out = { f: fArr, bwH: [], bwV: [], di: [] };
+  for (var i = 0; i < fArr.length; i++) {
+    var f = fArr[i];
+    var tH = Math.min(180, K / (Math.max(1, mouthW) * f));
+    var tV = Math.min(180, K / (Math.max(1, mouthH) * f));
+    if (platH) tH = Math.max(tH, platH);
+    if (platV) tV = Math.max(tV, platV);
+    var Q = 32400 / (tH * tV);
+    out.bwH.push(tH); out.bwV.push(tV);
+    out.di.push(Math.max(0, 10 * Math.log10(Q)));
+  }
+  return out;
+}
+function hornResponse(prof, fArr, coordMode, sMap) {
+  // TIER-1 ON-AXIS RESPONSE ESTIMATE (2026-07-13). Full 2x2 transmission-matrix chain
+  // (cylindrical staircase, same stations and propagation coordinate as
+  // throatImpedance -- one geometry source) terminated by the baffled-piston
+  // radiation impedance. Constant throat volume velocity; on-axis far-field
+  // p ~ j*omega*rho*U_mouth/(2*pi*r). Returned in dB relative to the top-octave
+  // median (shape, not absolute SPL). A 1-D Webster estimate -- NOT a BEM substitute.
+  var H = prof.H, V = prof.V, M = websterEnd(prof), i;   /* entry 238: the chain ends at the mouth plane */
+  var Ssta = [], dl = [];
+  var shp = prof.shape || "ellipse", rho2 = prof.rho || 0, rA = prof.rhoArr, sA = prof.seNArr;
+  for (i = 0; i < M; i++) Ssta.push(sectionArea(sA ? "sellipse:" + sA[Math.min(i, sA.length - 1)] : shp, H[i].r, V[i].r, rA ? rA[Math.min(i, rA.length - 1)] : rho2) - (prof.occl ? prof.occl[i] || 0 : 0));   /* entry 237: NET area (bullet phase plug occlusion subtracted) */
+  function sOfZ(zq) {
+    if (!sMap || !sMap.length) return zq;
+    if (zq <= sMap[0].z) return sMap[0].s;
+    for (var q9 = 1; q9 < sMap.length; q9++) if (sMap[q9].z >= zq) {
+      var f9 = (zq - sMap[q9 - 1].z) / (sMap[q9].z - sMap[q9 - 1].z || 1e-12);
+      return sMap[q9 - 1].s + f9 * (sMap[q9].s - sMap[q9 - 1].s);
+    }
+    return sMap[sMap.length - 1].s;
+  }
+  for (i = 1; i < M; i++) {
+    if (coordMode === "wavefront") dl.push(Math.max(1e-6, sOfZ(H[i].z) - sOfZ(H[i - 1].z)));
+    else dl.push(Math.max(1e-6, H[i].z - H[i - 1].z));
+  }
+  var Sm = Ssta[M - 1], am = Math.sqrt(Sm / Math.PI);
+  var out = [];
+  for (var fi = 0; fi < fArr.length; fi++) {
+    var f = fArr[fi], k = 2 * Math.PI * f / C;
+    // chain T = prod(seg throat->mouth), working with impedances normalized by rho*c
+    // (specific acoustic Z * S = "area-normalized"): per segment characteristic 1/Sseg.
+    var A = 1, Ai = 0, B = 0, Bi = 0, Cc = 0, Ci = 0, D = 1, Di = 0;
+    for (i = 0; i < M - 1; i++) {
+      var Sseg = (Ssta[i] + Ssta[i + 1]) / 2;
+      var kl = k * dl[i], c9 = Math.cos(kl), s9 = Math.sin(kl);
+      var Zc = 1 / Sseg;                                  // (rho c / S) / (rho c)
+      // seg matrix [[c, j Zc s],[ j s/Zc, c]] -- complex multiply into (A B; C D)
+      var mA = c9, mBi = Zc * s9, mCi = s9 / Zc, mD = c9;
+      var nA = A * mA - Bi * mCi, nAi = Ai * mA + B * mCi;
+      var nB = A * 0 - Ai * mBi + B * mD - 0, nBi = A * mBi + Bi * mD;
+      var nC = Cc * mA - Di * mCi, nCi = Ci * mA + D * mCi;
+      var nD = -Ci * mBi + D * mD, nDi = Cc * mBi + Di * mD;
+      A = nA; Ai = nAi; B = nB; Bi = nBi; Cc = nC; Ci = nCi; D = nD; Di = nDi;
+    }
+    var x = 2 * k * am;
+    var R1 = 1 - 2 * bessj1(x) / x, X1 = 2 * struveH1(x) / x;
+    var ZL = R1 / Sm, ZLi = X1 / Sm;                      // piston load, same normalization
+    // U_m / U_t = 1 / (C*ZL + D)
+    var dre = Cc * ZL - Ci * ZLi + D, dim = Cc * ZLi + Ci * ZL + Di;
+    var Um2 = 1 / (dre * dre + dim * dim);
+    // RADIATED POWER response (constant throat volume velocity): P ~ |U_m|^2 Re(Z_L).
+    // Flat above cutoff, mouth-reflection ripple near fc, mass-controlled collapse
+    // below -- the classic loading view. (Raw on-axis would additionally rise ~6dB/oct
+    // from piston beaming; directivity is charted separately.)
+    out.push({ f: f, mag: Math.sqrt(Um2 * ZL), ph: -Math.atan2(dim, dre) });   // entry 143: transfer phase kept (bLab plots impedance phase; ours feeds GROUP DELAY)
+  }
+  // dB relative to the passband (1-10 kHz median)
+  var top = out.filter(function (o9) { return o9.f >= 1000 && o9.f <= 10000; }).map(function (o9) { return o9.mag; }).sort(function (a9, b9) { return a9 - b9; });
+  var ref = top.length ? top[top.length >> 1] : out[out.length - 1].mag;
+  for (i = 0; i < out.length; i++) out[i].db = 20 * Math.log10(Math.max(1e-12, out[i].mag / ref));
+  return out;
+}
+function hornMaxSPL(prof, fArr, coordMode, sMap, opts) {
+  // AIR-NONLINEARITY MAX-SPL ESTIMATE (entry 215). Method: Makarski 2006 Ch.7
+  // (harmonic source terms from the LINEAR solution, slice by slice) reduced to
+  // closed form under 1-D area-law transfer weights; the per-slice plane-wave
+  // second-harmonic law is Thuras/Jenkins/O'Neil 1935 (rms form):
+  //   dp2 = (g+1)/(2*sqrt2*rho*c^2) * p1(z)^2 * k * dz,  k = fundamental's k.
+  // With p1(z) = pt*sqrt(St/S(z)) (resistive transport above fc) and the slice->
+  // mouth weight sqrt(S(z)/Sm), the in-horn sum collapses to
+  //   K2_horn = coef * k * pt * sqrt(St) * INT dz/sqrt(S(z)),
+  // BENCHED vs the Thuras exponential closed form at 0.008% (MAKARSKI_NOTES.md).
+  // Outside the mouth, spherical spreading adds coef*k*p1m*ln(d/rm) (the classic
+  // slowly-growing tail, evaluated at d = 4 m -- Makarski's convention).
+  // Anchor: p@1m per Pa of throat drive G = sqrt(St*Q/4pi)/1m from radiated
+  // power W = pt^2*St/(rho*c) and the app's GEOMETRIC Q(f) (Keele reversed).
+  // Same station/area/coordinate accounting as hornResponse (one geometry
+  // source); the integral stops at the AREA MAX (rolled mouths descend) and
+  // starts at z >= 0 (entry-192 loading-only driver-bore prepends are the
+  // DRIVER's interior -- this estimate is the HORN's physical limit).
+  // HONEST LIMITS: ideal driver (a good 1.4" driver costs ~3 dB at HF); no
+  // directivity-at-2f interaction (BEM arbitrates); invalid below fc where the
+  // transport is reactive (chart grays it).
+  opts = opts || {};
+  var GAM = 1.402, RHO9 = 1.205, C9 = C / 1000;            // SI locals (c from the engine constant)
+  var d9 = opts.d || 4;
+  var H = prof.H, M = websterEnd(prof), i;   /* entry 238: mouth plane */
+  var shp = prof.shape || "ellipse", rho2 = prof.rho || 0, rA = prof.rhoArr, sA = prof.seNArr;
+  var Ssta = [], zRaw = [];
+  for (i = 0; i < M; i++) {
+    Ssta.push(1e-6 * (sectionArea(sA ? "sellipse:" + sA[Math.min(i, sA.length - 1)] : shp, H[i].r, prof.V[i].r, rA ? rA[Math.min(i, rA.length - 1)] : rho2) - (prof.occl ? prof.occl[i] || 0 : 0)));   /* entry 237: NET area */
+    zRaw.push(H[i].z);
+  }
+  function sOfZ(zq) {
+    if (!sMap || !sMap.length) return zq;
+    if (zq <= sMap[0].z) return sMap[0].s;
+    for (var q9 = 1; q9 < sMap.length; q9++) if (sMap[q9].z >= zq) {
+      var f9 = (zq - sMap[q9 - 1].z) / (sMap[q9].z - sMap[q9 - 1].z || 1e-12);
+      return sMap[q9 - 1].s + f9 * (sMap[q9].s - sMap[q9 - 1].s);
+    }
+    return sMap[sMap.length - 1].s;
+  }
+  var i0 = 0; while (i0 < M - 1 && zRaw[i0] < 0) i0++;      // skip loading-only prepends
+  var iMax = i0; for (i = i0 + 1; i < M; i++) if (Ssta[i] > Ssta[iMax]) iMax = i;
+  var I9 = 0;
+  for (i = i0 + 1; i <= iMax; i++) {
+    var dz9 = coordMode === "wavefront" ? (sOfZ(zRaw[i]) - sOfZ(zRaw[i - 1])) : (zRaw[i] - zRaw[i - 1]);
+    I9 += Math.max(0, dz9) * 1e-3 * 0.5 * (1 / Math.sqrt(Ssta[i - 1]) + 1 / Math.sqrt(Ssta[i]));
+  }
+  var St9 = Ssta[i0], rm9 = Math.sqrt(Ssta[iMax] / Math.PI);
+  var coef = (GAM + 1) / (2 * Math.SQRT2 * RHO9 * C9 * C9);
+  var out = [];
+  for (var fi = 0; fi < fArr.length; fi++) {
+    var f = fArr[fi], k9 = 2 * Math.PI * f / C9;
+    var Q9 = opts.qArr ? opts.qArr[fi] : (opts.Q || 1);
+    var G9 = Math.sqrt(St9 * Q9 / (4 * Math.PI));           // p@1m per Pa throat (1 m implied)
+    var xh = coef * k9 * Math.sqrt(St9) * I9;               // in-horn K2 per Pa throat
+    var x9 = xh + coef * k9 * G9 * Math.log(Math.max(1.02, d9 / rm9));
+    out.push({ f: f, xh: xh, x: x9, gain: G9,
+               maxSPL10: 20 * Math.log10(Math.max(1e-12, G9 * 0.10 / x9) / 2e-5) });
+  }
+  return out;                                                // K2=3% is -10.46 dB, 1% is -20 dB from maxSPL10 (linear in K)
+}
+// entry 132 (user report: "lets make the best meshing tool that can work with both
+// Akabak and boundary lab"): GRADED WALL ASSEMBLY. Every station gets its own
+// azimuthal count tracking its local perimeter (full-circle convention, %4,
+// ratio-limited 2:1 between neighbors), sections and outer offsets sampled
+// per distinct count through the VALIDATED buildRings + bemOuterOffset
+// pipeline, bands stitched by a midpoint-rule zipper (monotone, cannot
+// cross, balanced seams -- the entry-129b hub-fan fix). Discs grade from the
+// small throat rims. Measured design target: 2.21x fewer elements at
+// identical quality (roadmap sec. 1), meshio/GMSH compatible for both
+// AKABAK and Boundary Lab.
+// entry 141 (user report: "Lets fix it for all families and all future families"):
+// the assembly is now GEOMETRY-SOURCE-AGNOSTIC. The single contract a family
+// must provide: ringsKept(n) -> Float32Array(M*n*3) of the KEPT stations
+// sampled at any azimuthal count n (%4). Everything else -- per-station
+// perimeters, arc positions, cap slope -- is measured from the grids
+// themselves. Implement ringsKept and a family gets graded counts, the cap
+// source, quality stats, and the NaN gates for free.
+function bemGradedWallAssembly(ringsKept, M, segs, thick, symQ, mode) {
+  // entry 134 (research: Ath Source.Radius spherical cap, auto = wavefront
+  // perpendicular to the walls; ABEC SimType 1 = Infinite Baffle):
+  // mode.srcCap -- dome the source disc as a spherical cap through the throat
+  //   rim, radius R = r_throat / sin(theta_wall) so the cap meets the walls at
+  //   90 deg (the physical exit-wavefront assumption); near-zero wall angle
+  //   degrades gracefully to flat.
+  // mode.baffle -- INFINITE-BAFFLE model: source disc + inner walls only,
+  //   open rim for mounting on the solver's baffle plane; no outer shell,
+  //   flange, or back disc; orientation set explicitly (no volume test on an
+  //   open surface).
+  mode = mode || {};
+  var i, j, k;
+  // probe grid: measured per-station perimeter + arc positions + throat slope
+  var PN = 64, probe = ringsKept(PN);
+  var perArr = [], ctr = [];
+  for (i = 0; i < M; i++) {
+    var pSum = 0, cz = 0, cr = 0;
+    for (j = 0; j < PN; j++) {
+      var a3 = (i * PN + j) * 3, b3 = (i * PN + ((j + 1) % PN)) * 3;
+      pSum += Math.hypot(probe[b3] - probe[a3], probe[b3 + 1] - probe[a3 + 1], probe[b3 + 2] - probe[a3 + 2]);
+      cz += probe[a3]; cr += Math.hypot(probe[a3 + 1], probe[a3 + 2]);
+    }
+    perArr.push(pSum); ctr.push({ z: cz / PN, r: cr / PN });
+  }
+  var eEff = Math.max(0.5, perArr[M - 1] / segs);   // achieved mouth element width
+  function snap4(x) { return 4 * Math.round(x / 4); }
+  // entry 138 (Ath practice, from their configs: ThroatResolution ~2x finer
+  // than MouthResolution -- the source region carries the velocity BC that
+  // drives the whole solve): the target edge tightens toward the throat with
+  // the Mesh2HRTF cosine ramp, x0.55 at the throat -> x1.0 from 30% of the
+  // arc onward. Costs ~10% elements, doubles source-region resolution.
+  var arcCum = [0];
+  for (i = 1; i < M; i++) arcCum.push(arcCum[i - 1] + Math.hypot(ctr[i].z - ctr[i - 1].z, ctr[i].r - ctr[i - 1].r));
+  var arcTot = arcCum[M - 1] || 1;
+  function eLoc(i9) {
+    var d9 = Math.min(1, (arcCum[i9] / arcTot) / 0.3);
+    var g9 = 0.5 - 0.5 * Math.cos(Math.PI * d9);   // smooth 0 -> 1
+    return eEff * (0.55 + 0.45 * g9);
+  }
+  // entry 160 (the wrap investigation's real root cause): ring builders'
+  // azimuthal parameterization is COUNT-DEPENDENT (corner clustering shifts
+  // with n), so grids built at different counts disagree by up to ~55 mm at
+  // the same parameter -- cross-count zipping produced the long diagonals
+  // blamed on the wrap (entry 158's membrane theory: wrong; the back cap
+  // always targeted row 0 correctly). Fix: ONE master grid at `segs`, every
+  // lower count derived by SUBSAMPLING -- same-parameter consistency by
+  // construction, for every rings family at once. Counts are restricted to
+  // divisors of segs (mult-of-4, >= 16) so the subsample stride is integer.
+  // counts stay snap4-granular; consistency comes from the COLUMN MAPS below
+  var nArr = [];
+  for (i = 0; i < M; i++) nArr.push(Math.min(segs, Math.max(16, snap4(perArr[i] / eLoc(i)))));
+  nArr[M - 1] = segs;
+  function ceil4(x) { return 4 * Math.ceil(x / 4); }
+  for (i = M - 2; i >= 0; i--) nArr[i] = Math.min(segs, Math.max(nArr[i], ceil4(nArr[i + 1] / 2)));
+  for (i = 1; i < M; i++) nArr[i] = Math.min(segs, Math.max(nArr[i], ceil4(nArr[i - 1] / 2)));
+  // entry 160: ONE master grid at `segs`; every lower count SELECTS master
+  // columns via a rounded COLUMN MAP (cols[j] = round(j*segs/n), strictly
+  // increasing). Nodes are exact master nodes and every row shares the same
+  // map, so cross-count zipping is consistent BY CONSTRUCTION -- the
+  // count-dependent parameterization of the family builders (up to ~55 mm
+  // same-parameter drift, the true root cause behind entry 158) never enters.
+  var masterF = ringsKept(segs);
+  function colMap(nG) {
+    var cm = new Int32Array(nG);
+    for (var jq = 0; jq < nG; jq++) cm[jq] = Math.round(jq * segs / nG);
+    for (var jq2 = 1; jq2 < nG; jq2++) if (cm[jq2] <= cm[jq2 - 1]) cm[jq2] = cm[jq2 - 1] + 1;
+    for (var jq3 = nG - 1; jq3 >= 1; jq3--) if (cm[jq3] >= segs - (nG - 1 - jq3)) cm[jq3] = segs - (nG - jq3);
+    return cm;
+  }
+  var grids = {};
+  for (i = 0; i < M; i++) if (!grids[nArr[i]]) {
+    var nG = nArr[i], PTSn = nG, innU, cmap9 = colMap(nG);
+    if (symQ) {
+      PTSn = nG / 4 + 1;
+      innU = new Float32Array(M * PTSn * 3);
+      for (var a2 = 0; a2 < M; a2++) for (var b2 = 0; b2 < PTSn; b2++) {
+        var sS = (a2 * segs + Math.min(b2 < nG ? cmap9[b2] : segs / 4, segs / 4)) * 3, sD = (a2 * PTSn + b2) * 3;
+        innU[sD] = masterF[sS]; innU[sD + 1] = masterF[sS + 1]; innU[sD + 2] = masterF[sS + 2];
+      }
+    } else {
+      innU = new Float32Array(M * nG * 3);
+      for (var a3g = 0; a3g < M; a3g++) for (var b3g = 0; b3g < nG; b3g++) {
+        var sS2 = (a3g * segs + cmap9[b3g]) * 3, sD2 = (a3g * nG + b3g) * 3;
+        innU[sD2] = masterF[sS2]; innU[sD2 + 1] = masterF[sS2 + 1]; innU[sD2 + 2] = masterF[sS2 + 2];
+      }
+    }
+    grids[nG] = { inn: innU, out: bemOuterOffset(innU, M, PTSn, thick, symQ), PTSn: PTSn };
+  }
+  function rowN(i9) { return symQ ? nArr[i9] / 4 + 1 : nArr[i9]; }
+  // ---- node layout: [inner rows][outer rows][cSrc][cBack][srcDiscRings][backDiscRings][flangeRings]
+  var innOff = [0], outOffBase, nodesA = [];
+  for (i = 0; i < M; i++) innOff.push(innOff[i] + rowN(i));
+  outOffBase = innOff[M];
+  function pushRow(grid, i9) {
+    var PTSn9 = grid.PTSn === undefined ? 0 : grid.PTSn;
+    for (var j9 = 0; j9 < rowN(i9); j9++) {
+      var s9 = (i9 * grids[nArr[i9]].PTSn + j9) * 3;
+      nodesA.push(grid[s9], grid[s9 + 1], grid[s9 + 2]);
+    }
+  }
+  for (i = 0; i < M; i++) pushRow(grids[nArr[i]].inn, i);
+  if (!mode.baffle) for (i = 0; i < M; i++) pushRow(grids[nArr[i]].out, i);
+  function INg(i9, j9) { var n9 = nArr[i9]; return innOff[i9] + (symQ ? Math.min(j9, n9 / 4) : ((j9 % n9 + n9) % n9)); }
+  function OUTg(i9, j9) { var n9 = nArr[i9]; return outOffBase + innOff[i9] + (symQ ? Math.min(j9, n9 / 4) : ((j9 % n9 + n9) % n9)); }
+  var cSrc = nodesA.length / 3;
+  var z0m = 0; for (j = 0; j < rowN(0); j++) z0m += nodesA[INg(0, j) * 3];
+  nodesA.push(z0m / rowN(0), 0, 0);
+  var cBack = -1;
+  if (!mode.baffle) {
+    cBack = nodesA.length / 3;
+    var zbm = 0; for (j = 0; j < rowN(0); j++) zbm += nodesA[OUTg(0, j) * 3];
+    nodesA.push(zbm / rowN(0), 0, 0);
+  }
+  // entry 134: spherical-cap source geometry (applied to source-disc interior
+  // nodes only; the rim stays put -- watertight, grading intact)
+  var capR = 0, capRim = 0, capZ0 = 0;
+  if (mode.srcCap) {
+    var dr0 = ctr[1].r - ctr[0].r, dz0 = ctr[1].z - ctr[0].z;
+    var sinT = dr0 / Math.max(1e-9, Math.hypot(dr0, dz0));
+    var rr0 = 0; for (j = 0; j < rowN(0); j++) rr0 += Math.hypot(nodesA[INg(0, j) * 3 + 1], nodesA[INg(0, j) * 3 + 2]);
+    capRim = rr0 / rowN(0); capZ0 = nodesA[cSrc * 3];
+    if (sinT > 0.02) capR = capRim / sinT;   // wavefront perpendicular to the walls; tiny angle => flat
+  }
+  function capLift(r9) {
+    if (!capR || r9 >= capRim) return 0;
+    return Math.sqrt(Math.max(0, capR * capR - r9 * r9)) - Math.sqrt(Math.max(0, capR * capR - capRim * capRim));
+  }
+  if (capR) nodesA[cSrc * 3] = capZ0 + capLift(0);   // apex
+  // ---- graded disc rings (full-count convention; rims are the wall/shell ring 0)
+  function discPlan(rimIdxFn, rimN, cI, eDisc) {
+    eDisc = eDisc || eEff;
+    var rr = 0; for (var jr = 0; jr < (symQ ? rimN / 4 + 1 : rimN); jr++) rr += Math.hypot(nodesA[rimIdxFn(jr) * 3 + 1], nodesA[rimIdxFn(jr) * 3 + 2]);
+    rr /= (symQ ? rimN / 4 + 1 : rimN);
+    var nR = Math.min(32, Math.max(1, Math.ceil(rr / eDisc)));
+    var counts = [], t9;
+    for (t9 = 1; t9 <= nR; t9++) counts.push(Math.min(rimN, Math.max(8, snap4(2 * Math.PI * (rr * t9 / nR) / eDisc))));
+    counts[nR - 1] = rimN;
+    for (t9 = nR - 2; t9 >= 0; t9--) counts[t9] = Math.min(counts[t9], counts[t9 + 1]);
+    // interior ring nodes: sample the rim row at fraction f, lerp toward the center
+    var off9 = [], base9 = nodesA.length / 3;
+    for (t9 = 1; t9 < nR; t9++) {
+      off9.push(nodesA.length / 3);
+      var n9 = counts[t9 - 1], rowC = symQ ? n9 / 4 + 1 : n9, frT = t9 / nR;
+      for (var j9 = 0; j9 < rowC; j9++) {
+        var u9 = j9 * rimN / n9;   // full-index units on the rim row
+        var i0 = Math.floor(u9), ff = u9 - i0;
+        var iA = rimIdxFn(symQ ? Math.min(i0, rimN / 4) : (i0 % rimN)) * 3;
+        var iB = rimIdxFn(symQ ? Math.min(i0 + 1, rimN / 4) : ((i0 + 1) % rimN)) * 3;
+        var rx = nodesA[iA] + (nodesA[iB] - nodesA[iA]) * ff;
+        var ry = nodesA[iA + 1] + (nodesA[iB + 1] - nodesA[iA + 1]) * ff;
+        var rz = nodesA[iA + 2] + (nodesA[iB + 2] - nodesA[iA + 2]) * ff;
+        var px9 = nodesA[cI * 3 + 1] + (ry - nodesA[cI * 3 + 1]) * frT, py9 = nodesA[cI * 3 + 2] + (rz - nodesA[cI * 3 + 2]) * frT;
+        var pz9 = nodesA[cI * 3] + (rx - nodesA[cI * 3]) * frT;
+        if (cI === cSrc && capR) pz9 = capZ0 + capLift(Math.hypot(px9, py9));   // entry 134: dome the cap
+        nodesA.push(pz9, px9, py9);
+      }
+    }
+    return { counts: counts, off: off9, nR: nR };
+  }
+  var tris = [];
+  // midpoint-rule zipper between ring A (count nA, idx fnA) and ring B (count nB, fnB)
+  // winding matches the legacy strip: advance-B -> [A, B_k, B_k+1]; advance-A -> [A_j, B_k, A_j+1]
+  function zipRings(fnA, nA, fnB, nB, flip) {
+    var limA = symQ ? nA / 4 : nA, limB = symQ ? nB / 4 : nB;
+    var iA9 = 0, iB9 = 0;
+    function emit(a9, b9, c9) { if (flip) tris.push([a9, c9, b9]); else tris.push([a9, b9, c9]); }
+    while (iA9 < limA || iB9 < limB) {
+      var mA = (iA9 + 0.5) / nA, mB = (iB9 + 0.5) / nB;   // midpoint parameters
+      var advB = (iA9 >= limA) || (iB9 < limB && mB <= mA + 1e-12);
+      if (advB) { emit(fnA(Math.min(iA9, limA)), fnB(iB9), fnB(iB9 + 1)); iB9++; }
+      else { emit(fnA(iA9), fnB(Math.min(iB9, limB)), fnA(iA9 + 1)); iA9++; }
+    }
+  }
+  function discTris(plan, rimIdxFn, rimN, cI, flip) {
+    var c0 = tris.length;
+    function ringFn(t9) {
+      if (t9 >= plan.nR) return { fn: rimIdxFn, n: rimN };
+      var n9 = plan.counts[t9 - 1], off9 = plan.off[t9 - 1];
+      return { fn: function (j9) { return off9 + (symQ ? Math.min(j9, n9 / 4) : ((j9 % n9 + n9) % n9)); }, n: n9 };
+    }
+    var r1 = ringFn(1), lim1 = symQ ? r1.n / 4 : r1.n;
+    for (var jH = 0; jH < lim1; jH++) { if (flip) tris.push([cI, r1.fn(jH + 1), r1.fn(jH)]); else tris.push([cI, r1.fn(jH), r1.fn(jH + 1)]); }
+    for (var tG = 1; tG < plan.nR; tG++) {
+      var rI = ringFn(tG), rO = ringFn(tG + 1);
+      zipRings(rI.fn, rI.n, rO.fn, rO.n, flip);
+    }
+    return tris.length - c0;
+  }
+  // 1) SOURCE disc first (bemToMsh groups elements [0, nSrc) as SourceDisc)
+  var planS = discPlan(function (j9) { return INg(0, j9); }, nArr[0], cSrc, eLoc(0));   // entry 138: source disc at throat resolution
+  var nSrc = discTris(planS, function (j9) { return INg(0, j9); }, nArr[0], cSrc, false);
+  // 2) channel walls
+  for (i = 0; i < M - 1; i++) zipRings(function (j9) { return INg(i, j9); }, nArr[i], (function (i9) { return function (j9) { return INg(i9, j9); }; })(i + 1), nArr[i + 1], false);
+  if (!mode.baffle) {
+    // 3) mouth flange (equal counts, single band)
+    zipRings(function (j9) { return INg(M - 1, j9); }, nArr[M - 1], function (j9) { return OUTg(M - 1, j9); }, nArr[M - 1], false);
+    // 4) outer shell (reversed)
+    for (i = 0; i < M - 1; i++) zipRings(function (j9) { return OUTg(i, j9); }, nArr[i], (function (i9) { return function (j9) { return OUTg(i9, j9); }; })(i + 1), nArr[i + 1], true);
+    // 5) back disc (reversed)
+    var planB = discPlan(function (j9) { return OUTg(0, j9); }, nArr[0], cBack);
+    discTris(planB, function (j9) { return OUTg(0, j9); }, nArr[0], cBack, true);
+  }
+  // rim planarity (baffle-mounting guidance): axial span of the open mouth rim
+  var rimZmin = 1e18, rimZmax = -1e18;
+  for (j = 0; j < rowN(M - 1); j++) {
+    var zr9 = nodesA[INg(M - 1, j) * 3];
+    if (zr9 < rimZmin) rimZmin = zr9; if (zr9 > rimZmax) rimZmax = zr9;
+  }
+  return { nodes: Float64Array.from(nodesA), tris: tris, nSrc: nSrc, NV: nodesA.length / 3, nArr: nArr,
+           layout: { innEnd: innOff[M], outEnd: outOffBase + innOff[M], cSrc: cSrc, cBack: cBack, innOff: innOff.slice(), nArrD: nArr.slice() },   /* entry 160 debug */
+           open: mode.baffle ? 1 : 0, rimSpan: rimZmax - rimZmin, capDepth: capR ? capLift(0) : 0 };
+}
+// entry 151 (user report: "when it downloads multiple files should it do it in a
+// zip file?"): STORE-ONLY ZIP writer (no compression -- text meshes, size
+// irrelevant; browsers gate multiple programmatic downloads and Boundary Lab
+// needs both files in ONE folder, which a zip enforces by construction).
+var _crcTable = null;
+function crc32(str) {
+  if (!_crcTable) {
+    _crcTable = new Int32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      _crcTable[n] = c;
+    }
+  }
+  var crc = -1;
+  for (var i = 0; i < str.length; i++) crc = (crc >>> 8) ^ _crcTable[(crc ^ str.charCodeAt(i)) & 0xFF];
+  return (crc ^ -1) >>> 0;
+}
+function abecProject(o) {
+  // AKABAK/ABEC PROJECT SCRIPTS (entry 224: "does the tool export an akabak
+  // project" -> "build it and ship it"). Grammar verified against WORKING
+  // ABEC3 scripts in the public record -- the import-ABEC-gmesh fragment
+  // (Control_Solver / MeshFile_Properties / Elements / "101 Mesh Include")
+  // and the abec-experts full blocks (SubDomain_Properties + ElType, include
+  // by NUMERIC physical tag, Driving/RefElements/DrvGroup, Infinite_Baffle,
+  // Nodes + BE_Spectrum Curves/Polar with BasePlane + Driving_Values).
+  // NOT fabricated (no authoritative source reachable): the binary .abec
+  // project container -- the README carries exact assembly steps instead --
+  // and the two-plane symmetry statement: QUARTER meshes get a loud comment
+  // + README instructions, never a guessed Sym line.
+  // Conventions: mesh = GMSH 2.2 ASCII, millimetres, x = the horn axis;
+  // physical tag 1 = SourceDisc (driven), tag 2 = HornWalls (entries 86/137).
+  var f1 = Math.max(50, Math.round(o.f1)), f2 = Math.max(f1 + 100, Math.round(o.f2));
+  var nf = o.nFreq || 48, mf = Math.round(o.meshFreq || f2);
+  var mx = Math.round(o.mouthX || 0);
+  var qNote = o.quarter ? "\n// QUARTER mesh: enable BOTH mirror planes in the solver settings\n// (the cut planes are y=0 and z=0, both through the horn axis).\n" : "";
+  var solving =
+    "// " + (o.name || "horn") + " -- ABEC solving script (generated by Horn Studio)\n" +
+    "// Mesh: GMSH 2.2 ASCII, millimetres, x = horn axis\n" +
+    "// Physical groups: 1 = SourceDisc (driven), 2 = HornWalls\n\n" +
+    "Control_Solver\n" +
+    "  f1=" + f1 + "; f2=" + f2 + "; NumFrequencies=" + nf + "; Abscissa=log\n" +
+    "  Dim=3D\n" +
+    "  MeshFrequency=" + mf + "Hz\n" + qNote + "\n" +
+    "MeshFile_Properties \"HornMesh\"\n" +
+    "  MeshFileAlias=\"M1\"\n" +
+    "  Scale=1mm\n\n" +
+    "SubDomain_Properties 'Air'\n" +
+    "  SubDomain=1\n" +
+    "  ElType=Exterior\n\n" +
+    "Elements \"HornWalls\"\n" +
+    "  SubDomain=1\n" +
+    "  MeshFileAlias=\"M1\"\n" +
+    "  101 Mesh Include 2\n\n" +
+    "Elements \"SourceDisc\"\n" +
+    "  SubDomain=1\n" +
+    "  MeshFileAlias=\"M1\"\n" +
+    "  101 Mesh Include 1\n\n" +
+    "Driving\n" +
+    "  RefElements=\"SourceDisc\"\n" +
+    "  DrvGroup=1001\n" +
+    (o.baffle ? "\nInfinite_Baffle\n  Subdomain=1\n  Position=x Offset=" + mx + "mm\n" : "");
+  var observation =
+    "// " + (o.name || "horn") + " -- ABEC observation script (generated by Horn Studio)\n\n" +
+    "Driving_Values\n" +
+    "  DrvType=Velocity; Value=1.0\n" +
+    "  101 DrvGroup=1001 Weight=1.0\n\n" +
+    "Nodes \"FieldPoints\"\n" +
+    "  Scale=1mm\n" +
+    "  // node, x, y, z   (x = horn axis; y = horizontal; z = vertical)\n" +
+    "  1000 " + (mx + 1000) + " 0 0   // on-axis, 1 m past the mouth plane\n" +
+    "  2001 " + mx + " 0 0   // rotation point: mouth plane on the axis\n" +
+    "  2002 " + (mx + 50) + " 0 0   // axis direction\n" +
+    "  2003 " + mx + " 100 0   // horizontal base plane\n" +
+    "  2004 " + mx + " 0 100   // vertical base plane\n\n" +
+    "BE_Spectrum\n" +
+    "  PlotType=Curves\n  RefNodes=\"FieldPoints\"\n  GraphHeader=\"SPL on-axis 1m\"\n" +
+    "  BodeType=LeveldB\n  Range=50dB\n  101 1000 ID=101\n\n" +
+    "BE_Spectrum\n" +
+    "  PlotType=Polar\n  GraphHeader=\"Polar H 2m\"\n  BodeType=LeveldB\n  Range=30dB\n" +
+    "  PolarRange=-90, 90, 37\n  BasePlane=2001 2002 2003 RefNodes=\"FieldPoints\"\n" +
+    "  Distance=2000\n  101 Inclination=0.0 ID=2101\n\n" +
+    "BE_Spectrum\n" +
+    "  PlotType=Polar\n  GraphHeader=\"Polar V 2m\"\n  BodeType=LeveldB\n  Range=30dB\n" +
+    "  PolarRange=-90, 90, 37\n  BasePlane=2001 2002 2004 RefNodes=\"FieldPoints\"\n" +
+    "  Distance=2000\n  101 Inclination=0.0 ID=2201\n";
+  var readme =
+    "HORN STUDIO -> AKABAK/ABEC PROJECT\n" +
+    "==================================\n\n" +
+    "Files: " + (o.mshName || "mesh.msh") + " (GMSH 2.2, mm), solving.txt, observation.txt.\n\n" +
+    "ASSEMBLY (AKABAK 3, which contains the ABEC solver):\n" +
+    "1. New Project -> BEM script project.\n" +
+    "2. Register the mesh file in the project (mesh files section) so the\n" +
+    "   alias M1 in solving.txt resolves to it; keep Scale = 1mm.\n" +
+    "3. Add solving.txt and observation.txt as the project's scripts.\n" +
+    "4. Run the solver's NORMALS CHECK before solving. If a group is flagged\n" +
+    "   inverted, append \" SwapNormals\" to that group's '101 Mesh Include'\n" +
+    "   line in solving.txt.\n" +
+    "5. Solve; the observation gives on-axis SPL at 1 m past the mouth and\n" +
+    "   horizontal + vertical polars at 2 m (37 angles, -90..90).\n\n" +
+    (o.quarter ? "QUARTER MESH: this export is a quarter model. Enable BOTH mirror planes\nin the solver settings (the cut planes are y=0 and z=0, through the horn\naxis). Without them the run is garbage.\n\n" : "") +
+    (o.baffle ? "INFINITE BAFFLE model: the mouth rim lies open on the baffle plane at\nx = " + mx + " mm (the Infinite_Baffle statement in solving.txt).\n\n" : "FREE-STANDING model: closed body in free space (exterior domain).\n\n") +
+    "Driving is a velocity source (1 m/s) on the SourceDisc group -- the same\n" +
+    "convention as this app's BEM exports. Prefer Ath-style flat-mass drive?\n" +
+    "Change DrvType=Velocity to DrvType=Acceleration in observation.txt.\n\n" +
+    "MESH SIZE: AKABAK 3's own guidance is to keep BEM elements under about\n" +
+    "5000. The mesh density selector in the app reports the element count\n" +
+    "before you export; the quarter-symmetry option cuts it roughly 4x.\n" +
+    "Driver alignment inside AKABAK is done by MESH TAG NUMBER, not by name.\n\n" +
+    "WANT LOADING AND RESPONSE INSTEAD OF DIRECTIVITY?\n" +
+    "There is a second, much simpler export: AKABAK SCRIPT (LEM, .AKS). It\n" +
+    "is the same horn reduced to its cross-sectional area law as a chain of\n" +
+    "conical Waveguide segments, and it loads by PASTE -- in AKABAK 3 under\n" +
+    "Lumped Element > General > Script. Use it for throat impedance, loading\n" +
+    "and on-axis response with your own driver; use THIS project for polars\n" +
+    "and DI, which a lumped model cannot produce.\n\n" +
+    "FIRST-RUN NOTE: these scripts follow ABEC3 grammar verified against\n" +
+    "working public examples, but this generator could not be tested inside\n" +
+    "AKABAK itself. If anything fails to parse on your machine, please report\n" +
+    "it (with the error line) -- it will be fixed the same day.\n" +
+    (o.plug ? "\nPHASE PLUG (entry 237): the mesh contains the bullet as a separate closed\n" +
+      "RIGID body (bullet O " + o.plug.D.toFixed(1) + " mm, length " + o.plug.L.toFixed(1) + " mm) inside the throat,\n" +
+      "oriented outward into the air like the horn walls. The " + (o.plug.spokes || 0) + " printed spokes\n" +
+      "are NOT in the BEM mesh (they touch the wall and would need a Boolean\n" +
+      "union); acoustically they are thin, but say so when you publish. The\n" +
+      "walls were opened so that NET area (wall minus bullet) follows the\n" +
+      "design law -- the loading you see is the compensated one.\n" : "");
+  return { solving: solving, observation: observation, readme: readme };
+}
+function akabakLEM(o) {
+  // AKABAK LEM SCRIPT (entry 230). Hans, via the forum: "tried to load Horn
+  // Studio files into Akabak the whole day using KI. But failed. Will there be
+  // the possibility to generate an .akp file?" -- Marwan's steer: "I think we
+  // could generate an akabak script like horn response does."
+  //
+  // GRAMMAR PROVENANCE -- copied from REAL, WORKING scripts in the public
+  // record, not invented:
+  //   * a verbatim Hornresp AkAbak export (redspade-audio 2012 "Akabak vs
+  //     Hornresp vs Real measurements", and the diyAudio "Project Eburon"
+  //     thread): "|" line comments, Def_Const { } blocks with {name} refs,
+  //     Def_Driver 'X' (Sd/Bl/Cms/Rms/fs/Le/Re/ExpoLe), System 'X',
+  //     Driver Def='X''Label' Node=1=0=5=6, Duct (SD/Len/Visc),
+  //     Waveguide 'seg' Node=a=b STh=..cm2 SMo=..cm2 Len=..cm Conical,
+  //     Radiator 'Horn mouth' Node=n SD=..cm2 Label=2.
+  //   * hand-written horn scripts on freespeakerplans (chains of conical
+  //     Waveguide segments + Enclosure 'Rear chamber' Vb=..L) confirm the
+  //     multi-segment form we emit here.
+  // NOT fabricated: the binary .akp project container stays undocumented (the
+  // diyAudio "Documentation for ABEC/Script Import Akabak" thread is still
+  // unanswered), so we ship the TEXT script AKABAK reads, never a guessed
+  // container. Decimal separator is always "." (Hornresp emits the OS locale's
+  // separator -- "0,20m" -- which is exactly the kind of thing that fails to
+  // parse on someone else's machine).
+  //
+  // MODEL: the same profile the geometry exports, reduced to its true
+  // cross-sectional AREA law (sectionArea, one geometry source with
+  // hornResponse/throatImpedance/hornMaxSPL) and cut into nSeg conical
+  // Waveguide segments along the SAME propagation coordinate the 1-D charts
+  // use (axial z, or the JMLC wavefront map). LEM sees area only -- that
+  // honesty is stated in the header, not hidden.
+  o = o || {};
+  var prof = o.prof, H = prof && prof.H, V = prof && prof.V;
+  if (!H || !V || H.length < 2) return null;
+  var M = H.length, i;
+  var shp = prof.shape || "ellipse", rho2 = prof.rho || 0, rA = prof.rhoArr, sA = prof.seNArr;
+  var sMap = o.sMap, wf = o.mode === "wavefront" && sMap && sMap.length;
+  function sOfZ(zq) {
+    if (!wf) return zq;
+    if (zq <= sMap[0].z) return sMap[0].s;
+    for (var q = 1; q < sMap.length; q++) if (sMap[q].z >= zq) {
+      var f = (zq - sMap[q - 1].z) / (sMap[q].z - sMap[q - 1].z || 1e-12);
+      return sMap[q - 1].s + f * (sMap[q].s - sMap[q - 1].s);
+    }
+    return sMap[sMap.length - 1].s;
+  }
+  // stations -> (coordinate mm, area mm2). Stations behind the throat (the
+  // entry-192 loading-only driver bore, z < 0) are EXCLUDED: the user's own
+  // driver already carries its exit, and double-counting it would be a lie
+  // dressed as precision. The header says so.
+  var L = [], A = [], skipped = 0;
+  for (i = 0; i < M; i++) {
+    if (H[i].z < -1e-9) { skipped++; continue; }
+    var li = sOfZ(H[i].z), ai = sectionArea(sA ? "sellipse:" + sA[Math.min(i, sA.length - 1)] : shp,
+      H[i].r, V[i].r, rA ? rA[Math.min(i, rA.length - 1)] : rho2) - (prof.occl ? prof.occl[i] || 0 : 0);   /* entry 237: NET area */
+    if (!isFinite(li) || !isFinite(ai) || ai <= 0) continue;
+    if (L.length && li <= L[L.length - 1] + 1e-9) continue;   // monotone coordinate only
+    L.push(li); A.push(ai);
+  }
+  if (L.length < 2) return null;
+  var l0 = L[0], tot = L[L.length - 1] - l0;
+  if (!(tot > 0)) return null;
+  var nSeg = Math.max(4, Math.min(64, Math.round(o.nSeg || 24)));
+  function areaAt(lq) {
+    if (lq <= L[0]) return A[0];
+    for (var q = 1; q < L.length; q++) if (L[q] >= lq) {
+      var f = (lq - L[q - 1]) / (L[q] - L[q - 1] || 1e-12);
+      return A[q - 1] + f * (A[q] - A[q - 1]);
+    }
+    return A[A.length - 1];
+  }
+  var node = [], area = [];
+  for (i = 0; i <= nSeg; i++) { var lc = l0 + tot * i / nSeg; node.push(lc); area.push(areaAt(lc)); }
+  function cm2(mm2) { return (mm2 / 100).toFixed(2); }
+  function cm(mm) { return (mm / 10).toFixed(3); }
+  var name = o.name || "horn";
+  var segLen = tot / nSeg;
+  var hdr =
+    "|" + akRep("=", 88) + "\n" +
+    "|HORN STUDIO -> AKABAK SCRIPT (LEM).  " + name + "\n" +
+    "|" + (o.build ? "Build " + o.build + ".  " : "") + "Family: " + (o.family || "?") +
+    "   Section: " + (o.section || shp) + "\n" +
+    (o.tag ? "|Design: " + String(o.tag).replace(/[\r\n]/g, " ") + "\n" : "") +   /* entry 238: provenance */
+    "|Throat area " + cm2(area[0]) + " cm2   Mouth area " + cm2(area[nSeg]) + " cm2   " +
+    (wf ? "Wavefront" : "Axial") + " length " + cm(tot) + " cm   " + nSeg + " conical segments\n" +
+    "|" + akRep("=", 88) + "\n" +
+    "|\n" +
+    "|WHAT THIS IS\n" +
+    "|The SAME profile this app exports as geometry, reduced to its true\n" +
+    "|cross-sectional area law and cut into " + nSeg + " conical Waveguide segments along\n" +
+    "|the " + (wf ? "wavefront" : "axial") + " propagation coordinate. It gives you loading, throat\n" +
+    "|impedance and on-axis response -- the 1-D picture, in AKABAK, with your driver.\n" +
+    "|\n" +
+    "|WHAT IT IS NOT\n" +
+    "|LEM sees AREA ONLY. The horizontal/vertical shape, the section (" + (o.section || shp) + "),\n" +
+    "|corner radii and the mouth roundover do not enter this model at all, so it\n" +
+    "|cannot tell you anything about directivity, polars or DI. Two horns with the\n" +
+    "|same area law and completely different coverage produce the SAME script.\n" +
+    "|For directivity use the app's EXPORT BEM PROJECT (ZIP): mesh + ABEC solving\n" +
+    "|and observation scripts for the BEM side of AKABAK.\n" +
+    "|\n" +
+    "|HOW TO LOAD\n" +
+    "|AKABAK 3: Lumped Element > General > Script, then paste this text into the\n" +
+    "|          script editor and apply.\n" +
+    "|AKABAK 2: File > New Script and paste (this file is plain text; the classic\n" +
+    "|          script extension is .aks).\n" +
+    "|\n" +
+    "|SETTINGS, so this agrees with Hornresp and with the app's own charts:\n" +
+    "|File > Preferences > Physical system constants:\n" +
+    "|Sound velocity c = 344m/s\n" +
+    "|Medium density rho = 1.205kg/m3\n" +
+    "|Radiation into 2 Pi (half space); input voltage 2.83V rms.\n" +
+    "|LEVEL REFERENCE: AKABAK references SPL to sqrt(2)*20uPa, Hornresp to 20uPa,\n" +
+    "|so AKABAK reads 3.01 dB high against a Hornresp plot of the same model.\n" +
+    "|\n" +
+    "|THE DRIVER BLOCK BELOW IS A PLACEHOLDER. Horn Studio designs the horn, not\n" +
+    "|the driver: replace every value in Def_Driver with your own compression\n" +
+    "|driver's parameters (and its rear-cavity volume in the Enclosure line)\n" +
+    "|before you believe any level. The horn segments are the real content here.\n" +
+    (skipped ? "|The " + skipped + " loading-only stations behind the throat (the driver bore term in\n" +
+      "|the app's impedance chart) are NOT exported -- your driver already has its\n" +
+      "|own exit. Add a Duct ahead of node 3 if you want it modelled explicitly.\n" : "") +
+    "|" + akRep("=", 88) + "\n\n";
+  var body =
+    "Def_Driver 'Driver'\n" +
+    // Parameter set copied from the verified Hornresp AkAbak export (Sd/Bl/Cms/
+    // Rms/fs/Le/Re/ExpoLe) rather than a guessed one. Placeholder values are a
+    // self-consistent generic 1" compression driver: fs 800 Hz, Mms 0.35 g,
+    // Qms 3.0 -> Cms = 1/((2*pi*fs)^2*Mms), Rms = 2*pi*fs*Mms/Qms.
+    "Sd=" + cm2(area[0]) + "cm2   |EDIT: your driver's diaphragm area\n" +
+    "Bl=9.0Tm   |EDIT\n" +
+    "Cms=0.0001131m/N   |EDIT\n" +
+    "Rms=0.5864Ns/m   |EDIT\n" +
+    "fs=800Hz   |EDIT\n" +
+    "Le=0.05mH   |EDIT\n" +
+    "Re=6.5ohm   |EDIT\n" +
+    "ExpoLe=1\n\n" +
+    "System '" + name + "'\n\n" +
+    "Driver Def='Driver''Driver'\n" +
+    "Node=1=0=2=3\n\n" +
+    "Enclosure 'Driver rear chamber'\n" +
+    "Node=2\n" +
+    "Vb=0.10L   |EDIT: your driver's rear cavity volume\n\n";
+  for (i = 0; i < nSeg; i++) {
+    body +=
+      "Waveguide 'Horn segment " + (i + 1) + "'\n" +
+      "Node=" + (3 + i) + "=" + (4 + i) + "\n" +
+      "STh=" + cm2(area[i]) + "cm2\n" +
+      "SMo=" + cm2(area[i + 1]) + "cm2\n" +
+      "Len=" + cm(segLen) + "cm\n" +
+      "Conical\n\n";
+  }
+  body +=
+    "Radiator 'Horn mouth'\n" +
+    "Node=" + (3 + nSeg) + "\n" +
+    "SD=" + cm2(area[nSeg]) + "cm2\n" +
+    "Label=1\n";
+  return { script: hdr + body, nSeg: nSeg, throatArea: area[0], mouthArea: area[nSeg], length: tot, skipped: skipped, mode: wf ? "wavefront" : "axial" };
+}
+function akRep(ch, n) { var s = ""; for (var i = 0; i < n; i++) s += ch; return s; }
+function makeStoreZip(files) {   // files: [{ name, data (ASCII/UTF8-safe string) }] -> Uint8Array
+  var parts = [], central = [], offset = 0, i;
+  function u16(v) { return [v & 255, (v >> 8) & 255]; }
+  function u32(v) { return [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255]; }
+  for (i = 0; i < files.length; i++) {
+    var name = files[i].name, data = files[i].data;
+    var crc = crc32(data), sz = data.length;
+    var local = [0x50, 0x4B, 0x03, 0x04].concat(u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(sz), u32(sz), u16(name.length), u16(0));
+    parts.push(new Uint8Array(local));
+    parts.push(Uint8Array.from(name, function (c) { return c.charCodeAt(0); }));
+    var body = new Uint8Array(sz);
+    for (var b = 0; b < sz; b++) body[b] = data.charCodeAt(b) & 255;
+    parts.push(body);
+    central.push({ name: name, crc: crc, sz: sz, off: offset });
+    offset += local.length + name.length + sz;
+  }
+  var cdStart = offset, cdLen = 0;
+  for (i = 0; i < central.length; i++) {
+    var e = central[i];
+    var cd = [0x50, 0x4B, 0x01, 0x02].concat(u16(20), u16(20), u16(0), u16(0), u16(0), u16(0), u32(e.crc), u32(e.sz), u32(e.sz), u16(e.name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(e.off));
+    parts.push(new Uint8Array(cd));
+    parts.push(Uint8Array.from(e.name, function (c) { return c.charCodeAt(0); }));
+    cdLen += cd.length + e.name.length;
+  }
+  var eocd = [0x50, 0x4B, 0x05, 0x06].concat(u16(0), u16(0), u16(central.length), u16(central.length), u32(cdLen), u32(cdStart), u16(0));
+  parts.push(new Uint8Array(eocd));
+  var total = 0;
+  for (i = 0; i < parts.length; i++) total += parts[i].length;
+  var out = new Uint8Array(total), p = 0;
+  for (i = 0; i < parts.length; i++) { out.set(parts[i], p); p += parts[i].length; }
+  return out;
+}
+// entry 132: the entry-78 continuity-anchored vertex-normal offset, extracted
+// verbatim so the legacy and graded assemblies share one implementation.
+function bemOuterOffset(inner, M, PTS, thick, symQ) {
+  var outer = new Float32Array(M * PTS * 3);
+  var prevN = new Float32Array(PTS * 3);
+  for (var i = 0; i < M; i++)
+    for (var j = 0; j < PTS; j++) {
+      var k0 = (i * PTS + j) * 3;
+      var ip = Math.max(0, i - 1) * PTS + j, iq = Math.min(M - 1, i + 1) * PTS + j;
+      var jpz, jpx, jpy, jqz, jqx, jqy;
+      if (symQ && j === 0) {
+        var mq0 = (i * PTS + 1) * 3;
+        jpz = inner[mq0]; jpx = inner[mq0 + 1]; jpy = -inner[mq0 + 2];
+        jqz = inner[mq0]; jqx = inner[mq0 + 1]; jqy = inner[mq0 + 2];
+      } else if (symQ && j === PTS - 1) {
+        var mq1 = (i * PTS + PTS - 2) * 3;
+        jpz = inner[mq1]; jpx = inner[mq1 + 1]; jpy = inner[mq1 + 2];
+        jqz = inner[mq1]; jqx = -inner[mq1 + 1]; jqy = inner[mq1 + 2];
+      } else {
+        var jp = i * PTS + ((j - 1 + PTS) % PTS), jq = i * PTS + ((j + 1) % PTS);
+        jpz = inner[jp * 3]; jpx = inner[jp * 3 + 1]; jpy = inner[jp * 3 + 2];
+        jqz = inner[jq * 3]; jqx = inner[jq * 3 + 1]; jqy = inner[jq * 3 + 2];
+      }
+      var tix = inner[iq * 3] - inner[ip * 3], tiy = inner[iq * 3 + 1] - inner[ip * 3 + 1], tiz = inner[iq * 3 + 2] - inner[ip * 3 + 2];
+      var tjx = jqz - jpz, tjy = jqx - jpx, tjz = jqy - jpy;
+      var nx = tjy * tiz - tjz * tiy, ny = tjz * tix - tjx * tiz, nz = tjx * tiy - tjy * tix;
+      var nl = Math.hypot(nx, ny, nz) || 1e-12;
+      if (i === 0) {
+        if (ny * inner[k0 + 1] + nz * inner[k0 + 2] < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      } else {
+        if (nx * prevN[j * 3] + ny * prevN[j * 3 + 1] + nz * prevN[j * 3 + 2] < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      }
+      prevN[j * 3] = nx / nl; prevN[j * 3 + 1] = ny / nl; prevN[j * 3 + 2] = nz / nl;
+      outer[k0] = inner[k0] + thick * nx / nl;
+      outer[k0 + 1] = inner[k0 + 1] + thick * ny / nl;
+      outer[k0 + 2] = inner[k0 + 2] + thick * nz / nl;
+    }
+  return outer;
+}
+function buildBEMProject(horn, prof, ringsOv, opts) {
+  // ONE-BUTTON BEM (2026-07-13, v2): the surface is CONSTRUCTED explicitly, source
+  // first -- no detection. buildSolidMesh turned out to be a genus-1 tube (open
+  // channel through, watertight because the channel is a HOLE), so a piston disc
+  // cannot be patched onto it manifoldly. Topology here (closed, 2-manifold):
+  //   [SOURCE disc at station 1, normals into the channel]  <- elements 0..nSrc-1
+  //   [channel wall, stations 1..M-1]
+  //   [flat mouth flange annulus]  (the cosmetic roundover is omitted for BEM)
+  //   [outer shell, offset t along vertex normals, reversed]
+  //   [flat back disc at station 0's plane]
+  // The slab between back disc and source disc is solid (the "driver").
+  opts = opts || {};
+  // density raised 22x26 -> 28x32 (2026-07-14): SLFMBEM under WASI makes ~3.4k
+  // elements affordable and lifts the lambda/6 ceiling ~40%.
+  var segs = opts.segs || 32, nSta = opts.stations || 28, thick = opts.thick || 6;
+  // entry 78: QUARTER MODEL for NumCalc SYMMETRY planes (x=0, y=0 mirrors; flags "1 1 0").
+  // Eligibility is HARD-ENFORCED (regression-21 lesson: no silent fallbacks): the loft
+  // must be a two-plane-symmetric section family (prof branch), no rings-path bodies
+  // (WN wrapped mouths / Arai fans are cut-unsafe in v1), no floating fin solids.
+  var symQ = opts.symmetry === "quarter";
+  // entry 136 (user: ".msh file exports are invalid now with some rows
+  // containing NaN"): HARD GATE -- reject non-finite geometry up front with a
+  // clear error instead of propagating NaN into the exported file.
+  if (ringsOv && ringsOv.rings) {   // entry 141: the rings path needs the same gate (biradial with bad params silently builds a NaN grid)
+    for (var gR = 0; gR < ringsOv.rings.length; gR += 97) {   // stride sample: cheap, catches whole-row NaN
+      if (!isFinite(ringsOv.rings[gR]))
+        throw new Error("BEM export aborted: non-finite ring geometry -- check the parameters (this family may need different settings)");
+    }
+  }
+  // entry 213: an EMPTY profile passes the non-finite loop below trivially
+  // (zero iterations) -- the one shape the entry-136 gates could not see.
+  // A family that reaches export with zero stations is broken upstream.
+  if (prof && prof.H && !prof.H.length)
+    throw new Error("BEM export aborted: empty profile (zero stations) -- check the parameters (this family may need different settings)");
+  if (prof && prof.H) for (var gG = 0; gG < prof.H.length; gG++) {
+    var gH = prof.H[gG], gV = prof.V[gG];
+    var gz = gH.z !== undefined ? gH.z : gH[0], gr = gH.r !== undefined ? gH.r : gH[1];
+    var gvr = gV ? (gV.r !== undefined ? gV.r : gV[1]) : 0;
+    if (!isFinite(gz) || !isFinite(gr) || !isFinite(gvr))
+      throw new Error("BEM export aborted: non-finite profile geometry at station " + gG + " -- check the parameters (this family may need different settings)");
+  }
+  var gradedW = null;   // entry 132: graded wall assembly (budgeted prof path)
+  if (symQ && ringsOv) throw new Error("symmetry quarter: rings-path families (WN/biradial) are not eligible");
+  if (symQ && opts.finMeshes && opts.finMeshes.length) throw new Error("symmetry quarter: fins are not eligible");
+  if (symQ && segs % 4) throw new Error("symmetry quarter needs segs % 4 === 0");
+  var inner, M;
+  if (ringsOv) {
+    // buildAraiFanRings returns {rings, M} with segs implied by the caller; buildWNRings
+    // includes segs. Fall back to opts.segs (0 elements were built when this was missing).
+    var M0 = ringsOv.M, sg0 = ringsOv.segs || segs, keep = [];
+    var gMouthPer = 0;   // entry 141: measured mouth-ring perimeter (any section shape)
+    for (var gmp = 0; gmp < sg0; gmp++) {
+      var gA9 = ((M0 - 1) * sg0 + gmp) * 3, gB9 = ((M0 - 1) * sg0 + ((gmp + 1) % sg0)) * 3;
+      gMouthPer += Math.hypot(ringsOv.rings[gB9] - ringsOv.rings[gA9], ringsOv.rings[gB9 + 1] - ringsOv.rings[gA9 + 1], ringsOv.rings[gB9 + 2] - ringsOv.rings[gA9 + 2]);
+    }
+    nSta = Math.min(nSta, M0);   // entry 77: stations > source rings duplicate keep[] -> degenerate quads
+    // entry 77: ADAPTIVE subsampling. Uniform-index keep[] let kept-pair 3-D gaps
+    // blow out where rings bunch/whip (WN curved mouths hit ~15 mm regardless of
+    // density, capping fMax ~3.9 kHz at 30k elements). Equalize instead over the
+    // cumulative max inter-ring gap so the station budget lands where rings move.
+    var gCum = [0];
+    for (var g1 = 0; g1 < M0 - 1; g1++) {
+      var gMx = 0;
+      for (var g2 = 0; g2 < sg0; g2++) {
+        var gA = (g1 * sg0 + g2) * 3, gB = ((g1 + 1) * sg0 + g2) * 3;
+        gMx = Math.max(gMx, Math.hypot(ringsOv.rings[gA] - ringsOv.rings[gB],
+          ringsOv.rings[gA + 1] - ringsOv.rings[gB + 1], ringsOv.rings[gA + 2] - ringsOv.rings[gB + 2]));
+      }
+      // entry 77: outer-aware metric -- the +thick shell amplifies steps where the
+      // wall TURNS (mouth lip wrap), so charge thick * max turn angle per pair too.
+      var gTurn = 0;
+      if (g1 < M0 - 2) {
+        for (var g3 = 0; g3 < sg0; g3++) {
+          var hA = (g1 * sg0 + g3) * 3, hB = ((g1 + 1) * sg0 + g3) * 3, hC = ((g1 + 2) * sg0 + g3) * 3;
+          var u1 = ringsOv.rings[hB] - ringsOv.rings[hA], u2 = ringsOv.rings[hB + 1] - ringsOv.rings[hA + 1], u3 = ringsOv.rings[hB + 2] - ringsOv.rings[hA + 2];
+          var v1 = ringsOv.rings[hC] - ringsOv.rings[hB], v2 = ringsOv.rings[hC + 1] - ringsOv.rings[hB + 1], v3 = ringsOv.rings[hC + 2] - ringsOv.rings[hB + 2];
+          var dn = (Math.hypot(u1, u2, u3) * Math.hypot(v1, v2, v3)) || 1e-12;
+          var cs = Math.max(-1, Math.min(1, (u1 * v1 + u2 * v2 + u3 * v3) / dn));
+          gTurn = Math.max(gTurn, Math.acos(cs));
+        }
+      }
+      var gRm = 0;   // entry 127: mean ring radius -> local element width
+      for (var g4 = 0; g4 < sg0; g4++) { var gk4 = (g1 * sg0 + g4) * 3; gRm += Math.hypot(ringsOv.rings[gk4 + 1], ringsOv.rings[gk4 + 2]); }
+      // entry 141: with GRADED counts the local width is ~constant (mouth
+      // perimeter / segs) -- uniform-arc stations, same as the prof path.
+      var gW = opts.budget ? Math.max(0.5, gMouthPer / sg0) : 1;
+      gCum.push(gCum[g1] + (gMx + thick * gTurn) / gW);
+    }
+    if (opts.budget) nSta = Math.max(12, Math.min(nSta, Math.round(gCum[M0 - 1]) + 1));   // entry 127: budgeted path only
+    keep = [];
+    // entry 147: the same sagitta bound for rings families -- station centroids
+    // (mean z, mean radius) give the meridian curvature; spacing capped at
+    // sqrt(8 R tol), tol = gW/12, so wraps and rolls keep geometric fidelity.
+    if (opts.budget) {
+      var gCtr = [];
+      for (var gc = 0; gc < M0; gc++) {
+        var gz9 = 0, gr9 = 0;
+        for (var gj = 0; gj < sg0; gj++) { var gk9 = (gc * sg0 + gj) * 3; gz9 += ringsOv.rings[gk9]; gr9 += Math.hypot(ringsOv.rings[gk9 + 1], ringsOv.rings[gk9 + 2]); }
+        gCtr.push({ z: gz9 / sg0, r: gr9 / sg0 });
+      }
+      var gW9 = Math.max(0.5, gMouthPer / sg0), gCum2 = [0];
+      for (var gg = 1; gg < M0; gg++) {
+        var gGap9 = Math.hypot(gCtr[gg].z - gCtr[gg - 1].z, gCtr[gg].r - gCtr[gg - 1].r);
+        var wLoc = gW9;
+        if (gg > 0 && gg < M0 - 1) {
+          var pA = gCtr[gg - 1], pB = gCtr[gg], pC = gCtr[gg + 1];
+          var dd2 = 2 * ((pB.z - pA.z) * (pC.r - pA.r) - (pB.r - pA.r) * (pC.z - pA.z));
+          if (Math.abs(dd2) > 1e-12) {
+            var u9 = pB.z * pB.z + pB.r * pB.r - pA.z * pA.z - pA.r * pA.r;
+            var v9 = pC.z * pC.z + pC.r * pC.r - pA.z * pA.z - pA.r * pA.r;
+            var cx9 = ((pC.r - pA.r) * u9 - (pB.r - pA.r) * v9) / dd2, cy9 = ((pB.z - pA.z) * v9 - (pC.z - pA.z) * u9) / dd2;
+            wLoc = Math.min(gW9, Math.sqrt(8 * Math.hypot(pB.z - cx9, pB.r - cy9) * (gW9 / 12)));
+          }
+        }
+        gCum2.push(gCum2[gg - 1] + gGap9 / wLoc);
+      }
+      gCum = gCum2;
+    }
+    var gTot = gCum[M0 - 1] || 1, gPtr = 0;
+    for (var q = 0; q < nSta; q++) {
+      var gT = gTot * q / (nSta - 1);
+      while (gPtr < M0 - 1 && gCum[gPtr + 1] <= gT) gPtr++;
+      var gPick = (gPtr < M0 - 1 && gT - gCum[gPtr] > gCum[gPtr + 1] - gT) ? gPtr + 1 : gPtr;
+      keep.push(Math.max(keep.length ? keep[keep.length - 1] + 1 : 0, Math.min(gPick, M0 - nSta + q)));
+    }
+    keep[nSta - 1] = M0 - 1;
+    segs = sg0; M = nSta;
+    // entry 141: rings families join the graded pipeline. The family supplies
+    // opts.ringsBuilder(n) (full-station ring grid at any azimuthal count %4);
+    // kept stations are subsampled so stations stay consistent across counts.
+    if (opts.budget && opts.ringsBuilder) {
+      var keepR = keep.slice();
+      gradedW = bemGradedWallAssembly(function (nQ) {
+        var fullQ = opts.ringsBuilder(nQ);
+        var outQ = new Float32Array(keepR.length * nQ * 3);
+        for (var kq = 0; kq < keepR.length; kq++)
+          for (var jq = 0; jq < nQ * 3; jq++) outQ[kq * nQ * 3 + jq] = fullQ.rings[keepR[kq] * nQ * 3 + jq];
+        return outQ;
+      }, keepR.length, sg0, thick, symQ, { srcCap: !!opts.srcCap, baffle: false });
+    }
+    inner = new Float32Array(M * segs * 3);
+    for (var a1 = 0; a1 < M; a1++) inner.set(ringsOv.rings.subarray(keep[a1] * sg0 * 3, (keep[a1] + 1) * sg0 * 3), a1 * segs * 3);
+  } else {
+    var Mh = prof.H.length, keep2 = [];
+    nSta = Math.min(nSta, Mh);   // entry 77: same duplicate-station guard as the rings path
+    // entry 77: adaptive keep, profile-arc metric (analytic branch has no rings yet).
+    // Wall points arrive as {z, r} objects (computeFamily) or [z, r] arrays -- read both.
+    function pz(p) { return p.z !== undefined ? p.z : p[0]; }
+    function pr(p) { return p.r !== undefined ? p.r : p[1]; }
+    var hCum = [0];
+    for (var h1 = 0; h1 < Mh - 1; h1++) {
+      var hGap = Math.hypot(pz(prof.H[h1 + 1]) - pz(prof.H[h1]), pr(prof.H[h1 + 1]) - pr(prof.H[h1]),
+        pr(prof.V[h1 + 1]) - pr(prof.V[h1]));
+      // entry 127 (user: "triangles on the throat and behind it are quite narrow
+      // slivers... BEM works better for equilateral"): divide the metric by the
+      // LOCAL element width (perimeter/segs) -- uniform slicing then equalizes
+      // ASPECT RATIO, packing stations where the horn is narrow.
+      // entry 132: with GRADED wall counts the local element width is ~constant
+      // (per(z)/n(z) ~ per_mouth/segs), so the station metric uses THAT width --
+      // uniform-arc spacing at the effective element size, not throat-packing.
+      var hW = opts.budget ? Math.max(0.5, Math.PI * (pr(prof.H[Mh - 1]) + pr(prof.V[Mh - 1])) / segs) : 1;
+      // entry 147 (fusiontomsh study: curvature-based sizing): axial spacing is
+      // ALSO bounded by a chord-deviation (sagitta) limit s <= sqrt(8 R tol),
+      // tol = eEff/12, so the mouth roll and other tight curvature get the
+      // stations that geometric fidelity requires -- straight walls unaffected.
+      if (opts.budget && h1 > 0 && h1 < Mh - 1) {
+        var cA = prof.H[h1 - 1], cB = prof.H[h1], cC = prof.H[h1 + 1];
+        var az = pz(cA), ar = pr(cA), bz = pz(cB), br = pr(cB), cz = pz(cC), crr = pr(cC);
+        var d2 = 2 * ((bz - az) * (crr - ar) - (br - ar) * (cz - az));
+        if (Math.abs(d2) > 1e-12) {
+          var uu = bz * bz + br * br - az * az - ar * ar, vv = cz * cz + crr * crr - az * az - ar * ar;
+          var ccx = ((crr - ar) * uu - (br - ar) * vv) / d2, ccy = ((bz - az) * vv - (cz - az) * uu) / d2;
+          var Rcur = Math.hypot(bz - ccx, br - ccy);
+          var sMax = Math.sqrt(8 * Rcur * (hW / 12));   // sagitta bound: dev <= eEff/12
+          hCum.push(hCum[h1] + hGap / Math.min(hW, sMax));
+        } else hCum.push(hCum[h1] + hGap / hW);
+      } else hCum.push(hCum[h1] + hGap / hW);
+    }
+    // entry 127: the metric total IS the near-square station count (each unit =
+    // one element-width of axial travel); opts.stations becomes the CAP. When a
+    // BUDGET binds, segs and stations are BALANCED (shrink segs, recompute the
+    // metric) so elements stay near-SQUARE at whatever size the budget affords
+    // (uniform coarse beats fine-but-sliver for BEM conditioning).
+    var hTot0 = hCum[Mh - 1];
+    if (opts.budget && 4 * segs * Math.min(Math.round(hTot0) + 1, 400) > opts.budget) {
+      for (var bal = 0; bal < 3; bal++) {
+        var need = Math.round(hCum[Mh - 1]) + 1;
+        var est9 = 4 * segs * Math.max(12, Math.min(need, 400));
+        if (est9 <= opts.budget * 1.1) break;
+        var sc9 = Math.sqrt(opts.budget / est9);
+        segs = Math.max(24, 4 * Math.round(segs * sc9 / 4));
+        hCum = [0];
+        for (var hb = 0; hb < Mh - 1; hb++) {
+          var gB9 = Math.hypot(pz(prof.H[hb + 1]) - pz(prof.H[hb]), pr(prof.H[hb + 1]) - pr(prof.H[hb]), pr(prof.V[hb + 1]) - pr(prof.V[hb]));
+          var wB9 = Math.max(0.5, Math.PI * (pr(prof.H[Mh - 1]) + pr(prof.V[Mh - 1])) / segs);   // entry 132: graded width
+          hCum.push(hCum[hb] + gB9 / wB9);
+        }
+      }
+    }
+    if (opts.budget) nSta = Math.max(12, Math.min(nSta, Math.round(hCum[Mh - 1]) + 1));   // entry 127: metric-derived count on the BUDGETED path only (explicit callers keep exact counts)
+    keep2 = [];
+    var hTot = hCum[Mh - 1], hPtr = 0;
+    if (!isFinite(hTot) || hTot <= 0) {      // guard: garbage metric -> uniform (regression 21 lesson)
+      for (var qU = 0; qU < nSta; qU++) keep2.push(Math.round(qU * (Mh - 1) / (nSta - 1)));
+    } else {
+      for (var q2 = 0; q2 < nSta; q2++) {
+        var hT = hTot * q2 / (nSta - 1);
+        while (hPtr < Mh - 1 && hCum[hPtr + 1] <= hT) hPtr++;
+        var hPick = (hPtr < Mh - 1 && hT - hCum[hPtr] > hCum[hPtr + 1] - hT) ? hPtr + 1 : hPtr;
+        keep2.push(Math.max(keep2.length ? keep2[keep2.length - 1] + 1 : 0, Math.min(hPick, Mh - nSta + q2)));
+      }
+      keep2[nSta - 1] = Mh - 1;
+    }
+    var H2 = [], V2 = [], rA2 = prof.rhoArr ? [] : null, sA2 = prof.seNArr ? [] : null;
+    for (var q3 = 0; q3 < nSta; q3++) {
+      H2.push(prof.H[keep2[q3]]); V2.push(prof.V[keep2[q3]]);
+      if (rA2) rA2.push(prof.rhoArr[Math.min(keep2[q3], prof.rhoArr.length - 1)]);
+      if (sA2) sA2.push(prof.seNArr[Math.min(keep2[q3], prof.seNArr.length - 1)]);
+    }
+    var p2 = { H: H2, V: V2, shape: prof.shape, rho: prof.rho, rhoArr: rA2, seNArr: sA2 };
+    inner = buildRings(p2, segs); M = nSta;
+    if (opts.budget) gradedW = bemGradedWallAssembly(function (nQ) { return buildRings(p2, nQ); }, M, segs, thick, symQ, { srcCap: !!opts.srcCap, baffle: !!opts.baffle });   // entries 132/134/141: the prof path implements the ringsKept contract via buildRings
+  }
+  var nodes, tris, NV, nSrc;   // hoisted: set by the graded or the legacy assembly
+  if (gradedW) { nodes = gradedW.nodes; tris = gradedW.tris; NV = gradedW.NV; nSrc = gradedW.nSrc; }
+  else {
+  // entry 78: PTS = points per ring, QDS = quads per ring band. Closed ring: equal.
+  // Quarter model: the validated full loft is built, then the 0..90deg arc is
+  // EXTRACTED (t = j/segs in [0, 1/4], endpoints ON the symmetry planes) -- the
+  // section machinery stays untouched and byte-identical for full builds.
+  var PTS = segs, QDS = segs;
+  if (symQ) {
+    PTS = segs / 4 + 1; QDS = segs / 4;
+    var innQ = new Float32Array(M * PTS * 3);
+    for (var sqI = 0; sqI < M; sqI++)
+      for (var sqJ = 0; sqJ < PTS; sqJ++) {
+        var sqS = (sqI * segs + sqJ) * 3, sqD = (sqI * PTS + sqJ) * 3;
+        innQ[sqD] = inner[sqS]; innQ[sqD + 1] = inner[sqS + 1]; innQ[sqD + 2] = inner[sqS + 2];
+      }
+    inner = innQ;
+  }
+  // outer shell: vertex-normal offset (entry 132: extracted to bemOuterOffset,
+  // shared verbatim with the graded assembly -- single source of truth)
+  var outer = bemOuterOffset(inner, M, PTS, thick, symQ);
+  var __oldOuterBlock = false; if (__oldOuterBlock) {
+  // REGRESSION 22 (entry 78, latent since entry 77): the offset-normal SIGN test used
+  // only the radial component (n . (x,y) > 0). At a mouth-roll APEX the wall tangent
+  // turns radial, the true outward normal is nearly pure +/-z, and the radial
+  // projection is numerical noise -- adjacent stations offset in OPPOSITE z (+6/-6 mm),
+  // a 13.1 mm shell zigzag that capped the 400 Hz default at ~4.3 kHz no matter how
+  // many stations were spent (present in entry-77 FULL meshes too; exposed by chasing
+  // 10 kHz on full-roll horns). Fix: chain the sign by CONTINUITY along each station
+  // column (dot with the previous station's accepted normal), anchored at station 0
+  // where the radial test is unambiguous (throat region).
+  var prevN = new Float32Array(PTS * 3);
+  for (var i = 0; i < M; i++)
+    for (var j = 0; j < PTS; j++) {
+      var k0 = (i * PTS + j) * 3;
+      var ip = Math.max(0, i - 1) * PTS + j, iq = Math.min(M - 1, i + 1) * PTS + j;
+      // ring-direction neighbors: wrap on a closed ring; at a quarter-arc cut use the
+      // MIRRORED neighbor across the symmetry plane, so the offset normal stays exactly
+      // in-plane there (a one-sided tangent tilts it and the mirrored shell seam-gaps).
+      var jpz, jpx, jpy, jqz, jqx, jqy;
+      if (symQ && j === 0) {
+        var mq0 = (i * PTS + 1) * 3;
+        jpz = inner[mq0]; jpx = inner[mq0 + 1]; jpy = -inner[mq0 + 2];
+        jqz = inner[mq0]; jqx = inner[mq0 + 1]; jqy = inner[mq0 + 2];
+      } else if (symQ && j === PTS - 1) {
+        var mq1 = (i * PTS + PTS - 2) * 3;
+        jpz = inner[mq1]; jpx = inner[mq1 + 1]; jpy = inner[mq1 + 2];
+        jqz = inner[mq1]; jqx = -inner[mq1 + 1]; jqy = inner[mq1 + 2];
+      } else {
+        var jp = i * PTS + ((j - 1 + PTS) % PTS), jq = i * PTS + ((j + 1) % PTS);
+        jpz = inner[jp * 3]; jpx = inner[jp * 3 + 1]; jpy = inner[jp * 3 + 2];
+        jqz = inner[jq * 3]; jqx = inner[jq * 3 + 1]; jqy = inner[jq * 3 + 2];
+      }
+      var tix = inner[iq * 3] - inner[ip * 3], tiy = inner[iq * 3 + 1] - inner[ip * 3 + 1], tiz = inner[iq * 3 + 2] - inner[ip * 3 + 2];
+      var tjx = jqz - jpz, tjy = jqx - jpx, tjz = jqy - jpy;
+      var nx = tjy * tiz - tjz * tiy, ny = tjz * tix - tjx * tiz, nz = tjx * tiy - tjy * tix;
+      var nl = Math.hypot(nx, ny, nz) || 1e-12;
+      if (i === 0) {   // anchor: throat region, radial test unambiguous
+        if (ny * inner[k0 + 1] + nz * inner[k0 + 2] < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      } else {         // continuity: outward normals rotate, never jump ~180deg
+        if (nx * prevN[j * 3] + ny * prevN[j * 3 + 1] + nz * prevN[j * 3 + 2] < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      }
+      prevN[j * 3] = nx / nl; prevN[j * 3 + 1] = ny / nl; prevN[j * 3 + 2] = nz / nl;
+      outer[k0] = inner[k0] + thick * nx / nl;
+      outer[k0 + 1] = inner[k0 + 1] + thick * ny / nl;
+      outer[k0 + 2] = inner[k0 + 2] + thick * nz / nl;
+    }
+  }
+  // REFINED END CAPS (entry 77): the single-fan source/back discs carry irreducible
+  // center-to-rim spokes (~throat radius) that CAP the whole mesh's lambda/6 fMax at
+  // ~1.8 kHz regardless of wall density -- invisible until the 10 kHz band asked for
+  // 5.7 mm edges. When opts.targetEdge (mm) is set, discs gain concentric rings so no
+  // spoke exceeds it, and the flange annulus splits when thick > targetEdge. Absent
+  // (legacy), nR = 1 everywhere and the mesh is IDENTICAL to the shipped two-band form.
+  // entry 128 (user, with an Ath reference mesh: "triangles are evenly
+  // distributed in a pizza-slice radial arrangement, and some near the middle
+  // have extremely sharp points... numerical inconsistencies in the top
+  // frequencies"): GRADED DISCS -- ring segment counts track the local
+  // circumference (n_t ~ 2*pi*r_t/eT, %4 for the quarter cut, floor 8),
+  // stitched ring-to-ring by the monotone zipper walk (cannot cross), tiny
+  // 8-slice fan only at the very hub. Gated on opts.budget like entry 127.
+  function gradedPlan(rimR, PTS9, eT9) {
+    var nR9 = Math.min(32, Math.max(1, Math.ceil(rimR / Math.max(eT9, 0.5))));
+    var counts = [], t9;
+    for (t9 = 1; t9 <= nR9; t9++) {
+      var r9 = rimR * t9 / nR9;
+      var n9 = Math.max(8, 4 * Math.round(2 * Math.PI * r9 / Math.max(eT9, 0.5) / 4));
+      counts.push(Math.min(PTS9, n9));
+    }
+    counts[nR9 - 1] = PTS9;   // the rim ring IS the wall ring
+    for (t9 = nR9 - 2; t9 >= 0; t9--) counts[t9] = Math.min(counts[t9], counts[t9 + 1]);   // monotone outward
+    return counts;
+  }
+  var eT = opts.targetEdge || 0;
+  var sx = 0, sy = 0, sz = 0, bx = 0, by = 0, bz = 0;
+  // averaged over QDS points (j = 0..QDS-1). Closed ring: all points, legacy-identical.
+  // Quarter arc: exactly one quadrant's sample of the full ring, so by two-plane
+  // symmetry the mean z EQUALS the full-ring mean and the centers land on the axis.
+  for (var j2 = 0; j2 < QDS; j2++) {
+    // entry 91: SOURCE ANCHORS RING 0 (was ring 1 -- a coherent off-by-one: cap,
+    // rim, lerp targets and the wall loop all started one station in, so every
+    // BEM mesh dropped its first band and the piston sat at station-1 z/radius;
+    // ~1-3 mm at validated densities, FATAL for the ribbon throat at defaults).
+    sz += inner[j2 * 3] / QDS; sx += inner[j2 * 3 + 1] / QDS; sy += inner[j2 * 3 + 2] / QDS;
+    bz += outer[j2 * 3] / QDS; bx += outer[j2 * 3 + 1] / QDS; by += outer[j2 * 3 + 2] / QDS;
+  }
+  if (symQ) { sx = 0; sy = 0; bx = 0; by = 0; }   // exact axis (means over an arc are off-axis)
+  var srcRimR = 0, backRimR = 0;
+  for (var j3 = 0; j3 < PTS; j3++) {
+    srcRimR = Math.max(srcRimR, Math.hypot(inner[j3 * 3] - sz, inner[j3 * 3 + 1] - sx, inner[j3 * 3 + 2] - sy));
+    backRimR = Math.max(backRimR, Math.hypot(outer[j3 * 3] - bz, outer[j3 * 3 + 1] - bx, outer[j3 * 3 + 2] - by));
+  }
+  function nRfor(r) { return eT > 0 ? Math.min(32, Math.max(1, Math.ceil(r / eT))) : 1; }
+  var graded = !!opts.budget;
+  var planS = graded ? gradedPlan(srcRimR, PTS, eT || srcRimR) : null;
+  var planB = graded ? gradedPlan(backRimR, PTS, eT || backRimR) : null;
+  var nRs = graded ? planS.length : nRfor(srcRimR), nRb = graded ? planB.length : nRfor(backRimR), nF = (eT > 0 && thick > eT) ? Math.min(8, Math.ceil(thick / eT)) : 1;
+  function planSum(pl) { var s9 = 0; for (var q9 = 0; q9 < pl.length - 1; q9++) s9 += pl[q9]; return s9; }   // interior rings only (the rim ring is the wall's)
+  // nodes: [inner M*PTS][outer M*PTS][cSrc][cBack][srcRings][backRings][flangeRings]
+  var NV = 2 * M * PTS + 2 + (graded ? planSum(planS) : (nRs - 1) * PTS) + (graded ? planSum(planB) : (nRb - 1) * PTS) + (nF - 1) * PTS;
+  var nodes = new Float64Array(NV * 3);
+  nodes.set(inner, 0); nodes.set(outer, M * PTS * 3);
+  var cSrc = 2 * M * PTS, cBack = cSrc + 1;
+  nodes[cSrc * 3] = sz; nodes[cSrc * 3 + 1] = sx; nodes[cSrc * 3 + 2] = sy;
+  nodes[cBack * 3] = bz; nodes[cBack * 3 + 1] = bx; nodes[cBack * 3 + 2] = by;
+  function IN(i, j) { return i * PTS + (j % PTS); }
+  function OUT(i, j) { return M * PTS + i * PTS + (j % PTS); }
+  var srcBase = cBack + 1, backBase = srcBase + (graded ? planSum(planS) : (nRs - 1) * PTS), flBase = backBase + (graded ? planSum(planB) : (nRb - 1) * PTS);
+  // graded ring offsets (ring t = 1..nR-1 interior; rim = wall ring)
+  var offS = [0], offB = [0];
+  if (graded) { for (var q8 = 0; q8 < planS.length - 1; q8++) offS.push(offS[q8] + planS[q8]); for (q8 = 0; q8 < planB.length - 1; q8++) offB.push(offB[q8] + planB[q8]); }
+  function lerpNode(dst, ci, ri, fr) {  // center index, rim index, fraction center->rim
+    nodes[dst * 3] = nodes[ci * 3] + (nodes[ri * 3] - nodes[ci * 3]) * fr;
+    nodes[dst * 3 + 1] = nodes[ci * 3 + 1] + (nodes[ri * 3 + 1] - nodes[ci * 3 + 1]) * fr;
+    nodes[dst * 3 + 2] = nodes[ci * 3 + 2] + (nodes[ri * 3 + 2] - nodes[ci * 3 + 2]) * fr;
+  }
+  var tI, jI;
+  function gradedRing(base9, off9, plan9, tG, cI9, rimFn9) {
+    // ring tG (1..nR-1): n9 nodes at uniform PARAMETER around the rim shape,
+    // scaled tG/nR toward the center -- rim positions sampled by fractional
+    // index (linear along the rim polygon) so elliptical rims grade cleanly.
+    var n9 = plan9[tG - 1], fr9 = tG / plan9.length;
+    for (var j9 = 0; j9 < n9; j9++) {
+      var u9 = j9 * PTS / n9, i0 = Math.floor(u9) % PTS, i1 = (i0 + 1) % PTS, ff = u9 - Math.floor(u9);
+      var r0 = rimFn9(i0) * 3, r1 = rimFn9(i1) * 3, dst = (base9 + off9[tG - 1] + j9) * 3;
+      var rx = nodes[r0] + (nodes[r1] - nodes[r0]) * ff, ry = nodes[r0 + 1] + (nodes[r1 + 1] - nodes[r0 + 1]) * ff, rz = nodes[r0 + 2] + (nodes[r1 + 2] - nodes[r0 + 2]) * ff;
+      nodes[dst] = nodes[cI9 * 3] + (rx - nodes[cI9 * 3]) * fr9;
+      nodes[dst + 1] = nodes[cI9 * 3 + 1] + (ry - nodes[cI9 * 3 + 1]) * fr9;
+      nodes[dst + 2] = nodes[cI9 * 3 + 2] + (rz - nodes[cI9 * 3 + 2]) * fr9;
+    }
+  }
+  if (graded) {
+    for (tI = 1; tI < nRs; tI++) gradedRing(srcBase, offS, planS, tI, cSrc, function (j9) { return IN(0, j9); });
+    for (tI = 1; tI < nRb; tI++) gradedRing(backBase, offB, planB, tI, cBack, function (j9) { return OUT(0, j9); });
+  } else {
+    for (tI = 1; tI < nRs; tI++) for (jI = 0; jI < PTS; jI++) lerpNode(srcBase + (tI - 1) * PTS + jI, cSrc, IN(0, jI), tI / nRs);
+    for (tI = 1; tI < nRb; tI++) for (jI = 0; jI < PTS; jI++) lerpNode(backBase + (tI - 1) * PTS + jI, cBack, OUT(0, jI), tI / nRb);
+  }
+  for (tI = 1; tI < nF; tI++) for (jI = 0; jI < PTS; jI++) lerpNode(flBase + (tI - 1) * PTS + jI, IN(M - 1, jI), OUT(M - 1, jI), tI / nF);
+  function SR(t, j) { return t >= nRs ? IN(0, j) : (t === 0 ? cSrc : srcBase + (t - 1) * PTS + (j % PTS)); }
+  function BR(t, j) { return t >= nRb ? OUT(0, j) : (t === 0 ? cBack : backBase + (t - 1) * PTS + (j % PTS)); }
+  function FL(t, j) { return t === 0 ? IN(M - 1, j) : (t >= nF ? OUT(M - 1, j) : flBase + (t - 1) * PTS + (j % PTS)); }
+  var tris = [];
+  var nSrc;
+  function gradedDiscTris(base9, off9, plan9, cI9, rimFn9, flip9) {
+    // hub fan + zippered ring-to-ring transitions; in symQ only the first
+    // quadrant's arc of each ring is stitched (all counts %4, phase 0 --
+    // nodes sit exactly on both cut planes).
+    var count0 = tris.length;
+    function ringIdx(tG, j9) {
+      if (tG >= plan9.length) return rimFn9(j9 % PTS);
+      return base9 + off9[tG - 1] + (j9 % plan9[tG - 1]);
+    }
+    function ringN(tG) { return tG >= plan9.length ? PTS : plan9[tG - 1]; }
+    function emit(a9, b9, c9) { if (flip9) tris.push([a9, c9, b9]); else tris.push([a9, b9, c9]); }
+    var n1 = ringN(1), lim1 = symQ ? n1 / 4 : n1;
+    for (var jH = 0; jH < lim1; jH++) emit(cI9, ringIdx(1, jH), ringIdx(1, (jH + 1)));
+    for (var tG = 1; tG < plan9.length; tG++) {
+      var nI = ringN(tG), nO = ringN(tG + 1);
+      var limI = symQ ? nI / 4 : nI, limO = symQ ? nO / 4 : nO;
+      // zipper on integer PARAMETER u = j*PTS/n (monotone, shared endpoints in symQ)
+      var iI9 = 0, iO9 = 0;
+      while (iI9 < limI || iO9 < limO) {
+        var uIn = (iI9 + 1) * PTS / nI, uOn = (iO9 + 1) * PTS / nO;
+        var advO = (iI9 >= limI) || (iO9 < limO && uOn <= uIn + 1e-9);
+        if (advO) { emit(ringIdx(tG + 1, iO9), ringIdx(tG + 1, iO9 + 1), ringIdx(tG, Math.min(iI9, limI - (symQ ? 0 : 0)))); iO9++; }
+        else { emit(ringIdx(tG, iI9), ringIdx(tG + 1, Math.min(iO9, limO)), ringIdx(tG, iI9 + 1)); iI9++; }
+      }
+    }
+    return tris.length - count0;
+  }
+  if (graded) {
+    nSrc = gradedDiscTris(srcBase, offS, planS, cSrc, function (j9) { return IN(0, j9); }, false);
+  } else {
+    for (var jS = 0; jS < QDS; jS++) tris.push([cSrc, SR(1, jS), SR(1, jS + 1)]);
+    for (var tS = 1; tS < nRs; tS++)
+      for (var jS2 = 0; jS2 < QDS; jS2++) {
+        tris.push([SR(tS, jS2), SR(tS + 1, jS2), SR(tS + 1, jS2 + 1)]);
+        tris.push([SR(tS, jS2), SR(tS + 1, jS2 + 1), SR(tS, jS2 + 1)]);
+      }
+    nSrc = QDS * (2 * nRs - 1);
+  }
+  // 2) channel wall 0..M-1 (entry 91: was 1..M-1, the off-by-one's other half)
+  for (var iC = 0; iC < M - 1; iC++)
+    for (var jC = 0; jC < QDS; jC++) {
+      tris.push([IN(iC, jC), IN(iC + 1, jC), IN(iC + 1, jC + 1)]);
+      tris.push([IN(iC, jC), IN(iC + 1, jC + 1), IN(iC, jC + 1)]);
+    }
+  // 3) mouth flange (nF radial bands; nF = 1 is the legacy single band)
+  for (var tM = 0; tM < nF; tM++)
+    for (var jM = 0; jM < QDS; jM++) {
+      tris.push([FL(tM, jM), FL(tM + 1, jM), FL(tM + 1, jM + 1)]);
+      tris.push([FL(tM, jM), FL(tM + 1, jM + 1), FL(tM, jM + 1)]);
+    }
+  // 4) outer shell 0..M-1 (reversed)
+  for (var iO = 0; iO < M - 1; iO++)
+    for (var jO = 0; jO < QDS; jO++) {
+      tris.push([OUT(iO, jO), OUT(iO + 1, jO + 1), OUT(iO + 1, jO)]);
+      tris.push([OUT(iO, jO), OUT(iO, jO + 1), OUT(iO + 1, jO + 1)]);
+    }
+  // 5) back disc on outer ring 0 (entry 128: graded on the budget path)
+  if (graded) {
+    gradedDiscTris(backBase, offB, planB, cBack, function (j9) { return OUT(0, j9); }, true);
+  } else {
+    for (var jB = 0; jB < QDS; jB++) tris.push([cBack, BR(1, jB + 1), BR(1, jB)]);
+    for (var tB = 1; tB < nRb; tB++)
+      for (var jB2 = 0; jB2 < QDS; jB2++) {
+        tris.push([BR(tB, jB2), BR(tB + 1, jB2 + 1), BR(tB + 1, jB2)]);
+        tris.push([BR(tB, jB2), BR(tB, jB2 + 1), BR(tB + 1, jB2 + 1)]);
+      }
+  }
+  }
+  // entry 150 (bLab user: quarter mesh "not accepted accusing some NaN"):
+  // DEGENERATE GATE. Zero-area or duplicate-index triangles carry finite
+  // coordinates (the NaN gates pass) but become NaN the moment any solver
+  // normalizes their normals. Proven reachable from garbage-but-finite
+  // inputs -- so: throw, never save.
+  {
+    var dgn = 0;
+    for (var dg = 0; dg < tris.length; dg++) {
+      var tA = tris[dg][0], tB = tris[dg][1], tC = tris[dg][2];
+      if (tA === tB || tB === tC || tA === tC) { dgn++; continue; }
+      var ax9 = nodes[tA * 3], ay9 = nodes[tA * 3 + 1], az9 = nodes[tA * 3 + 2];
+      var ux9 = nodes[tB * 3] - ax9, uy9 = nodes[tB * 3 + 1] - ay9, uz9 = nodes[tB * 3 + 2] - az9;
+      var vx9 = nodes[tC * 3] - ax9, vy9 = nodes[tC * 3 + 1] - ay9, vz9 = nodes[tC * 3 + 2] - az9;
+      if (Math.hypot(uy9 * vz9 - uz9 * vy9, uz9 * vx9 - ux9 * vz9, ux9 * vy9 - uy9 * vx9) < 1e-10) dgn++;
+    }
+    if (dgn > 0)
+      throw new Error("BEM export aborted: " + dgn + " degenerate (zero-area) elements -- check the parameters (these become NaN in the solver)");
+  }
+  // entry 129: mesh QUALITY REPORT (aspect stats) -- computed here so every
+  // export can state its own element quality alongside the lambda/6 honesty.
+  var qUnder2 = 0, qOver8 = 0, qWorst = 0, qf, totE = 0, nE = 0;
+  for (qf = 0; qf < tris.length; qf++) {
+    var qA = tris[qf][0] * 3, qB = tris[qf][1] * 3, qC = tris[qf][2] * 3;
+    var qe1 = Math.hypot(nodes[qB] - nodes[qA], nodes[qB + 1] - nodes[qA + 1], nodes[qB + 2] - nodes[qA + 2]);
+    var qe2 = Math.hypot(nodes[qC] - nodes[qB], nodes[qC + 1] - nodes[qB + 1], nodes[qC + 2] - nodes[qB + 2]);
+    var qe3 = Math.hypot(nodes[qA] - nodes[qC], nodes[qA + 1] - nodes[qC + 1], nodes[qA + 2] - nodes[qC + 2]);
+    var qar = Math.max(qe1, qe2, qe3) / Math.max(1e-12, Math.min(qe1, qe2, qe3));
+    if (qar < 2) qUnder2++; if (qar > 8) qOver8++; if (qar > qWorst) qWorst = qar;
+    totE += qe1 + qe2 + qe3; nE += 3;   // entry 187: mean edge for the curl verdict
+  }
+  // global orientation: outward normals -> positive enclosed volume.
+  // entry 134: OPEN meshes (infinite-baffle) have no enclosed volume -- orient
+  // by the source disc instead: its mean normal must point INTO the horn (+z).
+  if (gradedW && gradedW.open) {
+    var snz = 0, f2;
+    for (f2 = 0; f2 < nSrc; f2++) {
+      var A2 = tris[f2][0] * 3, B2 = tris[f2][1] * 3, C2 = tris[f2][2] * 3;
+      var u1 = nodes[B2] - nodes[A2], u2 = nodes[B2 + 1] - nodes[A2 + 1], u3 = nodes[B2 + 2] - nodes[A2 + 2];
+      var v1 = nodes[C2] - nodes[A2], v2 = nodes[C2 + 1] - nodes[A2 + 1], v3 = nodes[C2 + 2] - nodes[A2 + 2];
+      snz += u2 * v3 - u3 * v2;   // axial (first-coord) component of the cross product
+    }
+    if (snz < 0) for (f2 = 0; f2 < tris.length; f2++) { var tq = tris[f2][1]; tris[f2][1] = tris[f2][2]; tris[f2][2] = tq; }
+  } else {
+  var vol = 0, f;
+  for (f = 0; f < tris.length; f++) {
+    var A = tris[f][0] * 3, B = tris[f][1] * 3, Cc = tris[f][2] * 3;
+    vol += (nodes[A] * (nodes[B + 1] * nodes[Cc + 2] - nodes[B + 2] * nodes[Cc + 1])
+          - nodes[A + 1] * (nodes[B] * nodes[Cc + 2] - nodes[B + 2] * nodes[Cc])
+          + nodes[A + 2] * (nodes[B] * nodes[Cc + 1] - nodes[B + 1] * nodes[Cc])) / 6;
+  }
+  if (vol < 0) for (f = 0; f < tris.length; f++) { var tp = tris[f][1]; tris[f][1] = tris[f][2]; tris[f][2] = tp; }
+  }
+  // FINS IN THE ACOUSTIC BOUNDARY (2026-07-14): floating closed solids appended
+  // after the horn body; per-solid outward orientation by signed volume. WN fins
+  // never touch the walls (designed clearance), so no Boolean union is needed.
+  var nHornE = tris.length, nFinE = 0;
+  if (opts.finMeshes) for (var fm = 0; fm < opts.finMeshes.length; fm++) {
+    var F9 = opts.finMeshes[fm], base9 = NV;
+    var addN = F9.pos.length / 3;
+    var ext9 = new Float64Array((NV + addN) * 3);
+    ext9.set(nodes.subarray ? nodes.subarray(0, NV * 3) : nodes, 0);
+    for (var v8 = 0; v8 < addN * 3; v8++) ext9[NV * 3 + v8] = F9.pos[v8];
+    nodes = ext9;
+    var fv9 = 0, ftr = [];
+    for (var t8 = 0; t8 < F9.idx.length; t8 += 3) ftr.push([base9 + F9.idx[t8], base9 + F9.idx[t8 + 1], base9 + F9.idx[t8 + 2]]);
+    for (var t7 = 0; t7 < ftr.length; t7++) {
+      var A8 = ftr[t7][0] * 3, B8 = ftr[t7][1] * 3, C8 = ftr[t7][2] * 3;
+      fv9 += (nodes[A8] * (nodes[B8 + 1] * nodes[C8 + 2] - nodes[B8 + 2] * nodes[C8 + 1])
+            - nodes[A8 + 1] * (nodes[B8] * nodes[C8 + 2] - nodes[B8 + 2] * nodes[C8])
+            + nodes[A8 + 2] * (nodes[B8] * nodes[C8 + 1] - nodes[B8 + 1] * nodes[C8])) / 6;
+    }
+    if (fv9 < 0) for (var t6 = 0; t6 < ftr.length; t6++) { var tq = ftr[t6][1]; ftr[t6][1] = ftr[t6][2]; ftr[t6][2] = tq; }
+    for (var t5 = 0; t5 < ftr.length; t5++) tris.push(ftr[t5]);
+    nFinE += ftr.length; NV += addN;
+  }
+  // compact: drop unreferenced nodes (inner ring 0 is intentionally unused; NumCalc
+  // rejects isolated nodes)
+  var used = new Int32Array(NV).fill(-1), nUsed = 0;
+  for (f = 0; f < tris.length; f++) for (var v9 = 0; v9 < 3; v9++) if (used[tris[f][v9]] < 0) used[tris[f][v9]] = nUsed++;
+  var nodesC = new Float64Array(nUsed * 3);
+  for (var nO = 0; nO < NV; nO++) if (used[nO] >= 0) { nodesC[used[nO] * 3] = nodes[nO * 3]; nodesC[used[nO] * 3 + 1] = nodes[nO * 3 + 1]; nodesC[used[nO] * 3 + 2] = nodes[nO * 3 + 2]; }
+  for (f = 0; f < tris.length; f++) { tris[f][0] = used[tris[f][0]]; tris[f][1] = used[tris[f][1]]; tris[f][2] = used[tris[f][2]]; }
+  nodes = nodesC; NV = nUsed;
+  // entry 78: snap cut-boundary coordinates EXACTLY onto the symmetry planes.
+  // sectionPoint residuals reach ~8e-7 mm (superellipse at t=1/4); NumCalc requires
+  // every BE node on ONE side of each plane, so a negative residual would abort the
+  // solve. 1e-4 mm threshold: 4+ orders below any real off-plane node (~mm scale).
+  if (symQ) for (var nS = 0; nS < NV; nS++) {
+    if (Math.abs(nodes[nS * 3 + 1]) < 1e-4) nodes[nS * 3 + 1] = 0;
+    if (Math.abs(nodes[nS * 3 + 2]) < 1e-4) nodes[nS * 3 + 2] = 0;
+  }
+  // texts (NumCalc coords: our (Z,X,Y) -> (x,y,z)=(X,Y,Z), METERS)
+  var nTxt = NV + "\n";
+  for (var n2 = 0; n2 < NV; n2++) nTxt += n2 + " " + (nodes[n2 * 3 + 1] / 1000).toFixed(7) + " " + (nodes[n2 * 3 + 2] / 1000).toFixed(7) + " " + (nodes[n2 * 3] / 1000).toFixed(7) + "\n";
+  var eTxt = tris.length + "\n";
+  for (f = 0; f < tris.length; f++) eTxt += f + " " + tris[f][0] + " " + tris[f][1] + " " + tris[f][2] + " 0 0 0\n";
+  // eval arcs: BOTH planes in ONE solve (evaluation points are nearly free).
+  // H arc: indices 0..36 (0 = on-axis, shared), x-z plane.
+  // V arc: indices 37..72 (36 pts, axis shared with H index 0), y-z plane.
+  var NE0 = 300000, P9 = 37, R9 = 2.0, evPts = [], ang = [];
+  evPts.push([0, 0, R9]); ang.push(0);
+  for (var pI = 0; pI < P9 - 1; pI++) {
+    var deg = -90 + 180 * pI / (P9 - 2);
+    if (Math.abs(deg) < 1e-9) deg = 2.5;
+    var ph = deg * Math.PI / 180;
+    evPts.push([R9 * Math.sin(ph), 0, R9 * Math.cos(ph)]); ang.push(deg);
+  }
+  var angV = [0];
+  for (var pV = 0; pV < P9 - 1; pV++) {
+    var degV = -90 + 180 * pV / (P9 - 2);
+    if (Math.abs(degV) < 1e-9) degV = 2.5;
+    var phV = degV * Math.PI / 180;
+    evPts.push([0, R9 * Math.sin(phV), R9 * Math.cos(phV)]); angV.push(degV);
+  }
+  var nEv = evPts.length;
+  var evN = nEv + "\n";
+  for (var pJ = 0; pJ < nEv; pJ++) evN += (NE0 + pJ) + " " + evPts[pJ][0].toFixed(6) + " " + evPts[pJ][1].toFixed(6) + " " + evPts[pJ][2].toFixed(6) + "\n";
+  var nEvE = nEv - 2, evE = nEvE + "\n";
+  for (var pK = 0; pK < nEvE; pK++) evE += (NE0 + pK) + " " + (NE0 + pK) + " " + (NE0 + pK + 1) + " " + (NE0 + pK + 2) + " 2 0 1\n";
+  // entry 78: classify each edge as ring-direction (along the local hoop) or
+  // station-direction (everything else) so band sizing can REBALANCE stations vs
+  // segments. The adaptive-keep metric charges curvature at the mouth roll; on
+  // full-roll horns that starves the plain wall of stations, and the worst edge is
+  // station-direction (measured 13.1 mm vs 4.2 mm ring at 81x348 on the 400 Hz
+  // default: fMax 4.4 kHz where a balanced split reaches ~7 kHz at the SAME count).
+  var eMax = 0, eMaxSta = 0, eMaxRing = 0;
+  for (f = 0; f < tris.length; f++)
+    for (var e9 = 0; e9 < 3; e9++) {
+      var Pa = tris[f][e9] * 3, Pb = tris[f][(e9 + 1) % 3] * 3;
+      var eL9 = Math.hypot(nodes[Pa] - nodes[Pb], nodes[Pa + 1] - nodes[Pb + 1], nodes[Pa + 2] - nodes[Pb + 2]);
+      eMax = Math.max(eMax, eL9);
+      var mx9 = (nodes[Pa + 1] + nodes[Pb + 1]) / 2, my9 = (nodes[Pa + 2] + nodes[Pb + 2]) / 2;
+      var mr9 = Math.hypot(mx9, my9) || 1e-12;
+      var hoop9 = Math.abs((nodes[Pa + 1] - nodes[Pb + 1]) * (-my9 / mr9) + (nodes[Pa + 2] - nodes[Pb + 2]) * (mx9 / mr9)) / (eL9 || 1e-12);
+      if (hoop9 > 0.6) { if (eL9 > eMaxRing) eMaxRing = eL9; }
+      else if (eL9 > eMaxSta) eMaxSta = eL9;
+    }
+  return { objNodes: nTxt, objElems: eTxt, evalNodes: evN, evalElems: evE,
+           nNodes: NV + nEv, nElems: tris.length + nEvE, nBnd: tris.length, nSrc: nSrc,
+           maxEdge: eMax, edgeSta: eMaxSta, edgeRing: eMaxRing,
+           fMax: 344000 / (6 * eMax), angles: ang, anglesV: angV, nH: P9, nHornE: nHornE, nFinE: nFinE,
+           sym: symQ ? 2 : 0,   // entry 78: 2 = quarter model, NumCalc SYMMETRY "1 1 0" at origin
+           qUnder2: qUnder2, qOver8: qOver8, qWorst: qWorst, layout: gradedW ? gradedW.layout : null,
+           // entry 187: CURL RESOLUTION VERDICT -- three calibrated points from
+           // the leak campaign: meanEdge/curlRadius 0.44 = validated (rear -23
+           // dB), 0.81 = leaked, 3.2 = leaked catastrophically and worst at LOW
+           // frequency (the thinner the fold, the lower the leak). Safe
+           // threshold 0.55 with margin. opts.curlRMin = the tightest roll
+           // radius in the geometry; 0/absent = no curl, no verdict.
+           curl: (opts && opts.curlRMin > 0.5) ? (function () {
+             var ratio7 = (totE / nE) / opts.curlRMin;
+             return { rMin: opts.curlRMin, meanEdge: totE / nE, ratio: ratio7,
+                      verdict: ratio7 <= 0.55 ? "resolved" : (ratio7 <= 0.8 ? "MARGINAL" : "UNRESOLVABLE") };
+           })() : null,
+           open: gradedW ? gradedW.open : 0, rimSpan: gradedW ? gradedW.rimSpan : 0, capDepth: gradedW ? gradedW.capDepth : 0 };
+}
+// STEP EXPORT (entry 92, forum request). Faceted BREP per the AP214 merged
+// schema: faceted_brep_shape_representation WR3 requires every shell face to be
+// a FACE_SURFACE whose geometry is a PLANE located by a CARTESIAN_POINT -- so
+// each triangle carries POLY_LOOP -> FACE_OUTER_BOUND -> PLANE(AXIS2) ->
+// FACE_SURFACE (7 entities), plus the standard product/units blocks. Faceted,
+// not NURBS: same fidelity as the STL, in a STEP container every CAD package
+// imports; honest label on the button. Millimetres via SI_UNIT(.MILLI.,.METRE.).
+function stepTag(tag) { return tag ? ",'" + String(tag).replace(/'/g, "''").replace(/[\r\n]/g, ' ') + "'" : ''; }   // entry 238: design provenance in the STEP header (STEP string: apostrophes doubled)
+function stepFromMesh(pos, idx, name, tag) {
+  var L = [], id = 0;
+  function E(s) { id++; L.push('#' + id + '=' + s + ';'); return id; }
+  var nV = pos.length / 3, vid = new Array(nV);
+  function num(x) { var s = x.toFixed(4); return s.indexOf('.') < 0 ? s + '.' : s; }
+  for (var v = 0; v < nV; v++) vid[v] = E("CARTESIAN_POINT('',(" + num(pos[v * 3]) + "," + num(pos[v * 3 + 1]) + "," + num(pos[v * 3 + 2]) + "))");
+  var faces = [];
+  for (var t = 0; t < idx.length; t += 3) {
+    var a = idx[t], b = idx[t + 1], c = idx[t + 2];
+    var ax = pos[a * 3], ay = pos[a * 3 + 1], az = pos[a * 3 + 2];
+    var ux = pos[b * 3] - ax, uy = pos[b * 3 + 1] - ay, uz = pos[b * 3 + 2] - az;
+    var wx = pos[c * 3] - ax, wy = pos[c * 3 + 1] - ay, wz = pos[c * 3 + 2] - az;
+    var nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+    var nl = Math.hypot(nx, ny, nz);
+    if (nl < 1e-12) continue;                       // degenerate: skip
+    nx /= nl; ny /= nl; nz /= nl;
+    var ul = Math.hypot(ux, uy, uz) || 1;
+    var dn = E("DIRECTION('',(" + num(nx) + "," + num(ny) + "," + num(nz) + "))");
+    var dr = E("DIRECTION('',(" + num(ux / ul) + "," + num(uy / ul) + "," + num(uz / ul) + "))");
+    var axp = E("AXIS2_PLACEMENT_3D('',#" + vid[a] + ",#" + dn + ",#" + dr + ")");
+    var pl = E("PLANE('',#" + axp + ")");
+    var lp = E("POLY_LOOP('',(#" + vid[a] + ",#" + vid[b] + ",#" + vid[c] + "))");
+    var bd = E("FACE_OUTER_BOUND('',#" + lp + ",.T.)");
+    faces.push(E("FACE_SURFACE('',(#" + bd + "),#" + pl + ",.T.)"));
+  }
+  var sh = E("CLOSED_SHELL('',(#" + faces.join(",#") + "))");
+  var br = E("FACETED_BREP('',#" + sh + ")");
+  var org = E("CARTESIAN_POINT('',(0.,0.,0.))");
+  var dz = E("DIRECTION('',(0.,0.,1.))"), dx = E("DIRECTION('',(1.,0.,0.))");
+  var axg = E("AXIS2_PLACEMENT_3D('',#" + org + ",#" + dz + ",#" + dx + ")");
+  var lu = E("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))");
+  var au = E("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))");
+  var su = E("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())");
+  var un = E("UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(0.01),#" + lu + ",'distance_accuracy_value','')");
+  var ctx = E("(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#" + un + "))GLOBAL_UNIT_ASSIGNED_CONTEXT((#" + lu + ",#" + au + ",#" + su + "))REPRESENTATION_CONTEXT('Context','3D'))");
+  var rep = E("FACETED_BREP_SHAPE_REPRESENTATION('" + name + "',(#" + br + ",#" + axg + "),#" + ctx + ")");
+  var appc = E("APPLICATION_CONTEXT('core data for automotive mechanical design processes')");
+  E("APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#" + appc + ")");
+  var pctx = E("PRODUCT_CONTEXT('',#" + appc + ",'mechanical')");
+  var prod = E("PRODUCT('" + name + "','" + name + "','',(#" + pctx + "))");
+  E("PRODUCT_RELATED_PRODUCT_CATEGORY('part',$,(#" + prod + "))");
+  var pdf = E("PRODUCT_DEFINITION_FORMATION('1',$,#" + prod + ")");
+  var pdc = E("PRODUCT_DEFINITION_CONTEXT('part definition',#" + appc + ",'design')");
+  var pd = E("PRODUCT_DEFINITION('design',$,#" + pdf + ",#" + pdc + ")");
+  var pds = E("PRODUCT_DEFINITION_SHAPE('','',#" + pd + ")");
+  E("SHAPE_DEFINITION_REPRESENTATION(#" + pds + ",#" + rep + ")");
+  var now = new Date().toISOString().slice(0, 19);
+  return "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Horn Studio faceted export'" + stepTag(tag) + "),'2;1');\n" +
+    "FILE_NAME('" + name + ".step','" + now + "',('Horn Studio'),('Silence Please'),'Horn Studio','','');\n" +
+    "FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 2 1 1 }'));\nENDSEC;\nDATA;\n" + L.join("\n") + "\nENDSEC;\nEND-ISO-10303-21;\n";
+}
+// AKABAK / ABEC EXPORT (entry 86, user report: "an export that is compatible for BEMs
+// with akabak"). Akabak 3 / ABEC import GMSH MSH text meshes, VERSION 2.2 ONLY,
+// with all boundary elements in one file tagged into named physical surface
+// groups (the Ath convention). Converts a buildBEMProject boundary (objNodes in
+// meters, source-disc elements FIRST) into a 2.2 ASCII mesh in MILLIMETRES:
+// group 1 "SourceDisc" (driving elements 0..nSrc-1), group 2 "HornWalls".
+// opts.ribbonW/ribbonH (mm, both > 0): tag only the source-cap elements whose
+// centroid lies inside the centered W x H rectangle as "RibbonSource" (group 1);
+// the rest of the throat cap becomes rigid "ThroatBaffle" (group 3). Forum
+// request: ribbon drivers / rectangular radiators -- Akabak drives whichever
+// group you assign, so the split IS the feature. The rectangle boundary is
+// stair-stepped at element resolution (the cap is the densest region anyway).
+// ===== NURBS STEP (entry 112, user feedback: "the .step file created is being
+// inserted into Fusion 360 as a mesh") ===== The faceted BREP is thousands of
+// planar faces; CAD wants ONE spline surface. nurbsLoft globally INTERPOLATES
+// the inner ring grid with a bicubic B-spline (banded solves per direction --
+// the surface passes THROUGH every ring point), evalNurbs (de Boor) self-tests
+// the interpolation, stepFromNurbs writes it as a single ADVANCED_FACE.
+function bsplineBasis(deg, knots, nCtrl, t) {
+  var N = new Float64Array(nCtrl), lo = deg, hi = knots.length - deg - 1;
+  if (t <= knots[lo]) t = knots[lo] + 1e-12;
+  if (t >= knots[hi]) t = knots[hi] - 1e-12;
+  var span = lo;
+  while (span < hi - 1 && t >= knots[span + 1]) span++;
+  var left = [], right = [], Nl = [1], j, r;
+  for (j = 1; j <= deg; j++) {
+    left[j] = t - knots[span + 1 - j]; right[j] = knots[span + j] - t;
+    var saved = 0;
+    for (r = 0; r < j; r++) {
+      var tmp = Nl[r] / (right[r + 1] + left[j - r]);
+      Nl[r] = saved + right[r + 1] * tmp;
+      saved = left[j - r] * tmp;
+    }
+    Nl[j] = saved;
+  }
+  for (j = 0; j <= deg; j++) N[span - deg + j] = Nl[j];
+  return N;
+}
+function bandedInterp(params, knots, data, nCtrl) {
+  // data: array of n points (each [x,y,z]); returns nCtrl control points.
+  var n = data.length, deg = 3, A = [], i, j;
+  for (i = 0; i < n; i++) A.push(bsplineBasis(deg, knots, nCtrl, params[i]));
+  // dense Gaussian with partial pivot (n <= ~260 -- instant)
+  var M9 = [], P = [];
+  for (i = 0; i < n; i++) { M9.push(Array.from(A[i])); P.push([data[i][0], data[i][1], data[i][2]]); }
+  for (i = 0; i < n; i++) {
+    var piv = i;
+    for (j = i + 1; j < n; j++) if (Math.abs(M9[j][i]) > Math.abs(M9[piv][i])) piv = j;
+    var t9 = M9[i]; M9[i] = M9[piv]; M9[piv] = t9; t9 = P[i]; P[i] = P[piv]; P[piv] = t9;
+    var d9 = M9[i][i] || 1e-14;
+    for (j = i + 1; j < n; j++) {
+      var f9 = M9[j][i] / d9; if (!f9) continue;
+      for (var k9 = i; k9 < n; k9++) M9[j][k9] -= f9 * M9[i][k9];
+      P[j][0] -= f9 * P[i][0]; P[j][1] -= f9 * P[i][1]; P[j][2] -= f9 * P[i][2];
+    }
+  }
+  var out = new Array(n);
+  for (i = n - 1; i >= 0; i--) {
+    var rx = P[i][0], ry = P[i][1], rz = P[i][2];
+    for (j = i + 1; j < n; j++) { rx -= M9[i][j] * out[j][0]; ry -= M9[i][j] * out[j][1]; rz -= M9[i][j] * out[j][2]; }
+    var dd = M9[i][i] || 1e-14;
+    out[i] = [rx / dd, ry / dd, rz / dd];
+  }
+  return out;
+}
+function chordParams(pts) {
+  var u = [0], i, tot = 0;
+  for (i = 1; i < pts.length; i++) { tot += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1], pts[i][2] - pts[i - 1][2]); u.push(tot); }
+  if (tot < 1e-12) for (i = 0; i < u.length; i++) u[i] = i / (u.length - 1);
+  else for (i = 0; i < u.length; i++) u[i] /= tot;
+  return u;
+}
+function avgKnots(params, deg) {
+  var n = params.length, U = [], i, j;
+  for (i = 0; i <= deg; i++) U.push(0);
+  for (j = 1; j <= n - deg - 1; j++) {
+    var s9 = 0;
+    for (i = j; i < j + deg; i++) s9 += params[i];
+    U.push(s9 / deg);
+  }
+  for (i = 0; i <= deg; i++) U.push(1);
+  return U;
+}
+function nurbsLoft(rings, M, segs) {
+  // grid: M stations x (segs + 1) columns (seam duplicated to close the tube)
+  var nv = segs + 1, P = [], i, j;
+  for (i = 0; i < M; i++) { var row = []; for (j = 0; j < nv; j++) { var k9 = (i * segs + (j % segs)) * 3; row.push([rings[k9], rings[k9 + 1], rings[k9 + 2]]); } P.push(row); }
+  // averaged parameters
+  var uP = new Float64Array(M), vP = new Float64Array(nv);
+  for (j = 0; j < nv; j++) { var col = []; for (i = 0; i < M; i++) col.push(P[i][j]); var cu = chordParams(col); for (i = 0; i < M; i++) uP[i] += cu[i] / nv; }
+  for (i = 0; i < M; i++) { var rw = chordParams(P[i]); for (j = 0; j < nv; j++) vP[j] += rw[j] / M; }
+  var kU = avgKnots(Array.from(uP), 3), kV = avgKnots(Array.from(vP), 3);
+  // interpolate columns (u direction), then rows (v direction)
+  var R = [];
+  for (j = 0; j < nv; j++) { var colD = []; for (i = 0; i < M; i++) colD.push(P[i][j]); R.push(bandedInterp(Array.from(uP), kU, colD, M)); }
+  var ctrl = [];
+  for (i = 0; i < M; i++) { var rowD = []; for (j = 0; j < nv; j++) rowD.push(R[j][i]); ctrl.push(bandedInterp(Array.from(vP), kV, rowD, nv)); }
+  return { ctrl: ctrl, kU: kU, kV: kV, nu: M, nv: nv, uP: uP, vP: vP, grid: P };
+}
+function evalNurbs(sf, u, v) {
+  var Nu = bsplineBasis(3, sf.kU, sf.nu, u), Nv = bsplineBasis(3, sf.kV, sf.nv, v);
+  var x = 0, y = 0, z = 0, i, j;
+  for (i = 0; i < sf.nu; i++) { if (!Nu[i]) continue;
+    for (j = 0; j < sf.nv; j++) { if (!Nv[j]) continue;
+      var w9 = Nu[i] * Nv[j], c9 = sf.ctrl[i][j];
+      x += w9 * c9[0]; y += w9 * c9[1]; z += w9 * c9[2];
+    } }
+  return [x, y, z];
+}
+// ===== FOUR-PATCH SHARP-CORNER NURBS (entry 211, user report with a Fusion
+// screenshot: "I am almost certain this geometry is a result of step export
+// u gotta really fix this once and for all"). MEASURED first: a C2 spline
+// forced through a sharp corner RINGS -- the mouth boundary curve dipped
+// 1.57 mm (110x48) / 2.36 mm (56x32) into its own rectangle beside every
+// corner: the wavy rim in the screenshot. The lawful fix is how CAD models
+// a box: at cornerR ~0 the tube splits into FOUR clamped patches meeting at
+// true crease edges. Shared global u-interpolation makes adjacent patches'
+// corner columns BIT-IDENTICAL; clamped v-interpolation per side makes the
+// corners EXACT and the flats ring-free (a cubic through collinear points
+// is the line). Fewer isocurves per face as a bonus.
+// entry 212: ring-grid offset for the SOLID NURBS export -- the entry-206
+// mitered normal offset (true left/right dihedral, cap 1.5) applied to the
+// ring array itself, with the entry-201 machined ends: ring 0 pinned to the
+// throat plane, ring M-1 pinned to the mouth plane, so both caps are flat.
+function offsetRings(rings, M, segs, t) {
+  var out = new Float32Array(rings.length), i, j;
+  var zMouth = 0;
+  for (j = 0; j < segs; j++) zMouth = Math.max(zMouth, rings[((M - 1) * segs + j) * 3]);
+  for (i = 0; i < M; i++) {
+    var ip = Math.max(0, i - 1), iq = Math.min(M - 1, i + 1);
+    for (j = 0; j < segs; j++) {
+      var jp = (j + segs - 1) % segs, jq = (j + 1) % segs;
+      var k0 = (i * segs + j) * 3, kp = (ip * segs + j) * 3, kq = (iq * segs + j) * 3;
+      var tix = rings[kq] - rings[kp], tiy = rings[kq + 1] - rings[kp + 1], tiz = rings[kq + 2] - rings[kp + 2];
+      var kl = (i * segs + jp) * 3, kr = (i * segs + jq) * 3;
+      function cx9(ax, ay, az) {
+        var vx = ay * tiz - az * tiy, vy = az * tix - ax * tiz, vz = ax * tiy - ay * tix;
+        var vl = Math.hypot(vx, vy, vz) || 1e-12;
+        return [vx / vl, vy / vl, vz / vl];
+      }
+      var nL = cx9(rings[k0] - rings[kl], rings[k0 + 1] - rings[kl + 1], rings[k0 + 2] - rings[kl + 2]);
+      var nR = cx9(rings[kr] - rings[k0], rings[kr + 1] - rings[k0 + 1], rings[kr + 2] - rings[k0 + 2]);
+      var nx = nL[0] + nR[0], ny = nL[1] + nR[1], nz = nL[2] + nR[2];
+      var nl = Math.hypot(nx, ny, nz) || 1e-12;
+      var dot = Math.max(-1, Math.min(1, nL[0] * nR[0] + nL[1] * nR[1] + nL[2] * nR[2]));
+      var mit = Math.min(1.5, 1 / Math.max(0.667, Math.sqrt((1 + dot) / 2)));
+      out[k0] = rings[k0] + t * mit * nx / nl;
+      out[k0 + 1] = rings[k0 + 1] + t * mit * ny / nl;
+      out[k0 + 2] = rings[k0 + 2] + t * mit * nz / nl;
+      if (i === 0) out[k0] = 0;
+      if (i === M - 1) out[k0] = zMouth;
+    }
+  }
+  return out;
+}
+function quadLoft(rings, M, segs, cornerIdx) {
+  var P = [], i, j;
+  for (i = 0; i < M; i++) { var row = []; for (j = 0; j < segs; j++) { var k9 = (i * segs + j) * 3; row.push([rings[k9], rings[k9 + 1], rings[k9 + 2]]); } P.push(row); }
+  // global u parameterization + column interpolation (shared by all patches)
+  var uP = new Float64Array(M);
+  for (j = 0; j < segs; j++) { var col = []; for (i = 0; i < M; i++) col.push(P[i][j]); var cu = chordParams(col); for (i = 0; i < M; i++) uP[i] += cu[i] / segs; }
+  var kU = avgKnots(Array.from(uP), 3);
+  var R = [];
+  for (j = 0; j < segs; j++) { var colD = []; for (i = 0; i < M; i++) colD.push(P[i][j]); R.push(bandedInterp(Array.from(uP), kU, colD, M)); }
+  var patches = [];
+  for (var p = 0; p < 4; p++) {
+    var jA = cornerIdx[p], jB = cornerIdx[(p + 1) % 4];
+    var cols = [];
+    for (j = jA; ; j = (j + 1) % segs) { cols.push(j); if (j === jB) break; }
+    var nvp = cols.length;
+    var vP = new Float64Array(nvp);
+    for (i = 0; i < M; i++) { var rw = chordParams(cols.map(function (jj) { return P[i][jj]; })); for (j = 0; j < nvp; j++) vP[j] += rw[j] / M; }
+    var kV = avgKnots(Array.from(vP), 3);
+    var ctrl = [];
+    for (i = 0; i < M; i++) ctrl.push(bandedInterp(Array.from(vP), kV, cols.map(function (jj) { return R[jj][i]; }), nvp));
+    patches.push({ ctrl: ctrl, kU: kU, kV: kV, nu: M, nv: nvp, jA: jA, jB: jB });
+  }
+  return { patches: patches, R: R, kU: kU, cornerIdx: cornerIdx };
+}
+// entry 212: the SOLID quad writer -- a finished, watertight part. Ten faces:
+// four inner patches, four outer patches (offset rings, same corner indices),
+// a flat annular throat flange and a flat mouth end face, every edge shared
+// by exactly two faces, CLOSED_SHELL -> MANIFOLD_SOLID_BREP. CAD imports a
+// body with wall thickness, real corner edges, and machinable end faces.
+function stepFromNurbsSolidQuad(qi, qo, name, tag) {
+  var L = [], id = 0;
+  function E9(txt) { id++; L.push("#" + id + "=" + txt + ";"); return id; }
+  function knotStr(K) {
+    var ks = [], ms = [], i9;
+    for (i9 = 0; i9 < K.length; i9++) {
+      if (ks.length && Math.abs(K[i9] - ks[ks.length - 1]) < 1e-12) ms[ms.length - 1]++;
+      else { ks.push(K[i9]); ms.push(1); }
+    }
+    return { m: "(" + ms.join(",") + ")", k: "(" + ks.map(function (x) { return x.toFixed(9); }).join(",") + ")" };
+  }
+  function cp(p9) { return E9("CARTESIAN_POINT('',(" + p9[0].toFixed(6) + "," + p9[1].toFixed(6) + "," + p9[2].toFixed(6) + "))"); }
+  function curve(pts, kk) {
+    var ids9 = pts.map(function (p9) { return "#" + cp(p9); });
+    var ks9 = knotStr(kk);
+    return E9("B_SPLINE_CURVE_WITH_KNOTS('',3,(" + ids9.join(",") + "),.UNSPECIFIED.,.F.,.F.," + ks9.m + "," + ks9.k + ",.UNSPECIFIED.)");
+  }
+  function shellHalf(q, tag) {
+    // vertices + corner edges + per-side surface/arc entities for one wall
+    var vT = [], vM = [], eC = [];
+    for (var c = 0; c < 4; c++) {
+      var col = q.R[q.cornerIdx[c]];
+      vT.push(E9("VERTEX_POINT('',#" + cp(col[0]) + ")"));
+      vM.push(E9("VERTEX_POINT('',#" + cp(col[col.length - 1]) + ")"));
+      eC.push(E9("EDGE_CURVE('',#" + vT[c] + ",#" + vM[c] + ",#" + curve(col, q.kU) + ",.T.)"));
+    }
+    var faces = [], eT = [], eM = [];
+    for (var p = 0; p < 4; p++) {
+      var sf = q.patches[p], cA = (p + 1) % 4;
+      var cpIds = [];
+      for (var i = 0; i < sf.nu; i++) { var rowI = []; for (var j = 0; j < sf.nv; j++) rowI.push(cp(sf.ctrl[i][j])); cpIds.push(rowI); }
+      var grid = "(" + cpIds.map(function (r) { return "(" + r.map(function (x) { return "#" + x; }).join(",") + ")"; }).join(",") + ")";
+      var ku = knotStr(sf.kU), kv = knotStr(sf.kV);
+      var surf = E9("B_SPLINE_SURFACE_WITH_KNOTS('" + name + "_" + tag + p + "',3,3," + grid + ",.UNSPECIFIED.,.F.,.F.,.F.," + ku.m + "," + kv.m + "," + ku.k + "," + kv.k + ",.UNSPECIFIED.)");
+      eT.push(E9("EDGE_CURVE('',#" + vT[p] + ",#" + vT[cA] + ",#" + curve(sf.ctrl[0], sf.kV) + ",.T.)"));
+      eM.push(E9("EDGE_CURVE('',#" + vM[p] + ",#" + vM[cA] + ",#" + curve(sf.ctrl[sf.nu - 1], sf.kV) + ",.T.)"));
+      var loop = E9("EDGE_LOOP('',(#" +
+        E9("ORIENTED_EDGE('',*,*,#" + eC[p] + ",.T.)") + ",#" +
+        E9("ORIENTED_EDGE('',*,*,#" + eM[p] + ",.T.)") + ",#" +
+        E9("ORIENTED_EDGE('',*,*,#" + eC[cA] + ",.F.)") + ",#" +
+        E9("ORIENTED_EDGE('',*,*,#" + eT[p] + ",.F.)") + "))");
+      faces.push(E9("ADVANCED_FACE('',(#" + E9("FACE_OUTER_BOUND('',#" + loop + ",.T.)") + "),#" + surf + ",.T.)"));
+    }
+    return { faces: faces, eT: eT, eM: eM };
+  }
+  var inner = shellHalf(qi, "in"), outer = shellHalf(qo, "out");
+  // planar end caps: throat flange (z = 0) and mouth face (z = zMouth)
+  function cap(z9, arcsIn, arcsOut, flip) {
+    var org = E9("CARTESIAN_POINT('',(" + z9.toFixed(6) + ",0.,0.))");
+    var ax = E9("DIRECTION('',(1.,0.,0.))"), rf = E9("DIRECTION('',(0.,1.,0.))");
+    var pl = E9("PLANE('',#" + E9("AXIS2_PLACEMENT_3D('',#" + org + ",#" + ax + ",#" + rf + ")") + ")");
+    var loopO = E9("EDGE_LOOP('',(" + arcsOut.map(function (e) { return "#" + E9("ORIENTED_EDGE('',*,*,#" + e + "," + (flip ? ".F." : ".T.") + ")"); }).join(",") + "))");
+    var loopI = E9("EDGE_LOOP('',(" + arcsIn.map(function (e) { return "#" + E9("ORIENTED_EDGE('',*,*,#" + e + "," + (flip ? ".T." : ".F.") + ")"); }).join(",") + "))");
+    return E9("ADVANCED_FACE('',(#" + E9("FACE_OUTER_BOUND('',#" + loopO + ",.T.)") + ",#" + E9("FACE_BOUND('',#" + loopI + ",.T.)") + "),#" + pl + ",.T.)");
+  }
+  var zM9 = qi.patches[0].ctrl[qi.patches[0].ctrl.length - 1][0][0];
+  var throatCap = cap(0, inner.eT, outer.eT, false);
+  var mouthCap = cap(zM9, inner.eM, outer.eM, true);
+  var allFaces = inner.faces.concat(outer.faces, [throatCap, mouthCap]);
+  var shell = E9("CLOSED_SHELL('',(" + allFaces.map(function (f) { return "#" + f; }).join(",") + "))");
+  var brep = E9("MANIFOLD_SOLID_BREP('" + name + "',#" + shell + ")");
+  var lenU = E9("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))");
+  var angU = E9("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))");
+  var solU = E9("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())");
+  var tol = E9("UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-3),#" + lenU + ",'distance_accuracy_value','')");
+  var ctx = E9("(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#" + tol + "))GLOBAL_UNIT_ASSIGNED_CONTEXT((#" + lenU + ",#" + angU + ",#" + solU + "))REPRESENTATION_CONTEXT('',''))");
+  var rep = E9("ADVANCED_BREP_SHAPE_REPRESENTATION('" + name + "',(#" + brep + "),#" + ctx + ")");
+  var app = E9("APPLICATION_CONTEXT('core data for automotive mechanical design processes')");
+  var pdc = E9("PRODUCT_DEFINITION_CONTEXT('part definition',#" + app + ",'design')");
+  var pc = E9("PRODUCT_CONTEXT('',#" + app + ",'mechanical')");
+  var prod = E9("PRODUCT('" + name + "','" + name + "','',(#" + pc + "))");
+  var pdf = E9("PRODUCT_DEFINITION_FORMATION('','',#" + prod + ")");
+  var pd = E9("PRODUCT_DEFINITION('design','',#" + pdf + ",#" + pdc + ")");
+  var pds = E9("PRODUCT_DEFINITION_SHAPE('','',#" + pd + ")");
+  E9("SHAPE_DEFINITION_REPRESENTATION(#" + pds + ",#" + rep + ")");
+  var head = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Horn Studio thickened solid, sharp-corner four-patch walls'" + stepTag(tag) + "),'2;1');\nFILE_NAME('" + name + ".step','',(''),(''),'Horn Studio','','');\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 2 1 1 }'));\nENDSEC;\nDATA;\n";
+  return head + L.join("\n") + "\nENDSEC;\nEND-ISO-10303-21;\n";
+}
+function stepFromNurbsQuad(q, name, tag) {
+  var L = [], id = 0;
+  function E9(txt) { id++; L.push("#" + id + "=" + txt + ";"); return id; }
+  function knotStr(K) {
+    var ks = [], ms = [], i9;
+    for (i9 = 0; i9 < K.length; i9++) {
+      if (ks.length && Math.abs(K[i9] - ks[ks.length - 1]) < 1e-12) ms[ms.length - 1]++;
+      else { ks.push(K[i9]); ms.push(1); }
+    }
+    return { m: "(" + ms.join(",") + ")", k: "(" + ks.map(function (x) { return x.toFixed(9); }).join(",") + ")" };
+  }
+  function cp(p9) { return E9("CARTESIAN_POINT('',(" + p9[0].toFixed(6) + "," + p9[1].toFixed(6) + "," + p9[2].toFixed(6) + "))"); }
+  function curve(pts, kk) {
+    var ids9 = pts.map(function (p9) { return "#" + cp(p9); });
+    var ks9 = knotStr(kk);
+    return E9("B_SPLINE_CURVE_WITH_KNOTS('',3,(" + ids9.join(",") + "),.UNSPECIFIED.,.F.,.F.," + ks9.m + "," + ks9.k + ",.UNSPECIFIED.)");
+  }
+  // shared corner infrastructure: one vertex pair + one edge per corner column
+  var vT = [], vM = [], eCorner = [];
+  for (var c = 0; c < 4; c++) {
+    var col = q.R[q.cornerIdx[c]];                       // u-control of the corner column
+    vT.push(E9("VERTEX_POINT('',#" + cp(col[0]) + ")"));
+    vM.push(E9("VERTEX_POINT('',#" + cp(col[col.length - 1]) + ")"));
+    eCorner.push(E9("EDGE_CURVE('',#" + vT[c] + ",#" + vM[c] + ",#" + curve(col, q.kU) + ",.T.)"));
+  }
+  var faces = [];
+  for (var p = 0; p < 4; p++) {
+    var sf = q.patches[p];
+    var cpIds = [];
+    for (var i = 0; i < sf.nu; i++) { var rowI = [];
+      for (var j = 0; j < sf.nv; j++) rowI.push(cp(sf.ctrl[i][j]));
+      cpIds.push(rowI); }
+    var grid = "(" + cpIds.map(function (r) { return "(" + r.map(function (x) { return "#" + x; }).join(",") + ")"; }).join(",") + ")";
+    var ku = knotStr(sf.kU), kv = knotStr(sf.kV);
+    var surf = E9("B_SPLINE_SURFACE_WITH_KNOTS('" + name + "_side" + p + "',3,3," + grid + ",.UNSPECIFIED.,.F.,.F.,.F.," + ku.m + "," + kv.m + "," + ku.k + "," + kv.k + ",.UNSPECIFIED.)");
+    var cA = (p + 1) % 4;
+    var eThroat = E9("EDGE_CURVE('',#" + vT[p] + ",#" + vT[cA] + ",#" + curve(sf.ctrl[0], sf.kV) + ",.T.)");
+    var eMouth = E9("EDGE_CURVE('',#" + vM[p] + ",#" + vM[cA] + ",#" + curve(sf.ctrl[sf.nu - 1], sf.kV) + ",.T.)");
+    var loop = E9("EDGE_LOOP('',(#" +
+      E9("ORIENTED_EDGE('',*,*,#" + eCorner[p] + ",.T.)") + ",#" +
+      E9("ORIENTED_EDGE('',*,*,#" + eMouth + ",.T.)") + ",#" +
+      E9("ORIENTED_EDGE('',*,*,#" + eCorner[cA] + ",.F.)") + ",#" +
+      E9("ORIENTED_EDGE('',*,*,#" + eThroat + ",.F.)") + "))");
+    faces.push(E9("ADVANCED_FACE('',(#" + E9("FACE_OUTER_BOUND('',#" + loop + ",.T.)") + "),#" + surf + ",.T.)"));
+  }
+  var shell = E9("OPEN_SHELL('',(" + faces.map(function (f) { return "#" + f; }).join(",") + "))");
+  var model = E9("SHELL_BASED_SURFACE_MODEL('" + name + "',(#" + shell + "))");
+  var lenU = E9("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))");
+  var angU = E9("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))");
+  var solU = E9("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())");
+  var tol = E9("UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-3),#" + lenU + ",'distance_accuracy_value','')");
+  var ctx = E9("(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#" + tol + "))GLOBAL_UNIT_ASSIGNED_CONTEXT((#" + lenU + ",#" + angU + ",#" + solU + "))REPRESENTATION_CONTEXT('',''))");
+  var rep = E9("MANIFOLD_SURFACE_SHAPE_REPRESENTATION('" + name + "',(#" + model + "),#" + ctx + ")");
+  var app = E9("APPLICATION_CONTEXT('core data for automotive mechanical design processes')");
+  var pdc = E9("PRODUCT_DEFINITION_CONTEXT('part definition',#" + app + ",'design')");
+  var pc = E9("PRODUCT_CONTEXT('',#" + app + ",'mechanical')");
+  var prod = E9("PRODUCT('" + name + "','" + name + "','',(#" + pc + "))");
+  var pdf = E9("PRODUCT_DEFINITION_FORMATION('','',#" + prod + ")");
+  var pd = E9("PRODUCT_DEFINITION('design','',#" + pdf + ",#" + pdc + ")");
+  var pds = E9("PRODUCT_DEFINITION_SHAPE('','',#" + pd + ")");
+  E9("SHAPE_DEFINITION_REPRESENTATION(#" + pds + ",#" + rep + ")");
+  var head = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Horn Studio NURBS four-patch sharp-corner surface'" + stepTag(tag) + "),'2;1');\nFILE_NAME('" + name + ".step','',(''),(''),'Horn Studio','','');\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 2 1 1 }'));\nENDSEC;\nDATA;\n";
+  return head + L.join("\n") + "\nENDSEC;\nEND-ISO-10303-21;\n";
+}
+function stepFromNurbs(sf, name, tag) {
+  var L = [], id = 0;
+  function E9(txt) { id++; L.push("#" + id + "=" + txt + ";"); return id; }
+  function knotStr(K) {
+    // collapse to (multiplicities, knots)
+    var ks = [], ms = [], i;
+    for (i = 0; i < K.length; i++) {
+      if (ks.length && Math.abs(K[i] - ks[ks.length - 1]) < 1e-12) ms[ms.length - 1]++;
+      else { ks.push(K[i]); ms.push(1); }
+    }
+    return { m: "(" + ms.join(",") + ")", k: "(" + ks.map(function (x) { return x.toFixed(9); }).join(",") + ")" };
+  }
+  var i, j;
+  // control points
+  var cpIds = [];
+  for (i = 0; i < sf.nu; i++) { var rowI = [];
+    for (j = 0; j < sf.nv; j++) { var c9 = sf.ctrl[i][j];
+      rowI.push(E9("CARTESIAN_POINT('',(" + c9[0].toFixed(6) + "," + c9[1].toFixed(6) + "," + c9[2].toFixed(6) + "))")); }
+    cpIds.push(rowI); }
+  var grid = "(" + cpIds.map(function (r) { return "(" + r.map(function (x) { return "#" + x; }).join(",") + ")"; }).join(",") + ")";
+  var ku = knotStr(sf.kU), kv = knotStr(sf.kV);
+  var surf = E9("B_SPLINE_SURFACE_WITH_KNOTS('" + name + "',3,3," + grid + ",.UNSPECIFIED.,.F.,.F.,.F.," + ku.m + "," + kv.m + "," + ku.k + "," + kv.k + ",.UNSPECIFIED.)");
+  // boundary vertices (corners of the parameter rectangle)
+  function cp(p9) { return E9("CARTESIAN_POINT('',(" + p9[0].toFixed(6) + "," + p9[1].toFixed(6) + "," + p9[2].toFixed(6) + "))"); }
+  var c00 = evalNurbs(sf, 0, 0), c10 = evalNurbs(sf, 1, 0), c01 = evalNurbs(sf, 0, 1), c11 = evalNurbs(sf, 1, 1);
+  var v00 = E9("VERTEX_POINT('',#" + cp(c00) + ")"), v10 = E9("VERTEX_POINT('',#" + cp(c10) + ")");
+  var v01 = E9("VERTEX_POINT('',#" + cp(c01) + ")"), v11 = E9("VERTEX_POINT('',#" + cp(c11) + ")");
+  // boundary curves = control-net border rows/cols with matching knots
+  function curve(pts, kk) {
+    var ids9 = pts.map(function (p9) { return "#" + cp(p9); });
+    var ks9 = knotStr(kk);
+    return E9("B_SPLINE_CURVE_WITH_KNOTS('',3,(" + ids9.join(",") + "),.UNSPECIFIED.,.F.,.F.," + ks9.m + "," + ks9.k + ",.UNSPECIFIED.)");
+  }
+  /* entry 205 (user report: "when I import the step file to rhino I am seeing a
+     bunch of lines"): the surface is a CLOSED TUBE flattened to a patch --
+     its v = 0 and v = 1 borders are the SAME physical seam. The old writer
+     emitted them as two DISTINCT coincident edges, which is non-manifold
+     topology by the STEP rules: Fusion heals it silently, Rhino rejects the
+     face and imports only the boundary curves. The lawful seamed-tube
+     topology: THREE edges (throat ring closed on itself, mouth ring closed
+     on itself, one seam), the seam traversed twice with opposite senses. */
+  var cu0 = curve(sf.ctrl[0], sf.kV);                                        // u = 0 (throat ring)
+  var cu1 = curve(sf.ctrl[sf.nu - 1], sf.kV);                                // u = 1 (mouth ring)
+  var cv0 = curve(sf.ctrl.map(function (r) { return r[0]; }), sf.kU);        // the ONE seam
+  function edge(vA, vB, cId) { return E9("EDGE_CURVE('',#" + vA + ",#" + vB + ",#" + cId + ",.T.)"); }
+  var eThroat = edge(v00, v00, cu0);   // closed ring: start = end vertex
+  var eMouth = edge(v10, v10, cu1);    // closed ring
+  var eSeam = edge(v00, v10, cv0);     // throat-seam vertex -> mouth-seam vertex
+  var loop = E9("EDGE_LOOP('',(#" + E9("ORIENTED_EDGE('',*,*,#" + eSeam + ",.T.)") + ",#" + E9("ORIENTED_EDGE('',*,*,#" + eMouth + ",.T.)") + ",#" + E9("ORIENTED_EDGE('',*,*,#" + eSeam + ",.F.)") + ",#" + E9("ORIENTED_EDGE('',*,*,#" + eThroat + ",.F.)") + "))");
+  var face = E9("ADVANCED_FACE('',(#" + E9("FACE_OUTER_BOUND('',#" + loop + ",.T.)") + "),#" + surf + ",.T.)");
+  var shell = E9("OPEN_SHELL('',(#" + face + "))");
+  var model = E9("SHELL_BASED_SURFACE_MODEL('" + name + "',(#" + shell + "))");
+  // representation context (mm)
+  var lenU = E9("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))");
+  var angU = E9("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))");
+  var solU = E9("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())");
+  var tol = E9("UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-3),#" + lenU + ",'distance_accuracy_value','')");
+  var ctx = E9("(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#" + tol + "))GLOBAL_UNIT_ASSIGNED_CONTEXT((#" + lenU + ",#" + angU + ",#" + solU + "))REPRESENTATION_CONTEXT('','3D'))");
+  var rep = E9("MANIFOLD_SURFACE_SHAPE_REPRESENTATION('" + name + "',(#" + model + "),#" + ctx + ")");
+  // product skeleton
+  var app = E9("APPLICATION_CONTEXT('core data for automotive mechanical design processes')");
+  var pdc = E9("PRODUCT_DEFINITION_CONTEXT('part definition',#" + app + ",'design')");
+  var pc = E9("PRODUCT_CONTEXT('',#" + app + ",'mechanical')");
+  var prod = E9("PRODUCT('" + name + "','" + name + "','',(#" + pc + "))");
+  var pdf = E9("PRODUCT_DEFINITION_FORMATION('','',#" + prod + ")");
+  var pd = E9("PRODUCT_DEFINITION('design','',#" + pdf + ",#" + pdc + ")");
+  var pds = E9("PRODUCT_DEFINITION_SHAPE('','',#" + pd + ")");
+  E9("SHAPE_DEFINITION_REPRESENTATION(#" + pds + ",#" + rep + ")");
+  var head = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Horn Studio NURBS surface'" + stepTag(tag) + "),'2;1');\nFILE_NAME('" + name + ".step','',(''),(''),'Horn Studio','','');\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));\nENDSEC;\nDATA;\n";
+  return head + L.join("\n") + "\nENDSEC;\nEND-ISO-10303-21;\n";
+}
+function bemToMsh(bp, opts) {
+  // entry 136: FINAL GATE -- a corrupt mesh must throw, never save.
+  if (bp && bp.objNodes && (bp.objNodes.indexOf("NaN") !== -1 || bp.objNodes.indexOf("Infinity") !== -1))
+    throw new Error("BEM export aborted: non-finite node coordinates -- check the parameters");
+  if (bp && bp.objElems && (bp.objElems.indexOf("NaN") !== -1 || bp.objElems.indexOf("Infinity") !== -1))
+    throw new Error("BEM export aborted: non-finite element data -- check the parameters");
+  opts = opts || {};
+  var rib = (opts.ribbonW > 0 && opts.ribbonH > 0) ? { w: opts.ribbonW / 2000, h: opts.ribbonH / 2000 } : null;   // half-sizes in METERS (objNodes units)
+  var nl = bp.objNodes.trim().split("\n"), el = bp.objElems.trim().split("\n");
+  var nN = parseInt(nl[0], 10), nE = parseInt(el[0], 10);
+  var nx = new Float64Array(nN + 1), ny = new Float64Array(nN + 1);
+  var out = "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n$PhysicalNames\n" +
+    (rib ? "3\n2 1 \"RibbonSource\"\n2 2 \"HornWalls\"\n2 3 \"ThroatBaffle\"\n" : "2\n2 1 \"SourceDisc\"\n2 2 \"HornWalls\"\n") +
+    "$EndPhysicalNames\n$Nodes\n" + nN + "\n";
+  for (var i = 1; i <= nN; i++) {
+    var t = nl[i].split(" ");
+    nx[i] = parseFloat(t[1]); ny[i] = parseFloat(t[2]);
+    out += i + " " + (nx[i] * 1000).toFixed(4) + " " + (ny[i] * 1000).toFixed(4) + " " + (parseFloat(t[3]) * 1000).toFixed(4) + "\n";
+  }
+  out += "$EndNodes\n$Elements\n" + nE + "\n";
+  for (var e = 1; e <= nE; e++) {
+    var q = el[e].split(" ");
+    var a = parseInt(q[1], 10) + 1, b = parseInt(q[2], 10) + 1, c = parseInt(q[3], 10) + 1;
+    var ph;
+    if ((e - 1) >= bp.nSrc) ph = 2;
+    else if (!rib) ph = 1;
+    else {
+      var cx = (nx[a] + nx[b] + nx[c]) / 3, cy = (ny[a] + ny[b] + ny[c]) / 3;
+      ph = (Math.abs(cx) <= rib.w && Math.abs(cy) <= rib.h) ? 1 : 3;
+    }
+    out += e + " 2 2 " + ph + " " + ph + " " + a + " " + b + " " + c + "\n";
+  }
+  return out + "$EndElements\n";
+}
+// BEM MEMORY / SCHEDULING HELPERS (entry 77). Calibrated on real NumCalc ML-FMM
+// solves under WASI (WN horns, solve near each mesh's lambda/6 fMax -- the worst
+// case the adaptive band router ever produces): 3,520 el -> 256 MB wasm memory,
+// 9,520 -> 387 MB, 24,472 -> 1,315 MB. Growth is super-linear (FMM tree depth and
+// interaction lists grow with kD), so the linear fit is anchored CONSERVATIVELY
+// at the top: mem(N) = 200 + 0.048*N MB over-reserves ~40% at the small end and
+// tracks the 25k point. Pure functions so the smoke suite can pin them.
+// entry 78: PIECEWISE model. ML-FMM memory is super-linear in N -- measured under
+// WASI: 3,520 -> 256 MB, 9,520 -> 387, 24,472 -> 1,315, 28,710 -> 1,746 MB, and
+// 36,540 OOM-KILLED past 3.9 GB (an FMM octree depth step, not smooth growth).
+// Below 24,472 the entry-77 linear fit holds; above it the measured 0.102 MB/el
+// slope applies; past BEM_ELEM_RAIL (29,000, the largest solve MEASURED to fit)
+// wasm32 memory is unmodeled and callers must not build bigger single solves.
+var BEM_ELEM_RAIL = 29000;
+function bemMemEstimate(nBnd) {
+  var n9 = Math.max(0, nBnd);
+  var mb = n9 <= 24472 ? 200 + 0.048 * n9 : 1315 + 0.102 * (n9 - 24472);
+  return Math.round(mb * 1048576);   // bytes
+}
+function bemPoolPlan(jobElems, cores, deviceMemGB) {
+  var gb = (deviceMemGB && isFinite(deviceMemGB)) ? deviceMemGB : 4;   // navigator.deviceMemory caps at 8; undefined on FF/Safari
+  var budget = Math.max(0.5, Math.min(0.45 * gb, 3.2)) * 1073741824;   // bytes reserved for concurrent solvers
+  var maxJob = 0;
+  for (var i = 0; i < jobElems.length; i++) maxJob = Math.max(maxJob, bemMemEstimate(jobElems[i]));
+  var poolN = Math.max(1, Math.min(3, (cores || 2) - 1, jobElems.length));
+  return { budgetBytes: budget, poolN: poolN, maxJobBytes: maxJob };
+}
+// Third-band sizer: pick stations/segs so the mesh honestly supports fTop where the
+// element budget allows. segs runs at HALF the nominal edge along the perimeter
+// because curved-mouth corners carry extra axial travel plus the +thick outer-shell
+// inflation (measured ~2.5x local amplification on WN); stations follow the native
+// exporter's depth*1.6 rule. If the 4*M*segs estimate blows the budget, both shrink
+// by sqrt -- fMax degrades but stays HONEST (reported from the real maxEdge).
+// entry 78: depthMM should be the PROFILE ARC LENGTH, not the axial depth -- a 175deg
+// mouth roll nearly doubles the wall path (422 vs 247 mm on the 400 Hz default) and
+// axial-depth sizing under-stations it. Callers with a wall polyline pass its arc
+// length; the first build's edgeSta/edgeRing then drive one REBALANCE iteration
+// (sta scaled by edgeSta/eBal, segs by edgeRing/eBal, eBal = sqrt(edgeSta*edgeRing)
+// preserving the element count) because the adaptive-keep curvature charge starves
+// plain wall sections of stations on full-roll horns.
+function bemBandSize(mouthPerMM, depthMM, fTop, budgetElems) {
+  var eT = 344000 / (6 * fTop);
+  // entry 127: segs = perimeter/eT gives SQUARE elements at the mouth; the
+  // aspect-equalizing station metric owns the axial direction (the old eT/2
+  // azimuthal oversampling doubled the count for nothing).
+  var segs = Math.max(48, 4 * Math.round(mouthPerMM / eT / 4));
+  var sta = Math.max(30, Math.round(depthMM * 1.6 / eT));
+  var est = 4 * sta * segs;
+  if (est > budgetElems) {
+    var k = Math.sqrt(budgetElems / est);
+    segs = Math.max(48, 4 * Math.round(segs * k / 4));
+    sta = Math.max(30, Math.round(sta * k));
+  }
+  return { stations: sta, segs: segs, targetEdge: eT };
+}
+// entry 238 (found while adding the 20% loading corner): the 1-D chain was being
+// fed the CURLED-BACK LIP. Past the mouth plane a rolled wall's z DECREASES, so
+// the axial spacing clamp gave 1e-6 mm elements carrying a large area step --
+// an abrupt "reflector" that put +-0.55 top-octave ripple on a JMLC at
+// truncation 175 (0.035 at 90) and the +-0.76 on R-OSSE that the hornlab review
+// had blamed on physics. It was the coordinate. The Webster chain now ends at
+// the MOUTH PLANE -- the base station of maximum z -- with the radiation load
+// applied there; the lip beyond it is geometry, not duct. MEASURED after: JMLC
+// trunc 175 asymptote 1.000, ripple 0.035, 20% corner 399 Hz at fc 400.
+function websterEnd(prof) {
+  var H = prof.H, im = 0;   // ALL stations: a roundover that ends at 90 deg is duct up to the mouth plane; only what curls past it is lip
+  for (var i = 1; i < H.length; i++) if (H[i].z > H[im].z) im = i;
+  return Math.max(2, im + 1);
+}
+
+function throatImpedance(prof, fArr, coordMode, sMap) {
+  // AUDIT #2 (2026-07-13): the propagation coordinate is now explicit -- the old
+  // (d1+d2)/2 averaged wall slant was never a justified Webster coordinate.
+  //   coordMode "axial"     : dz spacing (plane-wave analytic profiles; also the labeled
+  //                           APPROXIMATION for reconstructed non-axisymmetric horns)
+  //   coordMode "wavefront" : sMap = monotone [{z, s}] mapping station z to the actual
+  //                           marching coordinate (JMLC)
+  // Callers must never pass an averaged wall slant.
+  var H = prof.H, V = prof.V, M = websterEnd(prof), i;   /* entry 238: the chain ends at the mouth plane */
+  var Ssta = [], dl = [];
+  var shp = prof.shape || "ellipse", rho2 = prof.rho || 0, rA = prof.rhoArr, sA = prof.seNArr;
+  for (i = 0; i < M; i++) Ssta.push(sectionArea(sA ? "sellipse:" + sA[Math.min(i, sA.length - 1)] : shp, H[i].r, V[i].r, rA ? rA[Math.min(i, rA.length - 1)] : rho2) - (prof.occl ? prof.occl[i] || 0 : 0));   /* entry 237: NET area (bullet phase plug occlusion subtracted) */
+  function sOfZ(zq) {
+    if (!sMap || !sMap.length) return zq;
+    if (zq <= sMap[0].z) return sMap[0].s;
+    for (var q9 = 1; q9 < sMap.length; q9++) if (sMap[q9].z >= zq) {
+      var f9 = (zq - sMap[q9 - 1].z) / (sMap[q9].z - sMap[q9 - 1].z || 1e-12);
+      return sMap[q9 - 1].s + f9 * (sMap[q9].s - sMap[q9 - 1].s);
+    }
+    return sMap[sMap.length - 1].s;
+  }
+  for (i = 1; i < M; i++) {
+    if (coordMode === "wavefront") dl.push(Math.max(1e-6, sOfZ(H[i].z) - sOfZ(H[i - 1].z)));
+    else dl.push(Math.max(1e-6, H[i].z - H[i - 1].z));
+  }
+  var Sm = Ssta[M - 1], am = Math.sqrt(Sm / Math.PI), St = Ssta[0];
+  var out = [];
+  for (var fi = 0; fi < fArr.length; fi++) {
+    var f = fArr[fi], k = 2 * Math.PI * f / C;
+    var x = 2 * k * am;
+    var R1 = 1 - 2 * bessj1(x) / x, X1 = 2 * struveH1(x) / x;
+    // work in normalized-by-(rho c) specific terms: define zA = Z * S / (rho c) ... chain with area ratios
+    // Z_L * Sm/(rho c) = R1 + jX1
+    var re = R1, im = X1, curS = Sm;
+    for (i = M - 2; i >= 0; i--) {
+      var Sseg = (Ssta[i] + Ssta[i + 1]) / 2;
+      // convert load into this segment's normalization: zl = Z*Sseg/(rho c) = (re,im)*Sseg/curS
+      var lre = re * Sseg / curS, lim = im * Sseg / curS;
+      var t = Math.tan(k * dl[i]);
+      // zin = (zl + j t) / (1 + j zl t)
+      var nre = lre, nim = lim + t;
+      var dre = 1 - lim * t, dim = lre * t;
+      var dd = dre * dre + dim * dim || 1e-30;
+      re = (nre * dre + nim * dim) / dd;
+      im = (nim * dre - nre * dim) / dd;
+      curS = Sseg;
+    }
+    // normalize to throat: Zt * St/(rho c)
+    out.push({ f: f, re: re * St / curS, im: im * St / curS });
+  }
+  return out;
+}
+
+/* entry 231 (user: "you need to show the number as the adjustments change").
+   R-OSSE, OS-SE and classic OS have NO fc dial -- their published formulae carry
+   no cut-off term (see entry 231 notes), so the only thing that sets the
+   low-frequency end is MOUTH SIZE. Until now that was inferable only by reading
+   the mouth diameter off the stats panel and doing the arithmetic by hand.
+
+   mouthCorner returns the corner as a DERIVED number, from the ACTUAL last
+   station of the ACTUAL profile the charts use (entry 215, one geometry source)
+   -- never from a nominal dial, and never from a mouth "diameter" that would be
+   wrong the moment the section is elliptical or rounded-rectangular. The
+   equivalent radius is taken from AREA, which is the only mouth measure that
+   generalizes across round / ellipse / superellipse / rrect.
+
+   kr1  = frequency where the mouth circumference equals one wavelength
+          (k*rEq = 1). Below it the mouth is acoustically small and pattern
+          control falls away -- it is a mouth-size limit, NOT a horn cut-off:
+          for the waveguide families there is no cut-off to report.
+   xoverMin = 2 * kr1, i.e. one octave above the corner. This is the standard
+          working rule of thumb, reported as ADVISORY -- it is not a measurement
+          and the header/label must say so wherever it is shown.
+
+   Pass areaOverride when the caller holds a truer mouth area than the planar
+   last station does (wn's curved-wavefront mouth, biradial's arc mouth). */
+function mouthCorner(prof, areaOverride) {
+  if (!prof || !prof.H || !prof.V || prof.H.length < 2 || prof.V.length < 2) return null;
+  var iL = prof.H.length - 1, jL = prof.V.length - 1;
+  var shp = prof.shape || "ellipse", rA = prof.rhoArr, sA = prof.seNArr;
+  var S9;
+  if (areaOverride !== undefined && areaOverride !== null && areaOverride > 0) S9 = areaOverride;
+  else S9 = sectionArea(sA ? "sellipse:" + sA[Math.min(iL, sA.length - 1)] : shp,
+    prof.H[iL].r, prof.V[jL].r, rA ? rA[Math.min(iL, rA.length - 1)] : (prof.rho || 0));
+  if (!(S9 > 0) || !isFinite(S9)) return null;
+  var rEq = Math.sqrt(S9 / Math.PI);
+  return {
+    area: S9, rEq: rEq, dEq: 2 * rEq,
+    kr1: C / (2 * Math.PI * rEq),
+    xoverMin: C / (Math.PI * rEq),
+    overridden: !!(areaOverride !== undefined && areaOverride !== null && areaOverride > 0)
+  };
+}
+
+if (typeof module !== "undefined") module.exports = { mouthCorner: mouthCorner, websterEnd: websterEnd, bulletProfile: bulletProfile, bulletRAt: bulletRAt, plugApply: plugApply, bulletMesh: bulletMesh, spokeMesh: spokeMesh, plugMeshes: plugMeshes, orientOutward: orientOutward, profileFold: profileFold, rosseCurve: rosseCurve, osseWall: osseWall, rosseWall: rosseWall, akabakLEM: akabakLEM, stepFromNurbsSolidQuad: stepFromNurbsSolidQuad, offsetRings: offsetRings, quadLoft: quadLoft, stepFromNurbsQuad: stepFromNurbsQuad, creaseThroatRows: creaseThroatRows, osVirtualEntry: osVirtualEntry, straightEntry: straightEntry, rollAudit: rollAudit, makeStoreZip: makeStoreZip, abecProject: abecProject, crc32: crc32, bemOuterOffset: bemOuterOffset, computeFamily: computeFamily, jmlcEllWall: jmlcEllWall, araiWall: araiWall, buildHVDiffAz: buildHVDiffAz, buildRings: buildRings, buildHVDiff: buildHVDiff, buildEWF: buildEWF, spTransform: spTransform, ellipsoidCapArea: ellipsoidCapArea, superellipseAreaFactor: superellipseAreaFactor, planeProfiles: planeProfiles, throatRibbonMorph: throatRibbonMorph, planeProfilesWN: planeProfilesWN, buildSolidMesh: buildSolidMesh, throatImpedance: throatImpedance, directivityEstimate: directivityEstimate, dec: dec, sectionPoint: sectionPoint, sectionArea: sectionArea, araiFinMesh: araiFinMesh, buildCabinetMesh: buildCabinetMesh, mergeMeshes: mergeMeshes, buildAraiFanRings: buildAraiFanRings, buildInteriorMesh: buildInteriorMesh, validateMesh: validateMesh, junctionReport: junctionReport, buildWNRings: buildWNRings, wnFinMesh: wnFinMesh, hornResponse: hornResponse, hornMaxSPL: hornMaxSPL, buildBEMProject: buildBEMProject, bemMemEstimate: bemMemEstimate, bemPoolPlan: bemPoolPlan, bemBandSize: bemBandSize, BEM_ELEM_RAIL: BEM_ELEM_RAIL, bemToMsh: bemToMsh, stepFromMesh: stepFromMesh, iwataWall: iwataWall, buildIwataRings: buildIwataRings, buildDriverPlate: buildDriverPlate, driverPlateDefaults: driverPlateDefaults, straightEntry: straightEntry, nurbsLoft: nurbsLoft, evalNurbs: evalNurbs, stepFromNurbs: stepFromNurbs, buildRings: buildRings };

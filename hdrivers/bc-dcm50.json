@@ -1,0 +1,27 @@
+{
+  "name": "B&C DCM50",
+  "source": "https://bcspeakers.com/en/products/hf-driver/archive/2/8/DCM50",
+  "kind": "2-inch midrange compression driver",
+  "exit_d_mm": 50,
+  "body_d_mm": 152,
+  "depth_mm": 108,
+  "bolt_n": 4,
+  "bolt_thread": "M6",
+  "bolt_circle_mm": 102,
+  "bolt_angle_deg": 45,
+  "bolt_hole_mm": 6.5,
+  "sensitivity_db": 108.5,
+  "range_hz": [
+    400,
+    10000
+  ],
+  "crossover_min_hz": 400,
+  "power_aes_w": 80,
+  "power_continuous_w": 160,
+  "mass_kg": 3.14,
+  "_estimated": "bolt_angle_deg (B&C: four M6 at 90\u00b0 on 102 mm; the angle to the horn's axes is not given) and the crossover slope (not given)",
+  "_note": "B&C lists it as archived; still in stock in Europe in Nov 2026",
+  "price_eur": 407.18,
+  "price_url": "https://en.toutlehautparleur.com/compression-driver-b-c-speakers-dcm50-8-ohm-2-0-inch-throat-diameter.html",
+  "price_note": "TLHP incl. VAT, 4 in stock, Nov 2026; SonoVente \u20ac339.17 ex VAT; Blue Aran \u00a3275.46 ex VAT"
+}

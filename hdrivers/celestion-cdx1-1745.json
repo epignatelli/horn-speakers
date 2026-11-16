@@ -1,0 +1,26 @@
+{
+  "name": "Celestion CDX1-1745",
+  "source": "https://celestion.com/product-brochure-pdf.php?id=924",
+  "kind": "1-inch compression driver, ferrite",
+  "exit_d_mm": 25.4,
+  "body_d_mm": 120,
+  "depth_mm": 56,
+  "bolt_n": 2,
+  "bolt_thread": "M6",
+  "bolt_circle_mm": 76,
+  "bolt_angle_deg": 0,
+  "bolt_hole_mm": 6.5,
+  "sensitivity_db": 110,
+  "range_hz": [
+    1200,
+    20000
+  ],
+  "crossover_min_hz": 2200,
+  "crossover_min_slope_db_oct": 12,
+  "power_aes_w": 75,
+  "mass_kg": 2.3,
+  "_note": "flange: 2 or 3 M6 holes on 76 / 57 mm; the 2-hole 76 mm pattern is used here",
+  "price_eur": 73.33,
+  "price_url": "https://www.sonovente.com/en-gb/celestion-cdx1-1745-p28712.html",
+  "price_note": "SonoVente (+\u20ac0.50 eco fee), Nov 2026; UK \u00a369.17 (16 \u03a9)"
+}
